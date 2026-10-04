@@ -47,7 +47,11 @@ export class EnvCredentialProvider implements CredentialProvider {
   async getToken(): Promise<string> {
     const raw = this.readEnv();
 
-    if (raw === undefined || raw.trim().length === 0) {
+    if (raw === undefined) {
+      // Genuinely absent. This is the only case that can be reported as "not
+      // set", because it is the only case where the variable has no value at
+      // all.
+      //
       // Names the variable so the operator can fix it. The variable NAME is not
       // a secret; a token value could never appear here because there is none.
       throw new CredentialError("token_absent", {
@@ -56,6 +60,11 @@ export class EnvCredentialProvider implements CredentialProvider {
       });
     }
 
+    // Present but blank (`""`, `"   "`, `"\t\n"`). Deliberately NOT folded
+    // into the branch above: the variable IS set, and reporting it as "not
+    // set" sends the operator to look for a missing export when the real fault
+    // is a stray space or an empty value committed to a `.env`. `validateTokenShape`
+    // classifies whitespace-only as absent with a reason that says exactly that.
     return validateTokenShape(raw, this.source);
   }
 }
