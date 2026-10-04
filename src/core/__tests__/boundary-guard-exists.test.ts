@@ -18,18 +18,25 @@
  * when the file is moved aside or emptied rather than quietly reducing what the
  * suite covers.
  *
- * WHY THIS FILE SKIPS WHEN THE GUARD IS ABSENT (and why that is honest).
+ * WHY THIS FILE FAILS RATHER THAN SKIPS WHEN THE GUARD IS ABSENT.
  *
- * `src/core/plugins/plugin.ts`, `src/core/events/canonical-event.ts` and the
- * boundary guard itself all arrive with the unmerged core-domain work (T3 /
- * PR #2, owned by cards t_4056bdb5 and t_dd9e67e6). This card's lint rule is
- * independent of that, but the meta test asserts on the guard, which does not
- * exist on this base. A skip is used rather than a failure because a red suite
- * blocks the whole queue (hard rule 6), and because a test that fails merely
- * because its subject has not landed yet is testing the schedule rather than
- * the code. The skip is asserted explicitly by the second `describe` below, so
- * the day the guard lands this test begins asserting for real and nobody has
- * to remember to come back.
+ * This test was first written with `describe.skipIf(!GUARD_EXISTS)`, because
+ * the guard is not on every base: `src/core/plugins/plugin.ts`,
+ * `src/core/events/canonical-event.ts` and the boundary guard itself all arrive
+ * with the unmerged core-domain work (T3 / PR #2, cards t_4056bdb5 and
+ * t_dd9e67e6). The skip was rejected on review, and the rejection was correct:
+ * a skip means the suite is GREEN with no boundary test in it, which is the
+ * precise condition this ticket exists to end. "Not landed yet" and "deleted"
+ * are indistinguishable from the outside once you skip, so a skip cannot
+ * protect the invariant -- only fail loudly on it.
+ *
+ * So an absent guard is a FAILURE here, deliberately, on every base. That is
+ * the intended behaviour, not a bug: a branch without the boundary guard is a
+ * branch where hard rule 1 is unpoliced, and the correct response to that is a
+ * red suite, not a quiet pass. Once PR #2 lands the guard, these assertions
+ * pass on their own merits with no edit to this file. Reviewers re-running this
+ * on the pre-PR #2 base should expect exactly one failing file, and the failure
+ * message names the missing path.
  *
  * WHY THIS FILE NAMES NO PROVIDER TOKEN (a real constraint, not a preference).
  *
@@ -59,7 +66,17 @@ const GUARD_PATH = path.join(CORE_DIR, "__tests__", "plugin-boundary.test.ts");
 
 const GUARD_EXISTS = existsSync(GUARD_PATH);
 
-const readGuard = (): string => readFileSync(GUARD_PATH, "utf8");
+/**
+ * The guard's text, or the empty string when it is absent.
+ *
+ * Returning "" rather than throwing is deliberate: it lets every assertion fail
+ * with its own explanatory message ("declares 0 deny-list families", "no longer
+ * declares FORBIDDEN_IMPORT_PATTERNS") instead of crashing in `readFileSync`
+ * with an ENOENT stack trace. Every assertion is independently informative, so
+ * a reviewer sees which specific property of the boundary was lost.
+ */
+const guardSource = (): string =>
+  GUARD_EXISTS ? readFileSync(GUARD_PATH, "utf8") : "";
 
 /**
  * Pull the deny-list family names out of the guard source, e.g. the first
@@ -98,89 +115,62 @@ const MIN_DENY_FAMILIES = 3;
 
 /** A guard reduced below this is not a guard; it is a stub that tests nothing. */
 const MIN_GUARD_LINES = 100;
-
-describe.skipIf(!GUARD_EXISTS)(
-  "plugin boundary guard is present and non-trivial",
-  () => {
-    it(`exists at ${path.relative(CORE_DIR, GUARD_PATH)}`, () => {
-      expect(GUARD_EXISTS).toBe(true);
-      expect(statSync(GUARD_PATH).isFile()).toBe(true);
-    });
-
-    it(`is longer than ${MIN_GUARD_LINES} lines, so it is not a stub`, () => {
-      const lineCount = readGuard().split("\n").length;
-      expect(
-        lineCount,
-        `plugin-boundary.test.ts is only ${lineCount} lines; a guard this short is a stub, not a second line of defence.`,
-      ).toBeGreaterThan(MIN_GUARD_LINES);
-    });
-
-    it("declares a deny-list with multiple provider families, so it is a boundary and not a vendor check", () => {
-      const families = denyFamiliesInGuard(readGuard());
-      expect(
-        families.length,
-        `plugin-boundary.test.ts declares ${families.length} deny-list families; the boundary needs at least ${MIN_DENY_FAMILIES} (D-065).`,
-      ).toBeGreaterThanOrEqual(MIN_DENY_FAMILIES);
-    });
-
-    it("gives every deny-list family real tokens, so no family is inert", () => {
-      const all = denyFamiliesInGuard(readGuard());
-      const withTokens = familiesWithTokens(readGuard());
-      expect(
-        all.filter((f) => !withTokens.includes(f)),
-        `these deny-list families in plugin-boundary.test.ts carry no tokens: ${all
-          .filter((f) => !withTokens.includes(f))
-          .join(", ")}. An empty family matches nothing and is not a defence.`,
-      ).toEqual([]);
-    });
-
-    it("keeps its forbidden-import patterns, the half that overlaps the lint rule", () => {
-      const source = readGuard();
-      expect(
-        source.includes("FORBIDDEN_IMPORT_PATTERNS"),
-        "plugin-boundary.test.ts no longer declares FORBIDDEN_IMPORT_PATTERNS; the guard no longer blocks the plugin namespace or provider SDKs.",
-      ).toBe(true);
-    });
-
-    it("is a different file from this one, so the guard was not collapsed into the meta test", () => {
-      // Guards against the bypass where someone moves the guard's body here and
-      // leaves a pointer file behind.
-      expect(path.resolve(GUARD_PATH)).not.toBe(path.resolve(THIS_FILE));
-    });
-  },
-);
-
-/**
- * Runs unconditionally, including when the guard is absent. Its job is to make
- * the skip above visible and self-describing rather than a silent hole:
- * `describe.skipIf` reports as skipped with no output, and a skip nobody reads
- * is how "32 passed, no boundary test anywhere" happens.
- */
-describe("plugin boundary guard presence (always runs)", () => {
-  it("either the guard exists and the meta assertions ran, or the skip is explicit and explained", () => {
-    if (GUARD_EXISTS) {
-      expect(readGuard().split("\n").length).toBeGreaterThan(MIN_GUARD_LINES);
-      return;
-    }
-
-    // Guard absent. This must be the documented "guard has not landed on this
-    // base yet" state, not a deleted guard. The distinguishing signal is whether
-    // the core SOURCE files the guard was written against are present too: if
-    // core exists but the guard does not, the guard was DELETED, and that is a
-    // defect this test must fail on rather than skip.
-    const coreSourceFiles = [
-      path.join(CORE_DIR, "plugins", "plugin.ts"),
-      path.join(CORE_DIR, "events", "canonical-event.ts"),
-    ];
-    const present = coreSourceFiles.filter(existsSync);
-
+// Deliberately NOT `describe.skipIf`. Every assertion below runs
+// unconditionally, INCLUDING when the guard is absent. A skip is precisely the
+// defect this test exists to close: skipping on a missing guard turns the suite
+// GREEN with no boundary test anywhere in it, which is exactly what QA measured
+// while reviewing t_7a135bf0. An absent guard must be RED.
+//
+// The substance assertions read the guard via `guardSource`, which returns an
+// empty string when the file is absent. That keeps each assertion failing with
+// its OWN explanatory message instead of crashing in `readFileSync` and
+// reporting an ENOENT stack trace -- a named failure a reviewer can act on.
+describe("plugin boundary guard is present and non-trivial", () => {
+  it("exists", () => {
     expect(
-      present,
-      `plugin-boundary.test.ts is MISSING while core sources exist at ${present
-        .map((f) => path.relative(CORE_DIR, f))
-        .join(
-          ", ",
-        )}. The boundary guard was deleted; the plugin boundary now has no test at all (hard rule 1, and the risk recorded while reviewing t_7a135bf0).`,
+      GUARD_EXISTS,
+      `plugin-boundary.test.ts is MISSING at ${GUARD_PATH}. The plugin boundary (hard rule 1) has no test at all. This is the exact condition measured as leaving the suite GREEN (32 passed) while reviewing t_7a135bf0, so it must not be allowed to pass silently again.`,
+    ).toBe(true);
+    expect(statSync(GUARD_PATH).isFile()).toBe(true);
+  });
+
+  it(`is longer than ${MIN_GUARD_LINES} lines, so it is not a stub`, () => {
+    const lineCount = guardSource().split("\n").length;
+    expect(
+      lineCount,
+      `plugin-boundary.test.ts is only ${lineCount} lines; a guard this short is a stub, not a second line of defence.`,
+    ).toBeGreaterThan(MIN_GUARD_LINES);
+  });
+
+  it("declares a deny-list with multiple provider families, so it is a boundary and not a single-vendor check", () => {
+    const families = denyFamiliesInGuard(guardSource());
+    expect(
+      families.length,
+      `plugin-boundary.test.ts declares ${families.length} deny-list families; the boundary needs at least ${MIN_DENY_FAMILIES} (D-065: one provider's vocabulary is a preference, three is a boundary).`,
+    ).toBeGreaterThanOrEqual(MIN_DENY_FAMILIES);
+  });
+
+  it("gives every deny-list family real tokens, so no family is inert", () => {
+    const all = denyFamiliesInGuard(guardSource());
+    const tokenless = all.filter(
+      (f) => !familiesWithTokens(guardSource()).includes(f),
+    );
+    expect(
+      tokenless,
+      `these deny-list families in plugin-boundary.test.ts carry no tokens: ${tokenless.join(", ")}. An empty family matches nothing and defends nothing.`,
     ).toEqual([]);
+  });
+
+  it("keeps its forbidden-import patterns, the half that overlaps the lint rule", () => {
+    expect(
+      guardSource().includes("FORBIDDEN_IMPORT_PATTERNS"),
+      "plugin-boundary.test.ts no longer declares FORBIDDEN_IMPORT_PATTERNS; the guard no longer blocks the plugin namespace or provider SDKs, leaving only the lint rule to police it.",
+    ).toBe(true);
+  });
+
+  it("is a different file from this one, so the guard was not collapsed into the meta test", () => {
+    // Guards the bypass where the guard's body is moved here and a pointer
+    // file is left behind.
+    expect(path.resolve(GUARD_PATH)).not.toBe(path.resolve(THIS_FILE));
   });
 });
