@@ -107,6 +107,17 @@ export const SYNC_OUTCOMES = {
    * success. See {@link SYNC_IS_IDEMPOTENT}.
    */
   alreadyPresent: "already_present",
+  /**
+   * The writer refused at least one event, so the batch was all-or-nothing and
+   * NOTHING was written. Reported as its own outcome rather than folded into
+   * `internal_error`, because the two mean different things to a caller: one is
+   * "this route hit a bug or a broken environment", the other is "the sync ran
+   * correctly and the DATA was rejected by a rule the persistence layer owns".
+   *
+   * 422, not 500: the request was understood and processed, and what failed is
+   * the content. See {@link statusFor}.
+   */
+  eventNotPersistable: "event_not_persistable",
   /** Anything else. Still never carries upstream or driver text. */
   internalError: "internal_error",
 } as const;
@@ -121,6 +132,7 @@ const FAILURE_OUTCOMES: readonly SyncOutcome[] = [
   SYNC_OUTCOMES.upstreamRejected,
   SYNC_OUTCOMES.upstreamUnreachable,
   SYNC_OUTCOMES.alreadyPresent,
+  SYNC_OUTCOMES.eventNotPersistable,
   SYNC_OUTCOMES.internalError,
 ];
 
@@ -146,6 +158,8 @@ const OUTCOME_MESSAGES: Readonly<Record<SyncOutcome, string>> = {
     "The request to the source could not be completed.",
   [SYNC_OUTCOMES.alreadyPresent]:
     "A row in this page collides on its PRIMARY KEY id while its (source, external_id) does not, which the natural-key upsert cannot absorb. This is not what a repeat call produces — a repeat converges and succeeds. Treat it as a conflict to resolve, not as a retry.",
+  [SYNC_OUTCOMES.eventNotPersistable]:
+    "The writer refused at least one event in this page, and the batch is all-or-nothing, so NOTHING was written. The events were fetched successfully and the data was rejected by a persistence rule this route does not own. No writer text is reported here.",
   [SYNC_OUTCOMES.internalError]:
     "The sync failed for a reason this route does not classify.",
 };
@@ -300,6 +314,13 @@ function statusFor(outcome: SyncOutcome): number {
       return 502;
     case SYNC_OUTCOMES.alreadyPresent:
       return 409;
+    case SYNC_OUTCOMES.eventNotPersistable:
+      // 422 Unprocessable Content, NOT 500. The sync ran: events were fetched
+      // and the persistence layer refused the DATA. Reporting a rejected batch
+      // as a server error would tell the caller the route is broken, when the
+      // accurate statement is that its content was not persistable. It is also
+      // deliberately not 200 -- see the refusal check in `handleSyncRequest`.
+      return 422;
     default:
       return 500;
   }
@@ -484,6 +505,37 @@ export async function handleSyncRequest(
       // first page, and takes no request body at all.
       ...(options.writer === undefined ? {} : { writer: options.writer }),
     });
+
+    // A REFUSED BATCH IS NOT A SUCCESS, and this check is the whole point.
+    // `syncSource` does not throw on a writer refusal — by design, so a route
+    // answers with a typed outcome instead of an exception escaping as an opaque
+    // 500. It RETURNS `{ events, persisted: 0, failure }`. This handler used to
+    // read only `result.events.length` and `result.persisted` and never looked
+    // at `.failure`, so a batch the writer rejected in full was reported as
+    // `synced` with HTTP 200 and `ok: true`. Measured by injection at the
+    // injectable `sync` seam, no database required:
+    //
+    //   status = 200  ok = true  outcome = "synced"  persisted = 0
+    //
+    // `persisted: 0` with `ok: true` was the only tell, and nothing in the
+    // response distinguished "nothing to write" from "every row was refused" —
+    // a caller polling this endpoint got a green light on a total write
+    // failure. The existing suite could not see it: every test drove this
+    // handler through the `sync` seam and none returned a populated `failure`.
+    //
+    // Checked BEFORE the empty check and before the success branch, because a
+    // refusal is neither "nothing new" nor "everything written".
+    //
+    // `SyncFailure.detail` is the writer's message carried VERBATIM and it names
+    // the offending value, so it is deliberately NOT echoed — see this module's
+    // secret-hygiene contract at the top. The classification (`code`) is
+    // selected into fixed text, never rendered.
+    if (result.failure !== undefined) {
+      return {
+        status: statusFor(SYNC_OUTCOMES.eventNotPersistable),
+        body: body(SYNC_OUTCOMES.eventNotPersistable, source, 0, 0),
+      };
+    }
 
     if (result.events.length === 0) {
       return {

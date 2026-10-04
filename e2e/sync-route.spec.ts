@@ -68,6 +68,9 @@ const STATUS_FOR_OUTCOME: Readonly<Record<string, number>> = {
   upstream_rejected: 502,
   upstream_unreachable: 502,
   already_present: 409,
+  // 422, not 500: the sync ran and the persistence layer refused the DATA.
+  // See the refusal branch in `handler.ts`.
+  event_not_persistable: 422,
   internal_error: 500,
 };
 

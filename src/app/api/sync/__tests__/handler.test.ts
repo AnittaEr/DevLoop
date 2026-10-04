@@ -40,6 +40,7 @@ import type {
 import {
   persistCanonicalEvents,
   SourceConfigurationError,
+  SYNC_FAILURE_CODES,
   syncSource,
 } from "@/app/sources";
 import {
@@ -637,6 +638,133 @@ describe("POST /api/sync failure modes are distinct", () => {
 
     expect(status).toBe(500);
     expect(body.outcome).toBe(SYNC_OUTCOMES.internalError);
+  });
+});
+
+/**
+ * A REFUSED BATCH MUST NOT BE REPORTED AS A SUCCESS. This is the negative
+ * control for a real, measured defect -- not a hypothetical.
+ *
+ * `syncSource` deliberately RETURNS a writer refusal instead of throwing it, so
+ * a route answers with a typed outcome rather than an exception escaping as an
+ * opaque 500. That is the correct boundary design, and it put the burden on this
+ * consumer: the handler used to read only `result.events.length` and
+ * `result.persisted` and never inspected `result.failure`, so a batch the writer
+ * rejected in full came back as `synced` / HTTP 200 / `ok: true`. Measured by
+ * injection at this same seam, before the fix:
+ *
+ *   status = 200  ok = true  outcome = "synced"  fetched = 1  persisted = 0
+ *
+ * Every other test in this file drove the handler through the `sync` seam and
+ * none of them returned a populated `failure`, so the whole suite was green on a
+ * route that reported a total write failure as a successful sync. That is the
+ * defect class this block closes.
+ */
+describe("a refused batch is never reported as a success", () => {
+  /**
+   * A `sync` that behaves exactly as `syncSource` behaves on refusal: events
+   * fetched, nothing written, and the classification attached.
+   */
+  function refusingSync() {
+    return async () => ({
+      events: [event()],
+      persisted: 0,
+      failure: {
+        code: SYNC_FAILURE_CODES.eventNotPersistable,
+        index: 0,
+        eventId: event().id,
+        externalId: event().externalId,
+        // The writer's own message, VERBATIM, and it names the offending value.
+        // Asserted absent from the response below.
+        detail:
+          "occurred_at 2026-10-04T10:00:00.123456Z has sub-millisecond precision [W-SECRET-CANARY]",
+      },
+    });
+  }
+
+  it("reports a refusal as its own failure outcome, NOT synced and NOT 200", async () => {
+    const { status, body } = await handleSyncRequest({
+      registry: registryWith(fakePlugin([event()])),
+      // Past the unconfigured-database guard without touching a real database:
+      // the seam under test is `sync`, which is injected.
+      hasDatabaseUrl: () => true,
+      sync: refusingSync(),
+    });
+
+    // THE ASSERTION THAT MATTERS: not a success, on any axis a caller reads.
+    expect(body.outcome).not.toBe(SYNC_OUTCOMES.synced);
+    expect(body.outcome).toBe(SYNC_OUTCOMES.eventNotPersistable);
+    expect(body.ok).toBe(false);
+    expect(status).toBe(422);
+    expect(status).not.toBe(200);
+
+    // Nothing was written, so nothing is claimed to have been written or fetched.
+    // Reporting the refused page's event count as `fetched` would imply the
+    // events reached storage.
+    expect(body.persisted).toBe(0);
+    expect(body.fetched).toBe(0);
+    expect(body.byType).toEqual({});
+
+    // The message says the batch was refused, in fixed text.
+    expect(body.message).toMatch(/refused/i);
+    expect(body.message).toMatch(/all-or-nothing|NOTHING was written/i);
+  });
+
+  it("does NOT leak the writer's verbatim detail into the response", async () => {
+    // `SyncFailure.detail` carries the writer's rejection message verbatim and it
+    // names the offending value. This module's secret-hygiene contract says no
+    // upstream or driver text reaches a response body, and a writer message is
+    // exactly that. So the classification is selected into fixed text and the
+    // detail is dropped — asserted here so a future "helpful" echo cannot be
+    // added without turning this red.
+    const { body } = await handleSyncRequest({
+      registry: registryWith(fakePlugin([event()])),
+      hasDatabaseUrl: () => true,
+      sync: refusingSync(),
+    });
+
+    const serialised = JSON.stringify(body);
+    expect(serialised).not.toContain("W-SECRET-CANARY");
+    expect(serialised).not.toContain("sub-millisecond");
+    expect(serialised).not.toContain("2026-10-04T10:00:00.123456Z");
+    // And it must not be smuggled in under another key either.
+    expect(body).not.toHaveProperty("failure");
+    expect(body).not.toHaveProperty("detail");
+  });
+
+  it("still reports a genuine success as a success, so the refusal check is not over-broad", async () => {
+    // The control for the block above. If the refusal check were written to
+    // fire on `persisted === 0` instead of on `failure !== undefined`, this would
+    // go red — and so would every legitimately-empty sync, which is a success.
+    const { status, body } = await handleSyncRequest({
+      registry: registryWith(fakePlugin([event()])),
+      hasDatabaseUrl: () => true,
+      sync: async () => ({ events: [event()], persisted: 1 }),
+    });
+
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.outcome).toBe(SYNC_OUTCOMES.synced);
+    expect(body.persisted).toBe(1);
+  });
+
+  it("still reports a genuinely empty page as `empty`, not as a refusal", async () => {
+    // The other control. `syncSource` returns `{ events: [], persisted: 0 }`
+    // with NO `failure` for a source with nothing new; that is a 200 success
+    // with zero rows, and the refusal check must not swallow it. This is the
+    // exact distinction the response previously could not express: "persisted
+    // zero because there was nothing to write" versus "persisted zero because
+    // every row was refused".
+    const { status, body } = await handleSyncRequest({
+      registry: registryWith(fakePlugin([event()])),
+      hasDatabaseUrl: () => true,
+      sync: async () => ({ events: [], persisted: 0 }),
+    });
+
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.outcome).toBe(SYNC_OUTCOMES.empty);
+    expect(body.persisted).toBe(0);
   });
 });
 
