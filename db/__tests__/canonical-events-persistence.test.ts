@@ -9,7 +9,7 @@
  * Run with `bun run test:db` after `bun run db:migrate`.
  */
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import type { CanonicalEvent } from "../../src/core/events/canonical-event";
@@ -215,21 +215,38 @@ describe("canonical_events persistence (type -> storage -> type)", () => {
     ).toBe("2026-10-04T12:31:07.000Z");
   });
 
-  it("keeps occurredAt byte-identical across a second round trip", async () => {
-    await insert(FULL_EVENT);
+  it("pins occurredAt to a hand-written literal, not to its own round trip", async () => {
+    // B27 finding 7: this test used to assert `second === first`, where `first`
+    // is ALREADY the mapper's own `toISOString()` output — so it largely restated
+    // that `toISOString()` is stable rather than checking what was persisted. The
+    // expectation below is written out by hand, and the input is deliberately
+    // NON-canonical (a `+02:00` offset with sub-second digits and no `Z`), so
+    // the assertion can fail if the persisted instant is wrong.
+    const nonCanonical: CanonicalEvent = {
+      ...MINIMAL_EVENT,
+      id: "evt_01HQZX0000000000000000007",
+      externalId: "ext-4717",
+      occurredAt: "2026-10-04T14:31:07.250+02:00",
+    };
+    await insert(nonCanonical);
+
     const [row] = await getDb()
       .select()
       .from(canonicalEvents)
-      .where(eq(canonicalEvents.id, FULL_EVENT.id));
+      .where(eq(canonicalEvents.id, nonCanonical.id));
 
-    const first = fromCanonicalEventRow(row!).occurredAt;
-    // Feed the normalised value back through the mapper: idempotent from here.
+    // The instant, spelled out: 14:31:07.250 at +02:00 IS 12:31:07.250 UTC.
+    const EXPECTED = "2026-10-04T12:31:07.250Z";
+    expect(row!.occurredAt.toISOString()).toBe(EXPECTED);
+    expect(fromCanonicalEventRow(row!).occurredAt).toBe(EXPECTED);
+
+    // Feeding the canonical value back is idempotent — a SECOND, weaker
+    // property, now stated after the strong one above rather than instead of it.
     const second = toCanonicalEventRow({
-      ...FULL_EVENT,
-      occurredAt: first,
+      ...nonCanonical,
+      occurredAt: fromCanonicalEventRow(row!).occurredAt,
     }).occurredAt.toISOString();
-
-    expect(second).toBe(first);
+    expect(second).toBe(EXPECTED);
   });
 
   it("preserves nested metadata types instead of flattening them to strings", async () => {
@@ -316,6 +333,42 @@ describe("canonical_events persistence (type -> storage -> type)", () => {
   });
 });
 
+describe("the mapper rejects timestamps it cannot persist faithfully (B27 f4/f5)", () => {
+  // Both of these used to be accepted silently, producing a row whose
+  // `occurred_at` was not the instant the caller supplied.
+  const base = MINIMAL_EVENT;
+
+  it("rejects an offset-less ISO value, whose instant would depend on the host TZ", () => {
+    // `new Date("2026-10-04T12:31:07")` resolves in the PROCESS timezone, so
+    // this string is not an instant at all — it is three different instants
+    // depending on who parses it.
+    expect(() =>
+      toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T12:31:07" }),
+    ).toThrow(/explicit UTC offset/);
+  });
+
+  it("rejects sub-millisecond precision instead of truncating it", () => {
+    expect(() =>
+      toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T12:31:07.0001Z" }),
+    ).toThrow(/more precision than a Date can hold/);
+  });
+
+  it("accepts a representable fraction and an offset of either sign", () => {
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T12:31:07.250Z",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T12:31:07.250Z");
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T14:31:07+02:00",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T12:31:07.000Z");
+  });
+});
+
 describe("canonical_events constraints are enforced by the database", () => {
   it("rejects a type outside CanonicalEventType", async () => {
     await expectRejectedBy(
@@ -329,6 +382,51 @@ describe("canonical_events constraints are enforced by the database", () => {
         ),
       "canonical_events_type_check",
     );
+  });
+
+  it("rejects JSON null in metadata, which NOT NULL does not stop (B27 f2)", async () => {
+    // `'null'::jsonb` is the JSON null VALUE, not SQL NULL, so the NOT NULL
+    // column constraint accepts it — and it satisfies nothing `JsonObject`
+    // promises. Only `jsonb_typeof(metadata) = 'object'` rejects it.
+    await expectRejectedBy(
+      getDb().execute(sql`
+        INSERT INTO canonical_events
+          (id, source, external_id, type, title, occurred_at, metadata)
+        VALUES ('evt_json_null_meta', 'fixture-source', 'ext-json-null',
+                'mention', 'json null metadata', now(), 'null'::jsonb)
+      `),
+      "canonical_events_metadata_is_object_check",
+    );
+  });
+
+  it("rejects an array and a scalar in metadata (B27 f2)", async () => {
+    // Each literal is spliced with `sql.raw` because a jsonb value must be
+    // cast in SQL text; these three are fixed strings written here, never input.
+    for (const [index, literal] of [
+      "'[1,2,3]'",
+      "'\"a string\"'",
+      "'42'",
+    ].entries()) {
+      await expectRejectedBy(
+        getDb().execute(sql`
+          INSERT INTO canonical_events
+            (id, source, external_id, type, title, occurred_at, metadata)
+          VALUES (${`evt_nonobj_${index}`}, 'fixture-source',
+                  ${`ext-nonobj-${index}`}, 'mention', 'non-object metadata',
+                  now(), ${sql.raw(literal)}::jsonb)
+        `),
+        "canonical_events_metadata_is_object_check",
+      );
+    }
+  });
+
+  it("accepts a JSON object in metadata, including a nested one (B27 f2)", async () => {
+    await insert({
+      ...MINIMAL_EVENT,
+      id: "evt_01HQZX0000000000000000008",
+      externalId: "ext-4718",
+      metadata: { a: 1, b: { c: [true, null] } },
+    });
   });
 
   it("accepts every member of CanonicalEventType", async () => {
