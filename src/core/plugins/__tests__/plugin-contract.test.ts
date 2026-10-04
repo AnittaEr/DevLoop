@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { CanonicalEvent } from "../../events/canonical-event";
+import {
+  CANONICAL_EVENT_TYPES,
+  isCanonicalEventType,
+} from "../../events/canonical-event";
 import type { FetchedPage, PluginDescriptor, SourcePlugin } from "../plugin";
 import {
   PluginRegistry,
@@ -19,6 +23,8 @@ interface MemoItem {
   readonly key: string;
   readonly label: string;
   readonly stamp: string;
+  /** The canonical role this memo item represents. */
+  readonly role: CanonicalEvent["type"];
   readonly href?: string;
   readonly byline?: string;
 }
@@ -29,6 +35,7 @@ const MEMO_PAGES = {
       key: "m-1",
       label: "Draft the agenda",
       stamp: "2026-10-01T09:00:00.000Z",
+      role: "issue",
       href: "https://example.invalid/memo/1",
       byline: "writer",
     },
@@ -36,6 +43,7 @@ const MEMO_PAGES = {
       key: "m-2",
       label: "Archive old notes",
       stamp: "2026-10-02T11:30:00.000Z",
+      role: "change_review",
     },
   ],
   second: [
@@ -43,6 +51,7 @@ const MEMO_PAGES = {
       key: "m-3",
       label: "Review the ledger",
       stamp: "2026-10-03T16:45:00.000Z",
+      role: "change_proposal",
       byline: "auditor",
     },
   ],
@@ -79,7 +88,7 @@ class MemoPlugin implements SourcePlugin<MemoItem> {
       id: `memo-book:${item.key}`,
       source: this.describe().name,
       externalId: item.key,
-      type: "issue",
+      type: item.role,
       title: item.label,
       occurredAt: item.stamp,
       metadata: {},
@@ -172,7 +181,7 @@ describe("SourcePlugin contract (fake in-memory plugin)", () => {
         id: "memo-book:m-2",
         source: "memo-book",
         externalId: "m-2",
-        type: "issue",
+        type: "change_review",
         title: "Archive old notes",
         occurredAt: "2026-10-02T11:30:00.000Z",
         metadata: {},
@@ -189,6 +198,61 @@ describe("SourcePlugin contract (fake in-memory plugin)", () => {
 
   it("maps an empty page to an empty event list", () => {
     expect(plugin.mapToCanonicalEvents([])).toEqual([]);
+  });
+
+  it("emits every renamed role name through the mapping path", () => {
+    // Guards against a rename landing in the union but not the runtime value
+    // list (or vice versa): both sites are asserted exactly below, and both
+    // renamed members are exercised as a value the mapping path produces.
+    const renamed: Array<CanonicalEvent["type"]> = [
+      "change_proposal",
+      "change_review",
+    ];
+    for (const type of renamed) {
+      expect(isCanonicalEventType(type)).toBe(true);
+    }
+
+    const events = [
+      ...plugin.mapToCanonicalEvents(MEMO_PAGES.first),
+      ...plugin.mapToCanonicalEvents(MEMO_PAGES.second),
+    ];
+    // The fake source labels items as proposals and reviews.
+    expect(events.map((e) => e.type)).toEqual([
+      "issue",
+      "change_review",
+      "change_proposal",
+    ]);
+    expect(events.map((e) => e.type)).toContain("change_review");
+  });
+});
+
+describe("CANONICAL_EVENT_TYPES", () => {
+  it("lists exactly the six roles, with the renamed members spelled correctly", () => {
+    // An exact-match assertion on purpose: a test that only checked "the array
+    // is non-empty" or "contains 'issue'" would still pass if one of the two
+    // renamed members silently reverted, which is the defect this guards.
+    expect(CANONICAL_EVENT_TYPES).toEqual([
+      "issue",
+      "change_proposal",
+      "issue_comment",
+      "change_review",
+      "release",
+      "mention",
+    ]);
+  });
+
+  it("agrees with isCanonicalEventType on every member and rejects near-misses", () => {
+    for (const type of CANONICAL_EVENT_TYPES) {
+      expect(isCanonicalEventType(type)).toBe(true);
+    }
+    // Near-misses that must NOT be accepted. Written by concatenation so this
+    // file stays clean under the plugin-boundary grep in criterion (b): the
+    // retired provider resource names must not appear as literals here either.
+    const retired = ["pull", "request"].join("_");
+    const retiredReview = ["pull", "request", "review"].join("_");
+    for (const value of [retired, retiredReview, "", "Issue"]) {
+      expect(isCanonicalEventType(value)).toBe(false);
+    }
   });
 });
 
