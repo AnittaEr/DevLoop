@@ -1428,6 +1428,50 @@ describe("db-schema scanner (case families, B30)", () => {
     }
   });
 
+  /**
+   * The TRAILING rule, pinned — the counterpart of the assertion the core guard
+   * carries at `src/core/__tests__/plugin-boundary.test.ts:1366`
+   * (`expect(scanOne('const xgithuby = 1;')).toEqual([])`).
+   *
+   * QA round 1 proved by execution that until this existed the rule was PROSE
+   * ONLY in this file: replacing the body of `tokenEndsCleanly` with `return true`
+   * left the suite green at 31/31. That is the drift this card exists to end, in
+   * the one form that is hardest to see — a rule that is implemented, documented
+   * and unpinned, so deleting it looks like a refactor and nothing turns red.
+   *
+   * Why these are the right probes. `githubrepo` and `octokitfoo` are a lowercase
+   * CONTINUATION of a token this guard genuinely carries, so they exercise
+   * `tokenEndsCleanly` on the deny list itself and not on the deny list's
+   * exclusions. Both are clean BY DESIGN — a lowercase continuation is a different
+   * symbol, exactly as `xgithuby` and `shadow` are — and `shadow` alone is not
+   * enough: `shadow` is refused by the DENY-LIST boundary (`ado` is preceded by
+   * `w`), so it would stay clean even with the trailing rule deleted.
+   */
+  it("refuses a lowercase continuation of a token it carries, so tokenEndsCleanly stays pinned", () => {
+    // Measured at head, both dialect positions, both orderings of case on the
+    // continuation: clean. Delete the trailing rule and each of these fires.
+    for (const name of ["githubrepo", "octokitfoo", "xgithuby", "githuby"]) {
+      expect(
+        scanTs(`  ${name}: text("${name}"),`).map((v) => v.token),
+        `lowercase continuation ${name} must be CLEAN — a provider token is not a substring of an ordinary word`,
+      ).toEqual([]);
+      expect(
+        scanSql(`CREATE TABLE "t" ("${name}" text);`).map((v) => v.token),
+        `lowercase continuation ${name} must be CLEAN in SQL position too`,
+      ).toEqual([]);
+    }
+    // The controls from the existing suite, restated here because they are the
+    // OTHER half of this rule: `ado` inside `shadow` must stay clean, which is the
+    // same trailing decision reached through a deny-list exclusion rather than a
+    // deny-list token.
+    expect(scanTs('  shadow: text("shadow"),').map((v) => v.token)).toEqual([]);
+    // And the rule must not have been over-applied: the same token with a HUMP or
+    // a delimiter after it is a real leak and still fires.
+    expect(
+      scanTs('  GitHubRepo: text("GitHubRepo"),').map((v) => v.token),
+    ).toContain("github");
+  });
+
   it("catches an uppercased forbidden import, matching the core guard's split", () => {
     // `@OCTOKIT/rest` and `require("Bitbucket")` are working import paths. The four
     // forbidden-import patterns that SPELL a provider carry CASE_INSENSITIVE; the
@@ -1520,6 +1564,23 @@ describe("db/ guard and core guard agree (B30 parity)", () => {
     "spr_value",
     "repr_value",
     "shadow",
+    // LOWERCASE CONTINUATIONS, added in QA round 1. QA's defect 2 was that every
+    // firing probe above ENDS its token, and every clean control above is refused
+    // by the DENY-LIST boundary rather than by `tokenEndsCleanly`, so the parity
+    // loop compared the two guards on probes where they already agreed and
+    // certified nothing about the axis that actually drifted — the TRAILING rule.
+    // QA proved that by running the `tokenEndsCleanly -> return true` mutant
+    // against this suite: "agrees with the core plugin-boundary guard on shared
+    // probes" still PASSED.
+    //
+    // `xgithuby` is the core guard's own probe (its :1366 assertion); `githubrepo`
+    // and `octokitfoo` continue tokens THIS guard carries, so they exercise its
+    // trailing rule on its own deny list rather than on the deny list's exclusions.
+    // All three are clean on BOTH sides — measured, not assumed, and reported in
+    // the round-2 hand-off. There is no disagreement to adjudicate on this axis.
+    "xgithuby",
+    "githubrepo",
+    "octokitfoo",
   ];
 
   /**
@@ -1612,7 +1673,7 @@ describe("db/ guard and core guard agree (B30 parity)", () => {
         `core guard must fire on ${probe}`,
       ).toBeGreaterThan(0);
     }
-    for (const probe of ["expr_value", "shadow"]) {
+    for (const probe of ["expr_value", "shadow", "githubrepo"]) {
       const source = `const ${probe} = 1;`;
       expect(findViolations(source, "parity-probe.ts"), probe).toEqual([]);
       expect(await coreFindViolations(source), probe).toEqual([]);
