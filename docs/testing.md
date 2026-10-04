@@ -4,14 +4,14 @@ Two independent runners. Neither replaces the other.
 
 ## Commands
 
-| Command               | What it runs                                                   |
-| --------------------- | -------------------------------------------------------------- |
-| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`.        |
-| `bun run lint`        | ESLint over the repo.                                          |
-| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).   |
-| `bun run build`       | `next build` — production build.                               |
-| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium. |
-| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.       |
+| Command               | What it runs                                                                           |
+| --------------------- | -------------------------------------------------------------------------------------- |
+| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
+| `bun run lint`        | ESLint over the repo.                                                                  |
+| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
+| `bun run build`       | `next build` — production build.                                                       |
+| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
+| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.                               |
 
 ## End-to-end tests
 
@@ -62,13 +62,20 @@ CI has **two jobs**, both defined in `.github/workflows/ci.yml`:
 
 - `verify` — `bun install --frozen-lockfile`, `bun run format:check`,
   `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`.
-- `e2e` — installs Chromium, then runs `bun run build` and `bun run e2e`.
+- `e2e` — verifies the lockfile, installs dependencies, runs `bun run build`,
+  then installs Chromium, then runs `bun run e2e`. The build must precede the
+  e2e steps (see the ordering note in `ci.yml`).
 
 They run concurrently on their own runners and report independent status and
-timing. A green CI run therefore **does** cover the e2e specs: the `e2e` check
-must be green for the PR to be mergeable. `bun run e2e` remains the local
-equivalent of the `e2e` job; it just also needs a Chromium build of the app,
-which `playwright.config.ts` handles via its `webServer` entry.
+timing. A green CI run therefore **does** cover the e2e specs: the `e2e` job
+reports under its own check name, so a red e2e is visible as `e2e` rather than
+hidden inside a green aggregate. Note that CI _reports_ this check but does not
+_enforce_ it — the repository has no branch protection and no rulesets, so
+nothing on GitHub requires any check to pass before a PR can be merged. A human
+reviewer decides whether a red `e2e` blocks the merge. `bun run e2e` remains the
+local equivalent of the `e2e` job, and carries the same build requirement
+described under "End-to-end tests" above — a prior `bun run build`, not
+something `playwright.config.ts` does for you.
 
 Vitest's include is `["src/**/*.test.{ts,tsx}", "e2e/**/*.test.{ts,tsx}"]`
 (source of truth: `vitest.config.ts`). The `e2e/**` half is deliberate — the
