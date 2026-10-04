@@ -200,3 +200,109 @@ jobs:
       # credential provider.
       - name: E2E (Playwright)
         run: bun run e2e
+
+  # T14 — the missing runner for the DB round-trip suite.
+  #
+  # WHY THIS JOB EXISTS. `db/__tests__/canonical-events-persistence.test.ts`
+  # (401 lines) is collected ONLY by `vitest.db.config.ts`
+  # (`include: ["db/**/__tests__/**/*.test.ts"]`), which `bun run test` never
+  # loads — `vitest.config.ts:17` matches `src/**` and `e2e/**` only. Until this
+  # job, that suite was written, reviewed, merged and executed by NOTHING: a
+  # green `verify` check proved nothing at all about persistence.
+  #
+  # WHY A SEPARATE JOB, NOT MORE STEPS IN `verify`. Three reasons, in order of
+  # weight: (1) a red round trip must be a NAMED check, so the PR checks list
+  # says `db round trip` rather than hiding a Postgres failure inside the
+  # aggregate; (2) `verify` needs no database, so adding a service container
+  # would put a database in the path of every unit test for no reason; (3) the
+  # suite is deliberately not skip-safe (vitest.db.setup.ts throws when
+  # DATABASE_URL is unset), so it must own a job that guarantees a database —
+  # there is no configuration of `verify` in which it is safely runnable.
+  # There is deliberately no `needs:` edge on `verify`, matching `e2e`: all three
+  # jobs are independent and run concurrently on their own runners.
+  db:
+    name: db round trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CI: true
+      NEXT_TELEMETRY_DISABLED: "1"
+      # The credential pair below is a THROWAWAY for the ephemeral service
+      # container declared in `services:` below. It is not a credential for any
+      # real host: the container is created fresh for this job, reachable only
+      # on the runner's loopback via the published port, and destroyed with the
+      # job. This string is never printed — `bun run db:check` prints only the
+      # result of `SELECT 1`, and no step echoes this variable. Do not replace
+      # it with a real host, and do not move it into a repository secret: a
+      # secret here would be strictly worse (fork PRs could not run the job, and
+      # it would be a real credential in a place a real credential belongs).
+      # `sslmode=disable` matches the local dev string in .env.example; the
+      # service has no TLS and the `postgres` driver would otherwise negotiate.
+      DATABASE_URL: postgresql://devloop:devloop@127.0.0.1:5432/devloop?sslmode=disable
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          # Same throwaway pair as DATABASE_URL above. `POSTGRES_DB` names the
+          # database created at first boot; the health check below is what the
+          # job waits on, so steps cannot race an initialising server.
+          POSTGRES_USER: devloop
+          POSTGRES_PASSWORD: devloop
+          POSTGRES_DB: devloop
+        ports:
+          # 5432:5432 — GitHub-hosted runners have nothing on 5432, so the
+          # service port maps to the same number and the URL above reads as it
+          # would locally.
+          - 5432:5432
+        # Without these options a step can connect in the window where the
+        # container is running but initdb has not finished, and the resulting
+        # error ("the database system is starting up") looks like a code defect
+        # instead of a race. With them, GitHub holds the job until the server
+        # genuinely accepts connections.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      # Same guard as `verify` and `e2e`, for the same reason: bun 1.3.x
+      # `--frozen-lockfile` exits 0 when bun.lock is absent entirely and
+      # resolves from the registry instead, which would let a PR that deleted
+      # the lockfile report a green `db round trip`.
+      - name: Verify lockfile is committed
+        run: |
+          if [ ! -f bun.lock ]; then
+            echo "::error::bun.lock is missing from the repository. Run 'bun install' and commit the lockfile."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Server-side reachability, before anything that depends on the schema.
+      # This asserts the service is genuinely usable (not merely that a TCP
+      # port is open) and is the first place a provisioning problem is
+      # reported as itself. It prints `SELECT 1 => 1` and never the URL.
+      - name: Check database connection
+        run: bun run db:check
+
+      # The suite inserts real rows into a real table with real constraints, so
+      # the schema must exist before it runs. `db:migrate` is idempotent (it
+      # applies only the migrations not yet recorded), and against a fresh
+      # ephemeral service it applies all of them.
+      - name: Apply migrations
+        run: bun run db:migrate
+
+      # THE step this job exists for. Deliberately not `bun run test`: that
+      # config does not collect `db/**`, and adding the directory to it would
+      # make every developer without a database see a red default suite.
+      - name: DB round-trip tests
+        run: bun run test:db
