@@ -166,9 +166,47 @@ function isInside(dir, target) {
 function resolveAliasSpecifier(specifier) {
   for (const [prefix, targetDir] of PATH_ALIASES) {
     if (!specifier.startsWith(prefix)) continue;
-    return path
-      .resolve(targetDir, specifier.slice(prefix.length))
-      .replace(SOURCE_SUFFIX, "");
+    // D-119 BYPASS 1. The remainder must stay RELATIVE to the alias target, or
+    // `path.resolve` discards `targetDir` entirely and the resolved path can
+    // never land inside a denied root. `@//core/../plugins/acme/impl` slices to
+    // `/core/../plugins/acme/impl`, which is absolute: resolving it yields
+    // `/plugins/acme/impl`, outside `<root>/src/plugins`, so `check` returned
+    // silently while `tsc` — which reads `@/core/../plugins/...` as a real
+    // module — happily resolved it. Prefixing `./` forces the remainder to be
+    // read as relative, so the extra slash collapses to what it means and the
+    // hop-collapse above is untouched: `@//core/../plugins/acme/impl` now
+    // normalises to the same `<SRC_DIR>/plugins/acme/impl` that
+    // `@/core/../plugins/acme/impl` always produced.
+    const remainder = `./${specifier.slice(prefix.length)}`;
+    return path.resolve(targetDir, remainder).replace(SOURCE_SUFFIX, "");
+  }
+  return null;
+}
+
+/**
+ * The static string a module specifier denotes, or `null` when it is dynamic.
+ *
+ * D-119 BYPASS 2. `checkCall` and the `ImportExpression` visitor used to gate on
+ * `first?.type === "Literal"` alone, so a backtick specifier — which parses as
+ * a `TemplateLiteral` — was skipped even when it contained no substitution at
+ * all and was therefore just as deniable as a quoted one. This mirrors ESLint's
+ * own `no-restricted-imports`, which uses `getStaticStringValue` for exactly
+ * this distinction.
+ *
+ * A template literal WITH a substitution stays `null`: it is genuinely dynamic
+ * and out of this rule's reach, the same as a specifier built by concatenation.
+ */
+function staticSpecifierValue(node) {
+  if (!node) return null;
+  if (node.type === "Literal") {
+    return typeof node.value === "string" ? node.value : null;
+  }
+  if (
+    node.type === "TemplateLiteral" &&
+    node.expressions.length === 0 &&
+    node.quasis.length === 1
+  ) {
+    return node.quasis[0].value.cooked ?? null;
   }
   return null;
 }
@@ -239,10 +277,8 @@ const rule = {
         callee.type === "Import" ||
         (callee.type === "Identifier" && callee.name === "require");
       if (!isImport) return;
-      const first = node.arguments[0];
-      if (first?.type === "Literal" && typeof first.value === "string") {
-        check(first, first.value);
-      }
+      const specifier = staticSpecifierValue(node.arguments[0]);
+      if (specifier !== null) check(node.arguments[0], specifier);
     };
 
     return {
@@ -256,10 +292,8 @@ const rule = {
       // needs its own visitor — without this, a dynamic import is a one-line
       // bypass of the whole rule. Asserted by a named test case.
       ImportExpression: (node) => {
-        const first = node.source;
-        if (first?.type === "Literal" && typeof first.value === "string") {
-          check(first, first.value);
-        }
+        const specifier = staticSpecifierValue(node.source);
+        if (specifier !== null) check(node.source, specifier);
       },
     };
   },

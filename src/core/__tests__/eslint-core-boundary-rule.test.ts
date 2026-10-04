@@ -504,6 +504,154 @@ describe("core-boundary lint rule: the `@/` alias escape (B17)", () => {
   });
 });
 
+describe("core-boundary lint rule: D-119 — the two spellings that evaded it", () => {
+  // Both of these were measured as LIVE BYPASSES at the assembled head
+  // `d07a371` — by the PM (D-119), and independently re-measured by QA and by
+  // me — so both are asserted here as revert-to-fail regression tests. Each
+  // case names the control it is measured against, because a bypass assertion
+  // on its own is exactly the shape that passes vacuously: if the probe
+  // destination does not resolve, or if the rule silently stopped running,
+  // "not flagged" and "flagged" look identical.
+  //
+  // The non-vacuity mechanism differs per case and is deliberate:
+  //   - bypass 1 is asserted on the RESOLVED PATH as well as on the report, so
+  //     a resolver that returned something arbitrary cannot satisfy it;
+  //   - bypass 2 runs the same fixture twice, quoted and backticked, so the
+  //     quoted form is the in-band control proving the visitor fired at all.
+
+  /** The denied destination, spelled the way B17 originally reported it. */
+  const CANONICAL = `@/core/../${NS}/acme/impl`;
+  /** The bypass-1 spelling: an alias remainder that STARTS WITH `/`. */
+  const ABSOLUTE_REMAINDER = `@//core/../${NS}/acme/impl`;
+
+  it("DENIES an alias remainder starting with `/` — it is not a different path", () => {
+    // D-119 bypass 1. `path.resolve(targetDir, remainder)` discards `targetDir`
+    // the moment `remainder` is absolute, so `@//core/../plugins/acme/impl`
+    // resolved to `/plugins/acme/impl` — outside every denied root — and
+    // `check` returned silently. `tsc` resolved that very specifier to the real
+    // plugin module, so this was a bypass rather than a curiosity: the denied
+    // import compiled and core could reach plugin code.
+    //
+    // The control is load-bearing. It proves the rule fires at this filename
+    // on THIS destination, so the assertion below cannot be satisfied by a
+    // resolver that decided nothing was deniable here.
+    const from = coreFile("d119-abs-remainder.ts");
+    expect(
+      lint(from, `import "${CANONICAL}";\n`),
+      "control must be denied",
+    ).toHaveLength(1);
+    expect(
+      lint(from, `import "${ABSOLUTE_REMAINDER}";\n`),
+      `${ABSOLUTE_REMAINDER} names the same denied module as ${CANONICAL}`,
+    ).toHaveLength(1);
+
+    // The mechanism itself, asserted directly: pre-fix this was
+    // `/plugins/acme/impl`, i.e. the alias target had been thrown away. If a
+    // future change restores that, the assertion fails with the actual path in
+    // the diff rather than relying on a downstream test to notice.
+    expect(resolveRelativeSpecifier(from, ABSOLUTE_REMAINDER)).toBe(
+      `${ROOT}/src/${NS}/acme/impl`,
+    );
+    expect(resolveRelativeSpecifier(from, ABSOLUTE_REMAINDER)).toBe(
+      resolveRelativeSpecifier(from, CANONICAL),
+    );
+  });
+
+  it("keeps denying the `/`-remainder spelling through every non-import door", () => {
+    // The fix is in the resolver, not in `ImportDeclaration`, so re-export,
+    // `export *`, dynamic `import()` and `require()` all inherit it. Asserted
+    // individually: a fix applied at one visitor would leave the others open
+    // while this block stayed green for the quoted spelling.
+    for (const [label, code] of [
+      ["re-export", `export { x } from "${ABSOLUTE_REMAINDER}";\n`],
+      ["export-star", `export * from "${ABSOLUTE_REMAINDER}";\n`],
+      [
+        "dynamic-import",
+        `export async function f() { return import("${ABSOLUTE_REMAINDER}"); }\n`,
+      ],
+      ["require", `const m = require("${ABSOLUTE_REMAINDER}");\n`],
+    ] as const) {
+      expect(
+        lint(coreFile("a", "b", `d119-${label}.ts`), code),
+        `${label} must not be a way around the /-remainder spelling`,
+      ).toHaveLength(1);
+    }
+  });
+
+  it("DENIES a substitution-free template literal specifier", () => {
+    // D-119 bypass 2. A backtick specifier parses as a `TemplateLiteral`, and
+    // both the `checkCall` gate and the `ImportExpression` visitor tested
+    // `first?.type === "Literal"` alone, so the rule skipped a specifier that
+    // was completely static and just as deniable as the quoted one. ESLint's
+    // own `no-restricted-imports` uses `getStaticStringValue` for precisely
+    // this distinction.
+    const quoted = `export async function f() { return import("${CANONICAL}"); }\n`;
+    const backticked = `export async function f() { return import(\`${CANONICAL}\`); }\n`;
+    // In-band control: the quoted form must still be reported, which proves the
+    // visitor ran and the rule was reachable at this filename. Without it, an
+    // unflagged backticked form would be indistinguishable from a rule that
+    // had stopped firing altogether.
+    expect(
+      lint(coreFile("d119-tl-quoted.ts"), quoted),
+      "control: the quoted specifier must still be denied",
+    ).toHaveLength(1);
+    expect(
+      lint(coreFile("d119-tl-backtick.ts"), backticked),
+      "a static template literal is deniable by the same reason as a quote",
+    ).toHaveLength(1);
+  });
+
+  it("DENIES a substitution-free template literal passed to require() too", () => {
+    // `require(\`…\`)` parses as a CallExpression, not an ImportExpression, so
+    // it exercises the other of the two gates D-119 named. Both were
+    // `Literal`-only, and fixing one without the other leaves this open.
+    const spec = escapeSpecifier(2, `${NS}/acme/impl`);
+    expect(
+      lint(
+        coreFile("a", "b", "d119-req-q.ts"),
+        `const m = require("${spec}");\n`,
+      ),
+      "control: the quoted require must still be denied",
+    ).toHaveLength(1);
+    expect(
+      lint(
+        coreFile("a", "b", "d119-req-t.ts"),
+        `const m = require(\`${spec}\`);\n`,
+      ),
+      "require() with a static template literal must be denied",
+    ).toHaveLength(1);
+  });
+
+  it("still ignores a template literal WITH a substitution — that one is dynamic", () => {
+    // The deliberate boundary of the D-119 fix. A substituted specifier has no
+    // static value to compare, exactly like one built by concatenation, and is
+    // out of this rule's reach for the same reason. Asserting it stays
+    // unflagged is what stops the fix degenerating into "deny every
+    // backticked import", which is the blunt instrument the original
+    // `../plugins/*` family was replaced to avoid.
+    const from = coreFile("a", "b", "d119-dynamic.ts");
+    expect(
+      lint(
+        from,
+        `const name = "${NS}";\nexport async function f() { return import(\`./\${name}/acme/impl\`); }\n`,
+      ),
+      "a dynamically-computed specifier is out of this rule's reach",
+    ).toEqual([]);
+    // And the static template literal must still be denied at the same filename,
+    // so the case above cannot be satisfied by never checking a TemplateLiteral
+    // again — which is exactly the pre-fix behaviour this block exists to kill.
+    // Same CANONICAL destination as the case above, so the ONLY difference
+    // between the two fixtures is the substitution.
+    expect(
+      lint(
+        from,
+        `export async function f() { return import(\`${CANONICAL}\`); }\n`,
+      ),
+      "a template literal with no substitution is still static",
+    ).toHaveLength(1);
+  });
+});
+
 describe("core-boundary lint rule: the lint helper cannot false-green", () => {
   it("throws rather than returning [] when the config does not apply", () => {
     // The single most likely way this whole block produces a green suite that
