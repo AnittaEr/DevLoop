@@ -14,46 +14,198 @@ import { expect, test } from "@playwright/test";
  * set an env var. That is a worse outcome than the coverage it buys, and it is
  * recorded as a finding on this card rather than shipped.
  *
- * What is proven here is the part that genuinely needs an HTTP client to prove:
- * the route exists, is mounted under `src/app/api/**`, answers POST, refuses
- * GET, and returns a classified, non-leaking JSON body. In the e2e environment
- * `DATABASE_URL` is unset, so the route short-circuits to
- * `database_unconfigured` — which is itself the assertion that matters: the
- * short-circuit happens over real HTTP, before any credential is resolved and
- * before any outbound request is made. The success and upstream-failure
- * branches are covered by the Vitest suite in
+ * ── WHY THIS FILE ASSERTS A CONTRACT INSTEAD OF ONE OUTCOME ────────────────
+ *
+ * The first version of this spec asserted `outcome === "database_unconfigured"`.
+ * That was a reproducibility bug, and a reviewer's `.env` caught it: QA round 1
+ * copied `.env.example` to `.env` — exactly what `.env.example:2` and
+ * `db/migrate.ts:16` instruct a developer to do — and the same assertion then
+ * failed with `Received: "source_not_configured"`. The ROUTE was correct in both
+ * runs; only the expectation was environment-specific. With `DATABASE_URL` set,
+ * the `database_unconfigured` short-circuit does not fire and the route
+ * correctly falls through to the composition root, which reports the unset
+ * `DEVLOOP_REPOSITORY` instead.
+ *
+ * So this spec now asserts the parts of the contract that hold in EVERY
+ * configuration (below), and derives which configuration it landed in from the
+ * route's own answer rather than from an ambient variable nobody declared.
+ *
+ * NOTE ON WHY WE CANNOT JUST SKIP WHEN CONFIGURED. It is tempting to skip
+ * unless `process.env.DATABASE_URL` is unset, but that does not work here and
+ * the reason is worth recording: this spec runs in the PLAYWRIGHT TEST process,
+ * which does not load `.env` at all — only the Next.js server does, at runtime.
+ * A developer who configured the project with a `.env` FILE (the documented
+ * path) is invisible to a `process.env` check in this file, so a skip guard
+ * built on it would not skip, and the original flake would survive it. The
+ * branch is therefore read off the response.
+ *
+ * WHAT IS PROVEN HERE is the part that genuinely needs an HTTP client: the
+ * route is mounted under `src/app/api/**`, answers POST, refuses GET, and
+ * returns classified, non-leaking JSON whose outcome and status agree. In an
+ * unconfigured environment the configuration short-circuit fires over real HTTP,
+ * before any credential is resolved and before any outbound request is made.
+ * The success and upstream-failure branches are covered by the Vitest suite in
  * `src/app/api/sync/__tests__/handler.test.ts` with an injected registry,
- * writer and sync function.
+ * writer and the real `syncSource`.
  */
+
+/**
+ * The status for each outcome, mirroring `statusFor` in the handler.
+ *
+ * Asserting the PAIR (outcome, status) rather than a status alone is what makes
+ * "each failure mode is distinct" checkable from outside: a caller cannot be
+ * handed a 200 for a failure, or a 503 for something that is not the service
+ * being unready. Duplicated here rather than imported because this is an
+ * HTTP-client assertion about the wire format, and importing the handler would
+ * make the spec assert the implementation against itself.
+ */
+const STATUS_FOR_OUTCOME: Readonly<Record<string, number>> = {
+  synced: 200,
+  empty: 200,
+  database_unconfigured: 503,
+  source_not_configured: 503,
+  credential_unavailable: 503,
+  upstream_rejected: 502,
+  upstream_unreachable: 502,
+  already_present: 409,
+  internal_error: 500,
+};
+
+/** Outcomes that mean the sync completed. Everything else is a failure. */
+const SUCCESS_OUTCOMES: ReadonlySet<string> = new Set(["synced", "empty"]);
+
+/**
+ * Outcomes reachable when the environment is not fully configured. Whichever
+ * one fires, the route refused to do work rather than attempting a sync.
+ */
+const CONFIGURATION_OUTCOMES: ReadonlySet<string> = new Set([
+  "database_unconfigured",
+  "source_not_configured",
+]);
+
+/** Every key the response body is allowed to carry. */
+const BODY_KEYS: ReadonlySet<string> = new Set([
+  "ok",
+  "outcome",
+  "message",
+  "source",
+  "fetched",
+  "persisted",
+  "byType",
+  "upstreamStatus",
+  "idempotent",
+  "idempotencyNote",
+]);
+
+interface SyncBody {
+  ok: boolean;
+  outcome: string;
+  message: string;
+  source: string;
+  fetched: number;
+  persisted: number;
+  byType: Record<string, number>;
+  idempotent: boolean;
+  idempotencyNote: string;
+}
+
+async function postSync(
+  request: import("@playwright/test").APIRequestContext,
+): Promise<{ status: number; body: SyncBody }> {
+  const response = await request.post("/api/sync");
+  expect(response.headers()["content-type"]).toContain("application/json");
+  return {
+    status: response.status(),
+    body: (await response.json()) as SyncBody,
+  };
+}
+
+/**
+ * The leak assertions, kept in one place because they are what protects the
+ * hard secret-hygiene constraint on this card. Deliberately broad: no
+ * credential, no Authorization header, and no upstream or driver text can
+ * appear anywhere in the serialised body.
+ */
+function expectNoSecrets(body: SyncBody): void {
+  expect(body).not.toHaveProperty("token");
+  expect(body).not.toHaveProperty("error");
+  const serialised = JSON.stringify(body).toLowerCase();
+  expect(serialised).not.toContain("authorization");
+  expect(serialised).not.toContain("bearer ");
+  expect(serialised).not.toContain("ghp_");
+}
+
 test.describe("POST /api/sync", () => {
-  test("is reachable over HTTP and classifies a missing DATABASE_URL", async ({
+  test("answers with a classified body whose outcome and status agree", async ({
     request,
   }) => {
-    const response = await request.post("/api/sync");
+    const { status, body } = await postSync(request);
 
-    expect(response.status()).toBe(503);
-    expect(response.headers()["content-type"]).toContain("application/json");
+    // The outcome must be a member of the closed set, in every environment.
+    // The containment check is the real assertion: an outcome this spec has
+    // never heard of fails here rather than passing silently, and it is what
+    // makes the lookup on the next line total.
+    expect(Object.keys(STATUS_FOR_OUTCOME)).toContain(body.outcome);
+    expect(status).toBe(STATUS_FOR_OUTCOME[body.outcome]);
 
-    const body = await response.json();
+    // Success and failure agree with each other.
+    expect(body.ok).toBe(SUCCESS_OUTCOMES.has(body.outcome));
 
-    expect(body.ok).toBe(false);
-    expect(body.outcome).toBe("database_unconfigured");
-    // The count a human needs in order to trust the answer.
-    expect(body.persisted).toBe(0);
-    expect(body.fetched).toBe(0);
-    // Never a credential, never an upstream fragment.
-    expect(body).not.toHaveProperty("token");
-    expect(body).not.toHaveProperty("error");
-    expect(JSON.stringify(body).toLowerCase()).not.toContain("authorization");
+    // A human-facing message exists, and it is not empty.
+    expect(typeof body.message).toBe("string");
+    expect(body.message.length).toBeGreaterThan(0);
+
+    expectNoSecrets(body);
+  });
+
+  test("carries only the documented keys, so the body cannot grow with the page", async ({
+    request,
+  }) => {
+    const { body } = await postSync(request);
+
+    for (const key of Object.keys(body)) {
+      expect(BODY_KEYS.has(key), `unexpected response key: ${key}`).toBe(true);
+    }
+
+    // `byType` is a ROLLUP, and what is correct about it depends on the
+    // outcome — so assert the invariant, not one environment's value:
+    //  - on any outcome that wrote or read nothing, it must be empty;
+    //  - on a success that fetched events, every entry is a positive count and
+    //    the total can never exceed `fetched`.
+    //
+    // An earlier draft of this test asserted `byType == {}` unconditionally,
+    // which is the SAME class of bug as the outcome assertion it replaced: it
+    // holds in an unconfigured environment and breaks on a configured one, the
+    // moment a real sync returns a non-empty rollup.
+    expect(typeof body.byType).toBe("object");
+    expect(body.byType).not.toBeNull();
+    expect(Array.isArray(body.byType)).toBe(false);
+
+    let total = 0;
+    for (const [type, count] of Object.entries(body.byType)) {
+      expect(typeof type).toBe("string");
+      expect(Number.isInteger(count)).toBe(true);
+      expect(count).toBeGreaterThan(0);
+      total += count;
+    }
+
+    if (SUCCESS_OUTCOMES.has(body.outcome)) {
+      expect(total).toBe(body.fetched);
+    } else {
+      // Every failure reports zero rows and therefore an empty rollup.
+      expect(body.byType).toEqual({});
+      expect(total).toBe(0);
+    }
   });
 
   test("always tells the caller the route is not idempotent", async ({
     request,
   }) => {
-    const response = await request.post("/api/sync");
-    const body = await response.json();
+    const { body } = await postSync(request);
 
     // A caller reading only the JSON must not mistake this for safe-to-retry.
+    // True on every path, success or failure — which is why it is asserted
+    // without regard to the outcome the environment produced.
     expect(body.idempotent).toBe(false);
     expect(body.idempotencyNote).toContain("already_present");
   });
@@ -66,5 +218,45 @@ test.describe("POST /api/sync", () => {
     // 405, not 200 and not a silent success: a sync WRITES rows, so answering
     // it to GET would let `<img src>` or a prefetcher cause a write.
     expect(response.status()).toBe(405);
+  });
+
+  /**
+   * The configuration short-circuit, asserted only when the environment
+   * actually produced one.
+   *
+   * In CI (`DATABASE_URL` unset) this is the whole point of the e2e job: the
+   * route refuses to work over real HTTP, before any credential is resolved
+   * and before any outbound request. On a fully configured developer machine the
+   * route instead attempts a real sync and lands on `synced`/`empty`/
+   * `already_present`, so there is no configuration short-circuit to assert —
+   * and the test skips with a reason instead of failing for the wrong reason.
+   *
+   * ── DISCLOSURE: THIS TEST CAN WRITE TO A DEVELOPER'S OWN DATABASE ────────
+   * On a machine where `.env` supplies `DATABASE_URL`, `DEVLOOP_REPOSITORY` and
+   * a real PAT, the POSTs above perform a REAL sync: real rows into that
+   * developer's local `canonical_events` table, and a real authenticated call to
+   * GitHub. That is inherent to proving the route reachable over HTTP, which
+   * this card requires, and it CANNOT be neutralised from here: the server's
+   * environment is fixed by `playwright.config.ts`, which is DO NOT TOUCH.
+   * A second local run reports `already_present` (HTTP 409) for the same rows,
+   * which is exactly the non-idempotency this card is required to surface, and
+   * is why the assertions above are written to accept every outcome.
+   */
+  test("refuses to sync before resolving a credential when the environment is unconfigured", async ({
+    request,
+  }) => {
+    const { status, body } = await postSync(request);
+
+    test.skip(
+      !CONFIGURATION_OUTCOMES.has(body.outcome),
+      `environment is fully configured, so the route attempted a real sync and reported "${body.outcome}" — there is no configuration short-circuit to assert here`,
+    );
+
+    expect(status).toBe(503);
+    expect(body.ok).toBe(false);
+    expect(body.persisted).toBe(0);
+    expect(body.fetched).toBe(0);
+    expect(CONFIGURATION_OUTCOMES.has(body.outcome)).toBe(true);
+    expectNoSecrets(body);
   });
 });
