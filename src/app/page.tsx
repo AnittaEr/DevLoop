@@ -1,4 +1,4 @@
-import { Button } from "@/components/ui/button";
+import { GetStartedButton } from "@/app/get-started-button";
 
 export default function Home() {
   return (
@@ -8,7 +8,7 @@ export default function Home() {
         DevLoop foundation is in place: Next.js App Router, TypeScript strict,
         Tailwind, shadcn/ui, ESLint, Prettier and Vitest.
       </p>
-      <Button>Get started</Button>
+      <GetStartedButton />
     </main>
   );
 }

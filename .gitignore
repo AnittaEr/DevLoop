@@ -18,6 +18,11 @@ dist/
 # testing
 coverage/
 
+# playwright
+test-results/
+playwright-report/
+.playwright/
+
 # env
 .env
 .env.local
