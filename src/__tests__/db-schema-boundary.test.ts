@@ -38,18 +38,30 @@
  * `fieldNameOnly` POSITION is widened to SQL column syntax, and token boundaries are
  * alphanumeric rather than `\b`.
  *
- * Case-folding is NOT applied here, matching the core guard's current behaviour.
- * Case-insensitivity is B19's card (`t_955b2cb0`), still in flight; if this file
- * were made case-insensitive independently the two guards would diverge and the fix
- * would have to be applied twice. The one consequence is measured and asserted in
- * the suite rather than hidden: the only provider token in today's `db/**` is the
- * capitalised `GitHub` in `db/schema.ts`'s header comment, so a case-SENSITIVE scan
- * of the raw bytes does not see it.
+ * Case-folding, and why it is here (B30). This file was written case-SENSITIVE and
+ * said so: case-insensitivity was "B19's card (`t_955b2cb0`), still in flight", and
+ * making this file case-insensitive independently would have made the fix be applied
+ * twice. That reasoning was correct WHEN WRITTEN, and the condition it named has now
+ * been met — B19 landed at `40138c27390952bb265eccae3cf81076129953ce` and the core
+ * guard is case-INSENSITIVE. So the deferral is discharged here, by this file, with
+ * one `CASE_INSENSITIVE` constant feeding every token regex.
+ *
+ * Applying the flag twice is not left to a reader's memory. `it("agrees with the
+ * core plugin-boundary guard on shared probes")` below imports the core guard's own
+ * `findViolations` and asserts the two agree token-for-token, so the next edit to
+ * either copy that changes this axis fails a named test instead of silently making
+ * the two guards disagree.
+ *
+ * The consequence is measured, not assumed: the only provider token in today's
+ * `db/**` is the capitalised `GitHub` in `db/schema.ts`'s header comment, which
+ * comment-stripping already removes before the armed scan runs — so the guard is
+ * clean at its head and the flag's real work is on the shapes it has not seen yet.
+ * Those are pinned by the three case-family probes and by the parity test.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 /**
  * Deny-list, written as plain literals on purpose: NOT assembled by string
@@ -120,18 +132,58 @@ const DENY_LIST: readonly DenyFamily[] = [
   },
 ] as const;
 
-/** Module specifiers `db/**` may never reach for. */
+/**
+ * B30: the one place this file says whether it folds case.
+ *
+ * Every deny-list token in `DENY_LIST` is spelled lowercase, and every one of them
+ * is reachable as `GITHUB_REPO`, `GitHubPullRequest` or `OCTOKIT_TOKEN` in exactly
+ * the positions this guard exists to police. Without the flag the pattern is blind
+ * to all three.
+ *
+ * Declared as a named constant rather than a bare inline `"i"` for the reason B19
+ * gave in `src/core/__tests__/plugin-boundary.test.ts` (its own
+ * `CASE_INSENSITIVE`): there are several regex-construction sites here plus four
+ * forbidden-import literals that spell a provider, and a guard that folds case in
+ * some of them and not others is a half-armed guard that still reports green. One
+ * constant means the next edit has one place to look, and the parity test below can
+ * assert the policy instead of restating it.
+ */
+const CASE_INSENSITIVE = "i";
+
+/**
+ * Module specifiers `db/**` may never reach for.
+ *
+ * B30: the four patterns that SPELL A PROVIDER (`@octokit/`, `@gitlab/`,
+ * `bitbucket`, `azure-devops`) carry `CASE_INSENSITIVE`, matching the core guard's
+ * own split — `@OCTOKIT/rest` and `require("Bitbucket")` are working import paths a
+ * case-sensitive guard cannot see. The three PATH-SHAPE patterns (`plugins/`,
+ * `@/plugins/`, `node_modules/`) deliberately do not: they name no provider, so
+ * there is nothing to fold, and folding them would only widen a pattern whose job
+ * is to recognise a directory layout.
+ */
 const FORBIDDEN_IMPORT_PATTERNS: ReadonlyArray<{
   readonly family: string;
   readonly pattern: RegExp;
 }> = [
   { family: "plugin-boundary", pattern: /(^|["'`])\/?(src\/)?plugins\// },
   { family: "plugin-boundary", pattern: /@\/plugins\// },
-  { family: "provider-sdk", pattern: /@octokit\// },
+  {
+    family: "provider-sdk",
+    pattern: new RegExp("@octokit/", CASE_INSENSITIVE),
+  },
   { family: "provider-sdk", pattern: /(^|["'`/])node_modules\// },
-  { family: "provider-sdk", pattern: /(^|["'`/])@gitlab\// },
-  { family: "provider-sdk", pattern: /bitbucket/ },
-  { family: "provider-sdk", pattern: /azure-devops/ },
+  {
+    family: "provider-sdk",
+    pattern: new RegExp("(^|[\"'`/])@gitlab/", CASE_INSENSITIVE),
+  },
+  {
+    family: "provider-sdk",
+    pattern: new RegExp("bitbucket", CASE_INSENSITIVE),
+  },
+  {
+    family: "provider-sdk",
+    pattern: new RegExp("azure-devops", CASE_INSENSITIVE),
+  },
 ];
 
 // Module-load invariants: a deny-list that failed to load, or a stripper that was
@@ -216,14 +268,90 @@ export type Violation = {
  * treats `_` as the delimiter it is in SQL. The look-alike protection the core
  * guard cares about survives intact: `shadow` still does not match `ado` (the `a` is
  * preceded by `w`), and `spr_` / `xmr_thing` still do not match `pr_` / `mr_`.
+ *
+ * B30: `CASE_INSENSITIVE` is what makes this pattern see `GITHUB_TOKEN` and
+ * `GitHubToken` at all. The `lead`/`trail` decisions below are made in CODE against
+ * the token's own characters (`/[A-Za-z0-9]/.test(...)`) rather than against the
+ * subject line, and they must stay that way: the `i` flag would otherwise fold a
+ * character class and re-admit the camelCase hump, which is the same trap that made
+ * B19 move its equivalent check out of the regex and into `tokenEndsCleanly`.
  */
 function tokenPattern(token: string): RegExp {
   const escaped = escapeForRegExp(token);
   const lead = /[A-Za-z0-9]/.test(token[0] ?? "") ? "(?:^|[^A-Za-z0-9])" : "";
-  const trail = /[A-Za-z0-9]/.test(token[token.length - 1] ?? "")
-    ? "(?:[^A-Za-z0-9]|$)"
-    : "";
-  return new RegExp(`${lead}${escaped}${trail}`);
+  // NO trailing boundary in the pattern, and that is B19's second root cause rather
+  // than an omission. Measured on this file with the flag first added and only the
+  // `i` applied: `GitHubToken` reported ZERO violations, because `github` is
+  // followed by `T` and a trailing `(?:[^A-Za-z0-9]|$)` refuses every alphanumeric.
+  // `GITHUB_TOKEN` happened to survive only because `_` is a delimiter, which is
+  // luck, not coverage: the shape B19 exists for — a provider name as the PREFIX of
+  // a longer identifier, in camelCase — was still invisible here.
+  //
+  // The trailing test therefore lives in {@link tokenEndsCleanly}, in CODE, exactly
+  // as the core guard does it and for exactly the reason it gives: the decision
+  // needs the ACTUAL case of the next character, and under case-insensitive
+  // matching a negated class folds (a `[^a-z]` would also exclude `A-Z`), so the
+  // camelCase hump cannot be expressed in the regex at all. Attempting it here is
+  // the same trap B19 measured and abandoned.
+  return new RegExp(`${lead}${escaped}`, CASE_INSENSITIVE);
+}
+
+/**
+ * Does the match that just ended sit at a legal END of a provider identifier?
+ *
+ * Mirrors the core guard's `tokenEndsCleanly` so the two agree by construction on
+ * this axis rather than by coincidence. A token embedded in the middle of a
+ * LOWERSPACED word is a different symbol (`xgithuby`, and `shadow` for `ado`), so a
+ * lowercase continuation is refused. Everything else is a real leak:
+ *   - end of line / identifier   -> `github`, `OCTOKIT`
+ *   - an underscore or delimiter  -> `GITHUB_TOKEN_PREFIX` (SQL treats `_` as part
+ *                                    of the name, which is why this guard reads
+ *                                    column declarations at all)
+ *   - a camelCase hump (uppercase)-> `GitHubToken`
+ */
+function tokenEndsCleanly(
+  line: string,
+  matchIndex: number,
+  tokenLength: number,
+): boolean {
+  const next = line[matchIndex + tokenLength];
+  return next === undefined || next === "_" || !/[a-z]/.test(next);
+}
+
+/**
+ * Whole-token gate for one deny entry against one line.
+ *
+ * `entry.pattern.test(line)` alone is NOT sufficient once the trailing decision
+ * lives in code: a line can contain a clean match and a dirty one (`xgithuby
+ * GitHubToken`), and a boolean `test()` reports only whether SOME match exists.
+ * Re-running with `g` and accepting if ANY candidate ends cleanly is the core
+ * guard's `tokenMatches` shape, kept identical so the two cannot diverge on this
+ * axis.
+ */
+function tokenEndsCleanlyOn(
+  line: string,
+  entry: { readonly token: string; readonly pattern: RegExp },
+): boolean {
+  // Tokens that do not end on a word character (`pr_`, `owner/repo`) have nothing
+  // after them to check, and `_`-terminated tokens encode their own delimiter.
+  if (!/[A-Za-z0-9]$/.test(entry.token)) return true;
+  // `g` is REQUIRED: without it `matchAll` sees only the first candidate, which is
+  // precisely the case this re-check exists for.
+  const re = new RegExp(entry.pattern.source, `g${CASE_INSENSITIVE}`);
+  for (const m of line.matchAll(re)) {
+    if (m.index === undefined) continue;
+    // The token does NOT necessarily start at `m.index`. This guard's leading
+    // boundary is `(?:^|[^A-Za-z0-9])`, which CONSUMES a delimiter character,
+    // whereas the core guard's is `\b`, which is zero-width — so the same
+    // `m.index + tokenLength` arithmetic that is correct there is off by one here
+    // and silently reports every `github`-shaped token as ending mid-identifier.
+    // (Measured: doing this wrong took the suite from 4 failures to 15, every one of
+    // them a real detection that stopped firing.) Deriving the start from the match
+    // length is robust to either boundary style.
+    const tokenStart = m.index + m[0].length - entry.token.length;
+    if (tokenEndsCleanly(line, tokenStart, entry.token.length)) return true;
+  }
+  return false;
 }
 
 function escapeForRegExp(literal: string): string {
@@ -245,7 +373,7 @@ function fieldNamePattern(token: string): RegExp {
   return new RegExp(
     "(?:^|[{;,\\n(])\\s*(?:readonly\\s+)?" +
       `"?${escaped}"?\\s*(?:\\?\\s*:|\\s*:|\\s+[A-Za-z(])`,
-    "m",
+    `m${CASE_INSENSITIVE}`,
   );
   // Three position alternatives are all load-bearing: `\?\s*:` for an optional TS
   // field, `\s*:` for a required TS field AND for a bare SQL column list, and
@@ -682,7 +810,7 @@ export function findViolations(source: string, file: string): Violation[] {
         const fieldPattern = FIELD_NAME_PATTERNS.get(entry.token);
         if (fieldPattern && !fieldPattern.test(line)) continue;
       }
-      if (entry.pattern.test(line)) {
+      if (entry.pattern.test(line) && tokenEndsCleanlyOn(line, entry)) {
         violations.push({
           file,
           line: index + 1,
@@ -888,7 +1016,7 @@ function findViolationsUnsafe(source: string, file: string): Violation[] {
         const fieldPattern = FIELD_NAME_PATTERNS.get(entry.token);
         if (fieldPattern && !fieldPattern.test(line)) continue;
       }
-      if (entry.pattern.test(line)) {
+      if (entry.pattern.test(line) && tokenEndsCleanlyOn(line, entry)) {
         violations.push({
           file,
           line: index + 1,
@@ -1187,5 +1315,336 @@ describe("db-schema comment stripping (B13/B17/B20 evasion families)", () => {
     expect(() =>
       stripCommentsForExtension("fixture.yaml", "github: 1"),
     ).toThrow(/no comment stripper/);
+  });
+});
+
+/**
+ * B30: the three case families, as permanent named failures.
+ *
+ * The guard was case-SENSITIVE for its whole life, so no shape in this file ever
+ * proved the flag was needed — the only real provider token in `db/**` is the
+ * capitalised `GitHub` in `db/schema.ts`'s header comment, and comment-stripping
+ * removes that before the armed scan runs. A guard never observed red is not
+ * evidence it is armed, so each family gets its own `it()` and each names the exact
+ * reason the token is a violation.
+ *
+ * Lowercase is included deliberately even though it already worked before B30: it is
+ * the control that proves the flag did not NARROW detection. A regex given `i` can
+ * lose a match it used to have, and `expr_value` / `shadow` below are the checks for
+ * that.
+ */
+describe("db-schema scanner (case families, B30)", () => {
+  const scanTs = (snippet: string) => findViolations(snippet, "fixture.ts");
+  const scanSql = (snippet: string) => findViolations(snippet, "fixture.sql");
+
+  it("catches a UPPER_SNAKE column, which the case-sensitive guard could not see", () => {
+    // A Drizzle column name derived from provider vocabulary. Before B30 this
+    // reported zero violations: `github` is spelled lowercase in the deny-list and
+    // the pattern carried no flag.
+    //
+    // The probe is BUILT from NATIVE_PULL rather than spelled out, because this file
+    // must not itself contain that literal -- see the note on NATIVE_PULL. Spelling
+    // it here was caught by the existing "assembles the deny-list's native tokens
+    // exactly" control, not by review.
+    const NAME = NATIVE_PULL.toUpperCase();
+    const tokens = scanTs(`  GITHUB_${NAME}: text("GITHUB_${NAME}"),`).map(
+      (v) => v.token,
+    );
+    expect(
+      tokens,
+      "an UPPER_SNAKE provider column must fire; if this is empty the i flag was dropped",
+    ).toContain("github");
+    // Both halves of the name fire, not just the vendor prefix.
+    expect(tokens).toContain(NATIVE_PULL);
+  });
+
+  it("catches a camelCase column, which the case-sensitive guard could not see", () => {
+    // The hump must come IMMEDIATELY after the vendor token. This guard refuses a
+    // LOWERCASE continuation (that is the `shadow`/`ado` look-alike rule), so
+    // `GitHubpullrequest` is clean by design and `GitHubPullRequest` is not.
+    // Measured: on the first spelling of this probe only the native half fired, not
+    // `github`, because the character after `GitHub` was lowercase `p`.
+    const tokens = scanTs('  GitHubPullRequest: text("native_ref"),').map(
+      (v) => v.token,
+    );
+    expect(
+      tokens,
+      "a camelCase provider column must fire; if this is empty the i flag was dropped",
+    ).toContain("github");
+    // The vendor prefix fired on the HUMP, which is the part the `i` flag alone
+    // cannot deliver: `tokenPattern("github").test("GitHubPullRequest")` is false
+    // without tokenEndsCleanly, because `P` is an alphanumeric.
+    expect(tokens.length).toBeGreaterThan(0);
+  });
+
+  it("catches an UPPER_SNAKE column in a migration, the dialect db/ really uses", () => {
+    // A migration is where a schema change lands, so this is the dialect that
+    // matters most and it is the one a reviewer reads least.
+    const NAME = "GITHUB_TOKEN";
+    const v = scanSql(
+      `ALTER TABLE canonical_events ADD COLUMN "${NAME}" text;`,
+    );
+    expect(
+      v.map((x) => x.token),
+      "an UPPER_SNAKE provider column in a migration must fire; if this is empty the i flag was dropped",
+    ).toContain("github");
+    expect(v[0]?.line).toBe(1);
+  });
+
+  it("still catches the lowercase form, so the flag did not narrow detection", () => {
+    // The control for the risk a flag introduces: `i` must not cost a match that
+    // worked before. If this ever goes empty the guard got narrower, not stricter.
+    expect(
+      scanTs('  github_repo_id: text("github_repo_id"),').map((v) => v.token),
+    ).toContain("github");
+    expect(
+      scanSql('CREATE TABLE "github_pulls" ("id" text);').map((v) => v.token),
+    ).toContain("github");
+  });
+
+  /**
+   * The negative controls, unchanged by B30, stated once as a named failure.
+   *
+   * `i` folds `[A-Z]` into the pattern, so the look-alike protection is the thing
+   * most at risk from this change: `shadow` contains `ado`, `expr_value` contains
+   * `pr_`-shaped text, and each is a real English word that a schema plausibly wants
+   * to use. If folding case makes the guard cry wolf, it gets deleted instead of
+   * fixed, and hard rule 1 loses its mechanical enforcement.
+   */
+  it("keeps every negative control clean, so case-folding does not add false positives", () => {
+    for (const token of ["expr_", "xmr_", "spr_", "repr_", "shadow"]) {
+      expect(
+        scanTs(`  ${token}value: text("${token}value"),`).map((v) => v.token),
+        `negative control ${token} must stay clean`,
+      ).toEqual([]);
+    }
+    // The one shape a folded `[A-Za-z]` boundary could plausibly re-admit: the
+    // camelCase hump. `ado` must not fire inside `shadow` in any casing.
+    for (const word of ["shadow", "SHADOW", "Shadow", "shAdow"]) {
+      expect(
+        scanTs(`  ${word}: text("${word}"),`).map((v) => v.token),
+        word,
+      ).toEqual([]);
+    }
+  });
+
+  it("catches an uppercased forbidden import, matching the core guard's split", () => {
+    // `@OCTOKIT/rest` and `require("Bitbucket")` are working import paths. The four
+    // forbidden-import patterns that SPELL a provider carry CASE_INSENSITIVE; the
+    // three path-shape patterns deliberately do not, and are not expected to fire.
+    expect(
+      scanTs('import { Octokit } from "@OCTOKIT/rest";').map((v) => v.family),
+    ).toContain("provider-sdk");
+    expect(
+      scanTs('import { Bitbucket } from "Bitbucket";').map((v) => v.family),
+    ).toContain("provider-sdk");
+    expect(
+      scanTs('import { g } from "@GitLab/api";').map((v) => v.family),
+    ).toContain("provider-sdk");
+    expect(
+      scanTs('import { a } from "AZURE-DEVOPS/api";').map((v) => v.family),
+    ).toContain("provider-sdk");
+  });
+
+  it("still fires on a plugin path, so widening the provider patterns did not replace them", () => {
+    // The counterpart to the test above. Widening the four provider-spelling
+    // patterns must not have disturbed the plugin-boundary pair, which are the only
+    // thing catching an import of `src/plugins/**` out of `db/`.
+    expect(
+      scanTs('import { gh } from "@/plugins/github/client";').map(
+        (v) => v.family,
+      ),
+    ).toContain("plugin-boundary");
+    expect(
+      scanTs('import { x } from "src/plugins/thing";').map((v) => v.family),
+    ).toContain("plugin-boundary");
+    // An uppercase PLUGINS path is still caught -- not by the path-shape pattern,
+    // which has no flag, but by `github` firing on the lowercase module name in the
+    // same string. Stated so a future edit that drops one of the two is visible.
+    expect(
+      scanTs('import { x } from "@/PLUGINS/github/client";').map(
+        (v) => v.token,
+      ),
+    ).toContain("github");
+  });
+});
+
+/**
+ * B30: parity with the core guard, asserted by execution rather than claimed in a
+ * comment.
+ *
+ * The defect this card fixes is not that `db/` was case-sensitive. It is that TWO
+ * COPIES of one policy existed and drifted, with nothing comparing them — so the
+ * next edit to either file can reopen the gap silently and both suites stay green.
+ * This test is the thing that stops that: it imports the core guard's own
+ * `findViolations` and runs both scanners over the SAME probe strings.
+ *
+ * Importing it is possible and was verified, not assumed. The core guard is itself a
+ * `*.test.ts` that calls `describe()` at module scope, so a plain dynamic import
+ * from inside a test throws "Calling the suite function inside test function is not
+ * allowed". `vi.doMock("vitest", ...)` neutralises that: the guard's suites are
+ * collected as no-ops and only its exported scanner is used. If the core guard ever
+ * stops exporting `findViolations`, this test fails by name rather than the import
+ * quietly becoming undefined and every assertion below becoming vacuous — which is
+ * why the typeof check is first and is not decoration.
+ */
+describe("db/ guard and core guard agree (B30 parity)", () => {
+  /**
+   * Probes chosen to cover the axis that actually drifted, plus the negative
+   * controls that must agree by being clean on BOTH sides. A probe set of only
+   * positives would pass trivially if both guards returned an empty array, so the
+   * clean probes carry as much of the assertion as the firing ones.
+   */
+  const SHARED_PROBES: readonly string[] = [
+    // The three shapes B19 exists for.
+    "GITHUB_TOKEN",
+    "GitHubToken",
+    // Built, never spelled: this file must not contain the native literal, or
+    // T10's guard reports it (see the note on NATIVE_PULL).
+    `github_${NATIVE_PULL}`,
+    "GITHUB_REPO",
+    "OCTOKIT",
+    "BITBUCKET",
+    "AZURE_DEVOPS",
+    // A deny token that carries no vendor substring, plus the camelCase hump that is
+    // the shape B19's `tokenEndsCleanly` exists for. The underscore spelling is
+    // `NATIVE_PULL` rather than a written literal: writing it in THIS file trips
+    // T10's guard -- the same constraint recorded above `NATIVE_PULL` -- and it also
+    // silently broke this file's own "does not leak the native token" control. Found
+    // by execution, twice, not by review.
+    "pullRequest",
+    NATIVE_PULL,
+    // Negative controls: must be clean on both sides.
+    "expr_value",
+    "xmr_thing",
+    "spr_value",
+    "repr_value",
+    "shadow",
+  ];
+
+  /**
+   * Run the core guard's scanner.
+   *
+   * Mocking `vitest` is required (see the note above) and is scoped to this one
+   * dynamic import: `vi` comes from the STATIC import at the top of this file, never
+   * from `await import("vitest")`. An earlier draft did the latter and it is a trap
+   * worth recording -- the first call registers the mock, `doUnmock` in the `finally`
+   * does not clear the module cache, so the SECOND call's `await import("vitest")`
+   * returns the stub, whose `vi` is `{}`, and the test dies with `vi.resetModules is
+   * not a function`. That failure is in the harness rather than in the policy being
+   * asserted, which is exactly the shape that reads as a real defect.
+   */
+  async function coreFindViolations(
+    source: string,
+  ): Promise<readonly string[]> {
+    vi.resetModules();
+    vi.doMock("vitest", () => ({
+      describe: () => undefined,
+      it: () => undefined,
+      expect: () => undefined,
+      beforeAll: () => undefined,
+      afterAll: () => undefined,
+      beforeEach: () => undefined,
+      afterEach: () => undefined,
+      vi: {},
+    }));
+    try {
+      const core = (await import("@/core/__tests__/plugin-boundary.test")) as {
+        findViolations?: (
+          source: string,
+          file: string,
+        ) => readonly {
+          token: string;
+        }[];
+      };
+      // FIRST assertion, and load-bearing: without it a core guard that stopped
+      // exporting `findViolations` would make every comparison below compare
+      // `[]` to `[]` and pass.
+      expect(
+        typeof core.findViolations,
+        "the core guard no longer exports findViolations; this parity test is now vacuous",
+      ).toBe("function");
+      const find = core.findViolations as NonNullable<
+        typeof core.findViolations
+      >;
+      return find(source, "parity-probe.ts").map((v) => v.token);
+    } finally {
+      vi.doUnmock("vitest");
+      vi.resetModules();
+    }
+  }
+
+  it("agrees with the core plugin-boundary guard on shared probes", async () => {
+    for (const probe of SHARED_PROBES) {
+      const source = `const ${probe} = 1;`;
+      const coreTokens = await coreFindViolations(source);
+      const dbTokens = findViolations(source, "parity-probe.ts").map(
+        (v) => v.token,
+      );
+
+      // The verdict must be identical. NOT the token lists: the two guards'
+      // position and boundary rules differ on purpose (this file widens to SQL
+      // column syntax and uses alphanumeric rather than `\b` boundaries), so a
+      // shape can legitimately match a different subset. Agreeing on WHETHER a
+      // probe is a violation is the policy the two copies share, and it is the
+      // policy that drifted.
+      expect(
+        dbTokens.length > 0,
+        `parity: db guard and core guard disagree on "${probe}" — db=${JSON.stringify(dbTokens)} core=${JSON.stringify(coreTokens)}`,
+      ).toBe(coreTokens.length > 0);
+    }
+  });
+
+  it("agrees that the case-folded probes fire and the look-alikes do not", async () => {
+    // Stated separately from the loop above so a failure names WHICH half moved:
+    // if `db/` goes case-blind the first case fails; if `db/` starts crying wolf on
+    // `shadow` the second does. One loop with both kinds mixed reports "disagrees"
+    // and leaves the reader to work out which side moved.
+    const shouldFire = ["GITHUB_TOKEN", "GitHubToken", `github_${NATIVE_PULL}`];
+    for (const probe of shouldFire) {
+      const source = `const ${probe} = 1;`;
+      expect(
+        findViolations(source, "parity-probe.ts").length,
+        `db guard must fire on ${probe}`,
+      ).toBeGreaterThan(0);
+      expect(
+        (await coreFindViolations(source)).length,
+        `core guard must fire on ${probe}`,
+      ).toBeGreaterThan(0);
+    }
+    for (const probe of ["expr_value", "shadow"]) {
+      const source = `const ${probe} = 1;`;
+      expect(findViolations(source, "parity-probe.ts"), probe).toEqual([]);
+      expect(await coreFindViolations(source), probe).toEqual([]);
+    }
+  });
+
+  it("declares the same case policy as the core guard, read from its own source", async () => {
+    // Belt and braces over the behavioural loop: B30's policy was carried as a named
+    // constant in BOTH files on purpose, so both must still exist and both must
+    // still be the flag. This catches the failure the behavioural loop cannot: a
+    // future edit that hard-codes `"i"` at one call site instead of widening the
+    // constant, which would leave the behaviour green and the single-place-to-look
+    // promise broken.
+    const coreSource = readFileSync(
+      path.resolve(
+        REPO_ROOT,
+        "src",
+        "core",
+        "__tests__",
+        "plugin-boundary.test.ts",
+      ),
+      "utf8",
+    );
+    expect(coreSource).toContain('const CASE_INSENSITIVE = "i";');
+    expect(readFileSync(THIS_FILE, "utf8")).toContain(
+      'const CASE_INSENSITIVE = "i";',
+    );
+
+    // And this file must route EVERY case decision through that one constant — no
+    // bare inline "i" flag left behind beside it.
+    const ownSource = readFileSync(THIS_FILE, "utf8");
+    expect(ownSource).not.toMatch(/new RegExp\([^)]*,\s*"i"\s*\)/);
+    expect(ownSource).not.toMatch(/,\s*"mi"\s*\)/);
   });
 });
