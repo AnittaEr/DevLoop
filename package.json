@@ -13,6 +13,7 @@
     "e2e": "playwright test",
     "e2e:install": "playwright install chromium",
     "test:watch": "vitest",
+    "test:db": "vitest run --config vitest.db.config.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "db:generate": "drizzle-kit generate",
