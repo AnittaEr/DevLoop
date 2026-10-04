@@ -1,6 +1,7 @@
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FlatCompat } from "@eslint/eslintrc";
+import { coreBoundaryPlugin, RULE_ID } from "./eslint-plugin-core-boundary.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -53,12 +54,28 @@ const compat = new FlatCompat({ baseDirectory: __dirname });
  * plugins there. That is why this block is scoped to `src/core/**` and nothing
  * else, and why the ticket's negative control matters.
  *
- * Known residual hole, recorded rather than hidden: this rule matches the
- * import SPECIFIER string, not the resolved path, so a deep relative path that
- * walks out of core without passing through a `plugins`/`providers` segment
- * would not be caught here. Closing that properly needs a resolver-aware rule,
- * which is out of scope for this card; the Vitest guard scans resolved paths and
- * remains the backstop.
+ * KNOWN RESIDUAL HOLE — AND IT IS NO LONGER THE `../` ONE.
+ *
+ * This family list still matches the import SPECIFIER string rather than the
+ * resolved path, so it is spelling-dependent: a relative hop count other than
+ * the one written here is not matched by it. That hole WAS the one cubic raised
+ * on PR #3 (finding 1: `../plugins/*` matches one `../` only, so
+ * `../../plugins/x` and `../../../plugins/x` escaped lint), and it is now closed
+ * by the resolver-aware rule in `eslint-plugin-core-boundary.mjs`, which is
+ * registered below and loads AFTER this one so it can share the same scope
+ * decision. The two overlap by design: the specifier families here are the
+ * cheap, human-readable deny-list for `@/plugins/*`, `src/plugins/*`, the
+ * provider SDKs and the one-hop `../` shape, and the resolver rule is the
+ * hop-count-independent backstop underneath them. `core-boundary-guard-exists`
+ * style tests in `src/core/__tests__/eslint-core-boundary-rule.test.ts` assert
+ * both halves, including that the two neutral contracts stay importable.
+ *
+ * What is still not covered here, recorded rather than hidden: a specifier that
+ * is neither relative nor in a family below (a new path alias, for instance)
+ * would need adding to this list; and the rule deliberately does not attempt to
+ * decide whether a plugin IMPLEMENTATION under `src/plugins/` is well-behaved,
+ * only that `src/core/**` cannot reach it. The Vitest guard scans resolved paths
+ * over the whole core tree and remains the independent third layer.
  */
 const CORE_PLUGIN_BOUNDARY_PATTERNS = [
   {
@@ -105,11 +122,17 @@ const eslintConfig = [
   {
     // Scoped to core ONLY. See the comment above for why src/app/** is exempt.
     files: ["src/core/**/*.{ts,tsx,js,jsx,mjs,cjs}"],
+    plugins: { "core-boundary": coreBoundaryPlugin },
     rules: {
       "no-restricted-imports": [
         "error",
         { patterns: CORE_PLUGIN_BOUNDARY_PATTERNS },
       ],
+      // The hop-count-independent half. Scoped to the same `src/core/**` files
+      // and deliberately a SEPARATE rule from `no-restricted-imports` so that
+      // removing the specifier list cannot silently take the resolver with it:
+      // the two fail for different reasons and are deleted by different edits.
+      [RULE_ID]: "error",
     },
   },
 ];
