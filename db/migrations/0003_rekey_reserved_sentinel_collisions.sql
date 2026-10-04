@@ -64,13 +64,27 @@
 -- a correctly remediated row is byte-identical on both. Nothing here depends on
 -- the migration being run once.
 --
+-- THE SECOND CASE LEFT ALONE: A ROW ALREADY CARRYING THE TARGET KEY. The repair
+-- is `(metadata - reserved) || jsonb_build_object(target, ...)`, and jsonb `||`
+-- is RIGHT-HAND-WINS: the left operand is the row with the reserved key already
+-- removed, so if the row ALSO carried `target` as its own real plugin data,
+-- that value would be silently discarded. That is the exact failure this
+-- migration's header promises never to commit -- "REPAIR, NOT DELETE" -- and
+-- the same one `0002`'s header rejects when it refuses to overwrite with '{}'
+-- because it would "silently destroy whatever the source put there". So rows
+-- that already carry the target key are EXCLUDED from the UPDATE and reported
+-- instead. Nothing is overwritten and nothing is silent; such a row stays
+-- refused by the writer until the plugin renames a key in its own payloads,
+-- which is the same remedy the ambiguous case below gets.
+--
 -- THE NOTICES are not decoration, for the same reason 0002's is: a silent
 -- rewrite of user data is exactly what must be visible in the migrate output.
 DO $$
 DECLARE
-  carrying  bigint;
-  rekeyed  bigint;
-  ambiguous bigint;
+  carrying   bigint;
+  rekeyed    bigint;
+  clash      bigint;
+  ambiguous  bigint;
 BEGIN
   SELECT count(*)
     INTO carrying
@@ -83,6 +97,20 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Count the rows that ALREADY carry the target key before the UPDATE, so the
+  -- report below can account for every carrying row and no exclusion is ever
+  -- silent. Read first because the UPDATE below has to exclude them, and a
+  -- count taken after would already have lost them.
+  SELECT count(*)
+    INTO clash
+    FROM "canonical_events"
+   WHERE jsonb_typeof("metadata") = 'object'
+     AND "metadata" ? '_devloop_legacy_non_object'
+     AND "metadata" ? '_devloop_rekeyed_from_reserved_legacy_non_object';
+
+  -- `AND NOT (... ? target)` is the correction that keeps the repair lossless:
+  -- without it jsonb `||`'s right-hand-wins would silently discard a plugin's
+  -- real value already stored under the target key.
   UPDATE "canonical_events"
      SET "metadata" =
            ("metadata" - '_devloop_legacy_non_object')
@@ -93,16 +121,28 @@ BEGIN
    WHERE jsonb_typeof("metadata") = 'object'
      AND "metadata" ? '_devloop_legacy_non_object'
      AND NOT (
+           "metadata" ? '_devloop_rekeyed_from_reserved_legacy_non_object'
+         )
+     AND NOT (
            ("metadata" - '_devloop_legacy_non_object') = '{}'::jsonb
            AND jsonb_typeof("metadata" -> '_devloop_legacy_non_object')
                IS DISTINCT FROM 'object'
          );
 
   GET DIAGNOSTICS rekeyed = ROW_COUNT;
-  ambiguous := carrying - rekeyed;
+
+  -- Everything that carried the reserved key and was NOT re-keyed is one of the
+  -- two deliberately-declined shapes. Splitting them means the operator is told
+  -- WHICH ambiguity they are looking at rather than a single lumped number.
+  ambiguous := carrying - rekeyed - clash;
 
   RAISE NOTICE 'canonical_events: re-keyed % pre-existing row(s) whose metadata used "_devloop_legacy_non_object" as real plugin data, renaming that key to "_devloop_rekeyed_from_reserved_legacy_non_object" so the writer stops refusing them permanently. % further row(s) carry the reserved key in exactly the remediated shape and were deliberately left untouched, because that shape is indistinguishable from what 0002 itself produced.',
     rekeyed, ambiguous;
+
+  IF clash > 0 THEN
+    RAISE WARNING 'canonical_events: % row(s) carry BOTH "_devloop_legacy_non_object" and "_devloop_rekeyed_from_reserved_legacy_non_object", and were NOT rewritten: moving the payload would overwrite the value already stored under the second key, and this migration destroys nothing. Rename a key in the source payloads so the plugin''s own data stops colliding with the reserved name; the writer will report the row again on every write.',
+      clash;
+  END IF;
 
   IF ambiguous > 0 THEN
     RAISE WARNING 'canonical_events: % row(s) carry "_devloop_legacy_non_object" as their ONLY key with a non-object value — the exact shape 0002 produced, so they cannot be told apart from a remediated row and were not rewritten. If such a row is plugin data rather than a remediation, rename the key in the source payloads; the writer will report it again on every write.',

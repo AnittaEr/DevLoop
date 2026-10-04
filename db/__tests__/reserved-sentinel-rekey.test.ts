@@ -63,71 +63,128 @@ const REKEYED = "_devloop_rekeyed_from_reserved_legacy_non_object";
 /** The migrations that existed BEFORE the shape CHECK, applied in order. */
 const LEGACY_TAGS = ["0000_tiny_nightshade", "0001_parched_talon"] as const;
 
+/**
+ * Runs `run` against a connection PINNED to `schema`.
+ *
+ * `reset` drops and recreates the sandbox on entry; without it the connection
+ * merely attaches. That distinction is load-bearing rather than convenient:
+ * resetting per call destroys the state later cases assert on. DROP runs BEFORE
+ * CREATE because dropping a schema the connection's `search_path` already
+ * points at leaves Postgres with "no schema has been selected to create in".
+ * Both measured, both inherited from the existing sandbox helper's rationale.
+ *
+ * Each describe below owns its own schema because each needs its own LEGACY
+ * database: they build different pre-`0003` states, and a shared one would make
+ * a case prove only that an already-repaired table ignores the UPDATE's
+ * predicate rather than that the predicate matches or declines to match the
+ * shape under test.
+ */
+async function withSandbox<T>(
+  schema: string,
+  run: (client: postgres.Sql) => Promise<T>,
+  options: { readonly reset: boolean },
+): Promise<T> {
+  const client = postgres(process.env.DATABASE_URL!, { max: 1 });
+  try {
+    if (options.reset) {
+      await client.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+      await client.unsafe(`CREATE SCHEMA "${schema}"`);
+    }
+    await client.unsafe(`SET search_path TO "${schema}"`);
+    return await run(client);
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * Applies the named migration files verbatim, in order, splitting on the exact
+ * marker drizzle's own migrator uses (`drizzle-orm/migrator` ->
+ * `query.split("--> statement-breakpoint")`) and executing each part in ONE
+ * transaction — so this is the code path `db:migrate` runs, not an
+ * approximation of it.
+ */
+async function applyMigrations(client: postgres.Sql, tags: readonly string[]) {
+  for (const tag of tags) {
+    const file = readFileSync(
+      new URL(`../migrations/${tag}.sql`, import.meta.url),
+      "utf8",
+    );
+    await client.begin(async (tx) => {
+      for (const statement of file.split("--> statement-breakpoint")) {
+        if (statement.trim() === "") continue;
+        await tx.unsafe(statement);
+      }
+    });
+  }
+}
+
+/**
+ * Applies ONE migration file and returns the NOTICE and WARNING text it emitted.
+ *
+ * Its own connection, because a caller cannot retrofit notice collection onto
+ * the `postgres` handle it already holds: `onNotice` is fixed when the client is
+ * constructed, and notices are only ever delivered to a connection that asked
+ * for them. Assertions about what a migration REPORTS have to run the statements
+ * through this rather than through `applyMigrations`, or they would silently
+ * assert nothing — which is exactly how the clash exclusion went unreported in
+ * review round 1.
+ */
+async function applyCapturingNotices(
+  tag: string,
+  schema: string,
+): Promise<string[]> {
+  const seen: string[] = [];
+  // `onnotice`, not `onNotice`: this postgres.js version's Options type spells it
+  // lowercase, and the capitalised form is silently dropped — which is why the
+  // first attempt at this assertion captured nothing at all.
+  const listener = postgres(process.env.DATABASE_URL!, {
+    max: 1,
+    onnotice: (n) => seen.push(`${n.severity}: ${n.message}`),
+  });
+  try {
+    await listener.unsafe(`SET search_path TO "${schema}"`);
+    const file = readFileSync(
+      new URL(`../migrations/${tag}.sql`, import.meta.url),
+      "utf8",
+    );
+    for (const statement of file.split("--> statement-breakpoint")) {
+      if (statement.trim() === "") continue;
+      await listener.unsafe(statement);
+    }
+  } finally {
+    await listener.end();
+  }
+  return seen;
+}
+
+/** Every row's `id` and `metadata`, ordered, for a whole-table assertion. */
+async function readAll(client: postgres.Sql) {
+  return client<{ id: string; metadata: Record<string, unknown> }[]>`
+    SELECT id, metadata FROM canonical_events ORDER BY id`;
+}
+
+/** Inserts one legacy fixture row into an already-migrated legacy schema. */
+async function insertLegacy(
+  client: postgres.Sql,
+  row: { id: string; externalId: string; title: string; metadata: string },
+) {
+  await client.unsafe(
+    `
+      INSERT INTO canonical_events
+        (id, source, external_id, type, title, occurred_at, metadata)
+      VALUES ('${row.id}', 'fixture-source', '${row.externalId}', 'mention',
+              '${row.title}', now(), '${row.metadata}'::jsonb)
+    `,
+  );
+}
+
 describe("0003 re-keys a plugin row that used the remediation sentinel as data", () => {
   const SANDBOX_SCHEMA = "reserved_sentinel_rekey_probe";
 
-  /**
-   * A connection PINNED to the sandbox schema.
-   *
-   * `reset` drops and recreates the sandbox on entry; without it the connection
-   * merely attaches. That distinction is load-bearing rather than convenient:
-   * resetting per call destroys the state later cases assert on. DROP runs BEFORE
-   * CREATE because dropping a schema the connection's `search_path` already
-   * points at leaves Postgres with "no schema has been selected to create in".
-   * Both measured, both inherited from the existing sandbox helper's rationale.
-   */
-  async function withSandbox<T>(
-    run: (client: postgres.Sql) => Promise<T>,
-    options: { readonly reset: boolean },
-  ): Promise<T> {
-    const client = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      if (options.reset) {
-        await client.unsafe(
-          `DROP SCHEMA IF EXISTS "${SANDBOX_SCHEMA}" CASCADE`,
-        );
-        await client.unsafe(`CREATE SCHEMA "${SANDBOX_SCHEMA}"`);
-      }
-      await client.unsafe(`SET search_path TO "${SANDBOX_SCHEMA}"`);
-      return await run(client);
-    } finally {
-      await client.end();
-    }
-  }
-
-  /**
-   * Applies the named migration files verbatim, in order, splitting on the exact
-   * marker drizzle's own migrator uses (`drizzle-orm/migrator` ->
-   * `query.split("--> statement-breakpoint")`) and executing each part in ONE
-   * transaction — so this is the code path `db:migrate` runs, not an
-   * approximation of it.
-   */
-  async function applyMigrations(
-    client: postgres.Sql,
-    tags: readonly string[],
-  ) {
-    for (const tag of tags) {
-      const file = readFileSync(
-        new URL(`../migrations/${tag}.sql`, import.meta.url),
-        "utf8",
-      );
-      await client.begin(async (tx) => {
-        for (const statement of file.split("--> statement-breakpoint")) {
-          if (statement.trim() === "") continue;
-          await tx.unsafe(statement);
-        }
-      });
-    }
-  }
-
-  /** Every row's `id` and `metadata`, ordered, for a whole-table assertion. */
-  async function readAll(client: postgres.Sql) {
-    return client<{ id: string; metadata: Record<string, unknown> }[]>`
-      SELECT id, metadata FROM canonical_events ORDER BY id`;
-  }
-
   beforeAll(async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         await applyMigrations(client, LEGACY_TAGS);
       },
@@ -137,6 +194,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   afterAll(async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         await client.unsafe(
           `DROP SCHEMA IF EXISTS "${SANDBOX_SCHEMA}" CASCADE`,
@@ -151,6 +209,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
     // object, or if the name had been impossible to write, the repair below
     // would be proving nothing about a row that could ever have existed.
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         await client.unsafe(`
           INSERT INTO canonical_events
@@ -191,6 +250,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   it("[repair-mutation] 0002 leaves the colliding row untouched — the defect it creates", async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         await applyMigrations(client, ["0002_loud_johnny_blaze"]);
 
@@ -215,6 +275,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
     // on the real row `0002` left behind. Without this the card would only claim
     // a cosmetic re-key; this is the behaviour that actually strands an event.
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         const rows = await readAll(client);
         const colliding = rows.find((row) => row.id === "plugin-collision")!;
@@ -237,6 +298,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   it("[repair-mutation] 0003 re-keys the colliding row and preserves its payload and siblings", async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         await applyMigrations(client, [
           "0003_rekey_reserved_sentinel_collisions",
@@ -264,6 +326,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   it("[repair-mutation] the writer now accepts the re-keyed row", async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         const rows = await readAll(client);
         const repaired = rows.find((row) => row.id === "plugin-collision")!;
@@ -295,6 +358,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   it("[repair-mutation] leaves the correctly remediated row exactly as 0002 made it", async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         const rows = await readAll(client);
         const control = rows.find((row) => row.id === "control-sentinel")!;
@@ -310,6 +374,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   it("leaves an ordinary row untouched", async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         const rows = await readAll(client);
         expect(rows.find((row) => row.id === "ordinary")!.metadata).toEqual({
@@ -325,6 +390,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
     // rows still carrying the OLD key, and a row it has already touched no longer
     // does — so re-running is a byte-level no-op, including for the control.
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         const before = await readAll(client);
         await applyMigrations(client, [
@@ -346,6 +412,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 
   it("a third application is still a no-op, and the control never drifts", async () => {
     await withSandbox(
+      SANDBOX_SCHEMA,
       async (client) => {
         const before = await readAll(client);
         await applyMigrations(client, [
@@ -375,45 +442,9 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
 describe("0003 declines to guess on a row indistinguishable from the remediation", () => {
   const AMBIGUOUS_SCHEMA = "reserved_sentinel_ambiguous_probe";
 
-  async function withSandbox<T>(
-    run: (client: postgres.Sql) => Promise<T>,
-    options: { readonly reset: boolean },
-  ): Promise<T> {
-    const client = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      if (options.reset) {
-        await client.unsafe(
-          `DROP SCHEMA IF EXISTS "${AMBIGUOUS_SCHEMA}" CASCADE`,
-        );
-        await client.unsafe(`CREATE SCHEMA "${AMBIGUOUS_SCHEMA}"`);
-      }
-      await client.unsafe(`SET search_path TO "${AMBIGUOUS_SCHEMA}"`);
-      return await run(client);
-    } finally {
-      await client.end();
-    }
-  }
-
-  async function applyMigrations(
-    client: postgres.Sql,
-    tags: readonly string[],
-  ) {
-    for (const tag of tags) {
-      const file = readFileSync(
-        new URL(`../migrations/${tag}.sql`, import.meta.url),
-        "utf8",
-      );
-      await client.begin(async (tx) => {
-        for (const statement of file.split("--> statement-breakpoint")) {
-          if (statement.trim() === "") continue;
-          await tx.unsafe(statement);
-        }
-      });
-    }
-  }
-
   beforeAll(async () => {
     await withSandbox(
+      AMBIGUOUS_SCHEMA,
       async (client) => {
         await applyMigrations(client, LEGACY_TAGS);
         // A PLUGIN row that used the sentinel name alone, wrapping a non-object.
@@ -446,6 +477,7 @@ describe("0003 declines to guess on a row indistinguishable from the remediation
 
   afterAll(async () => {
     await withSandbox(
+      AMBIGUOUS_SCHEMA,
       async (client) => {
         await client.unsafe(
           `DROP SCHEMA IF EXISTS "${AMBIGUOUS_SCHEMA}" CASCADE`,
@@ -457,6 +489,7 @@ describe("0003 declines to guess on a row indistinguishable from the remediation
 
   it("leaves BOTH rows in the remediation shape rather than corrupting one of them", async () => {
     await withSandbox(
+      AMBIGUOUS_SCHEMA,
       async (client) => {
         const rows = await client<
           { id: string; metadata: Record<string, unknown> }[]
@@ -470,6 +503,163 @@ describe("0003 declines to guess on a row indistinguishable from the remediation
           { id: "ambiguous-plugin", metadata: { [RESERVED]: 42 } },
           { id: "genuine-remediation", metadata: { [RESERVED]: "text" } },
         ]);
+      },
+      { reset: false },
+    );
+  });
+});
+
+describe("0003 never overwrites a value already stored under the re-key target", () => {
+  const CLASH_SCHEMA = "reserved_sentinel_clash_probe";
+
+  beforeAll(async () => {
+    await withSandbox(
+      CLASH_SCHEMA,
+      async (client) => {
+        await applyMigrations(client, LEGACY_TAGS);
+
+        // QA REVIEW ROUND 1'S DEFECT, reproduced here as a fixture. The repair is
+        // `(metadata - reserved) || jsonb_build_object(target, ...)`, and jsonb
+        // `||` is RIGHT-HAND-WINS, so before the correction this row came out as
+        // `{[REKEYED]: {real: plugin data}}` and the plugin's own
+        // `{"plugin":"PRECIOUS"}` was gone — silently destroyed by the very
+        // migration whose header promises "REPAIR, NOT DELETE".
+        //
+        // Reachable, not theoretical: a plugin that already moved its payloads to
+        // the key `0003` invents, and still writes the legacy sentinel name,
+        // lands exactly here on its next `db:migrate`.
+        await insertLegacy(client, {
+          id: "both-keys",
+          externalId: "ext-both-keys",
+          title: "plugin row using BOTH names as data",
+          metadata: `{"${RESERVED}": {"real":"plugin data"}, "${REKEYED}": {"plugin":"PRECIOUS"}}`,
+        });
+
+        // A control that the SAME migration still repairs in the same run, so a
+        // fix that simply disabled the UPDATE wholesale cannot pass by being
+        // uniformly cautious.
+        await insertLegacy(client, {
+          id: "repaired-alongside",
+          externalId: "ext-repaired-alongside",
+          title: "ordinary collision repaired in the same run",
+          metadata: `{"${RESERVED}": {"real":"plugin data"}, "other": 1}`,
+        });
+
+        // And the row `0002` genuinely produced, which must stay untouched.
+        await insertLegacy(client, {
+          id: "genuine-remediation",
+          externalId: "ext-genuine-clash",
+          title: "row 0002 really did remediate",
+          metadata: `"text"`,
+        });
+
+        await applyMigrations(client, ["0002_loud_johnny_blaze"]);
+        await applyMigrations(client, [
+          "0003_rekey_reserved_sentinel_collisions",
+        ]);
+      },
+      { reset: true },
+    );
+  });
+
+  afterAll(async () => {
+    await withSandbox(
+      CLASH_SCHEMA,
+      async (client) => {
+        await client.unsafe(`DROP SCHEMA IF EXISTS "${CLASH_SCHEMA}" CASCADE`);
+      },
+      { reset: false },
+    );
+  });
+
+  it("[overwrite-mutation] preserves BOTH payloads on the both-keys row", async () => {
+    await withSandbox(
+      CLASH_SCHEMA,
+      async (client) => {
+        const rows = await readAll(client);
+        const both = rows.find((row) => row.id === "both-keys")!;
+
+        // The plugin's value under the target key is intact. THIS is the
+        // assertion that was missing when QA found the defect: before the
+        // `AND NOT (... ? target)` correction this object was
+        // `{"plugin":"PRECIOUS"}`-free, and nothing in the suite noticed.
+        expect(both.metadata).toEqual({
+          [RESERVED]: { real: "plugin data" },
+          [REKEYED]: { plugin: "PRECIOUS" },
+        });
+      },
+      { reset: false },
+    );
+  });
+
+  it("still repairs the ordinary collision in the same run", async () => {
+    await withSandbox(
+      CLASH_SCHEMA,
+      async (client) => {
+        const rows = await readAll(client);
+
+        // The correction must be a targeted exclusion, not a decision to repair
+        // nothing. Without this, a migration that declined to touch any row
+        // would satisfy the assertion above.
+        expect(
+          rows.find((row) => row.id === "repaired-alongside")!.metadata,
+        ).toEqual({ other: 1, [REKEYED]: { real: "plugin data" } });
+      },
+      { reset: false },
+    );
+  });
+
+  it("leaves the genuinely remediated row untouched", async () => {
+    await withSandbox(
+      CLASH_SCHEMA,
+      async (client) => {
+        const rows = await readAll(client);
+
+        expect(
+          rows.find((row) => row.id === "genuine-remediation")!.metadata,
+        ).toEqual({ [RESERVED]: "text" });
+      },
+      { reset: false },
+    );
+  });
+
+  it("[overwrite-mutation] WARNS about the clash rather than resolving it silently", async () => {
+    // The exclusion must be VISIBLE. A row declined without a count would be
+    // indistinguishable, to whoever reads the migrate output, from a row that
+    // was never there — which is how a lost payload becomes permanent.
+    //
+    // This asserts the REPORT, not the row. An earlier version of this case
+    // counted matching rows and stayed GREEN when the exclusion was deleted,
+    // because the row exists either way — only its metadata differs. Asserting
+    // the emitted WARNING is what makes the reporting non-vacuous.
+    const seen = await applyCapturingNotices(
+      "0003_rekey_reserved_sentinel_collisions",
+      CLASH_SCHEMA,
+    );
+
+    const warnings = seen.filter((line) => line.startsWith("WARNING"));
+    expect(warnings).toHaveLength(2);
+    expect(
+      warnings.some(
+        (line) =>
+          line.includes("carry BOTH") &&
+          line.includes(REKEYED) &&
+          line.includes("1 row(s)"),
+      ),
+    ).toBe(true);
+  });
+
+  it("is idempotent: a second application changes no row at all", async () => {
+    await withSandbox(
+      CLASH_SCHEMA,
+      async (client) => {
+        const before = await readAll(client);
+        await applyMigrations(client, [
+          "0003_rekey_reserved_sentinel_collisions",
+        ]);
+        const after = await readAll(client);
+
+        expect(after).toEqual(before);
       },
       { reset: false },
     );
