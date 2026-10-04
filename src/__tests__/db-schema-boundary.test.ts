@@ -277,8 +277,62 @@ export type Violation = {
  * B19 move its equivalent check out of the regex and into `tokenEndsCleanly`.
  */
 function tokenPattern(token: string): RegExp {
-  const escaped = escapeForRegExp(token);
-  const lead = /[A-Za-z0-9]/.test(token[0] ?? "") ? "(?:^|[^A-Za-z0-9])" : "";
+  const bare = escapeForRegExp(token);
+  // The leading boundary is a CAPTURING group, and B32 makes its capture
+  // load-bearing rather than incidental. With the `[_]?` bridge a match can be
+  // SHORTER than the deny-list token (`azure_devops` against the 10 characters of
+  // `azureDevops`), so the number of characters the token itself consumed is
+  // `m[0].length - leadLength` and not `entry.token.length` — the arithmetic the
+  // core guard already had to move for the same reason, documented at
+  // `src/core/__tests__/plugin-boundary.test.ts:296-304`. `lead` is captured so
+  // `leadLength` is read off the match rather than guessed from a boundary's
+  // spelling, which keeps this correct whether the leading boundary consumes a
+  // character (`(?:^|(?<lead>[^A-Za-z0-9]))`) or is zero-width (`\b`).
+  const lead = /[A-Za-z0-9]/.test(token[0] ?? "")
+    ? "(?:^|(?<lead>[^A-Za-z0-9]))"
+    : "";
+  // B32: the snake_case -> camelCase BRIDGE, and the guard for over-bridging.
+  //
+  // This file's DENY_LIST spells its tokens the way a Postgres schema does
+  // (snake_case: `NATIVE_PULL` joins "pull" and "request", `azure_devops`,
+  // `merge_request`) while the TypeScript that reads `db/**` spells the same
+  // symbols camelCase (`pullRequest`, `azureDevopsWorkItem`, `mergeRequest`).
+  // With the token taken literally, the camelCase spelling did not fire here
+  // while the core guard -- which carries B26's bridge -- fired on it, and the
+  // parity test this file owns went RED the moment B29 landed: on the probe
+  // "pullRequest" the db side returned an empty token list and the core side
+  // returned the snake_case token (the verbatim assertion is in B32's commit
+  // message; the snake_case spelling is left out of this file on purpose, per the
+  // note on NATIVE_PULL above -- writing it here trips T10's guard).
+  //
+  // The bridge is a per-character decision, NOT a blanket rewrite of the escaped
+  // token, and the distinction is load-bearing. `escaped.replace("_", "[_]?")` is
+  // the one-line form and it over-bridges in two measured ways, because it cannot
+  // tell a `_` that SEAMS a snake/camel boundary from one that is the token's own
+  // trailing delimiter:
+  //
+  //   - it rewrites the FINAL `_` of a `_`-terminated token, so `pr_` would become
+  //     `pr` and fire on any bare `pr`;
+  //   - it rewrites only the FIRST `_` of a multi-underscore token (a
+  //     `${NATIVE_PULL}_review`), leaving the rest literal.
+  //
+  // The core guard already decided both of those, and this function now decides
+  // them the same way, by construction rather than by coincidence: a token that
+  // ends on `_` keeps its literal spelling (its trailing delimiter IS its rule),
+  // and every other `_` becomes optional. No token is added, removed or renamed --
+  // this is a MATCHER change only, exactly as the core guard documents for its own
+  // copy of this rule.
+  if (token.endsWith("_")) {
+    return new RegExp(`${lead}${bare}`, CASE_INSENSITIVE);
+  }
+  const body = [...token]
+    .map((char) => (char === "_" ? "[_]?" : escapeForRegExp(char)))
+    .join("");
+  // The trailing decision still lives in {@link tokenEndsCleanly}, in CODE, and
+  // the bridge does not move it back into the pattern: under `CASE_INSENSITIVE`
+  // a negated class folds (`[^a-z]` also excludes `A-Z`), so the camelCase hump
+  // would be inexpressible and `githubPullRequest` would go invisible again.
+  // Same trap B19 measured and abandoned; see the note above this function.
   // NO trailing boundary in the pattern, and that is B19's second root cause rather
   // than an omission. Measured on this file with the flag first added and only the
   // `i` applied: `GitHubToken` reported ZERO violations, because `github` is
@@ -293,7 +347,7 @@ function tokenPattern(token: string): RegExp {
   // matching a negated class folds (a `[^a-z]` would also exclude `A-Z`), so the
   // camelCase hump cannot be expressed in the regex at all. Attempting it here is
   // the same trap B19 measured and abandoned.
-  return new RegExp(`${lead}${escaped}`, CASE_INSENSITIVE);
+  return new RegExp(`${lead}${body}`, CASE_INSENSITIVE);
 }
 
 /**
@@ -340,16 +394,29 @@ function tokenEndsCleanlyOn(
   const re = new RegExp(entry.pattern.source, `g${CASE_INSENSITIVE}`);
   for (const m of line.matchAll(re)) {
     if (m.index === undefined) continue;
-    // The token does NOT necessarily start at `m.index`. This guard's leading
-    // boundary is `(?:^|[^A-Za-z0-9])`, which CONSUMES a delimiter character,
-    // whereas the core guard's is `\b`, which is zero-width — so the same
+    // The token does NOT necessarily start at `m.index` nor span exactly
+    // `entry.token.length`, and B32 makes BOTH facts true at once.
+    //
+    // (a) This guard's leading boundary `(?:^|[^A-Za-z0-9])` CONSUMES a delimiter
+    // character, whereas the core guard's is `\b`, which is zero-width — so the
     // `m.index + tokenLength` arithmetic that is correct there is off by one here
     // and silently reports every `github`-shaped token as ending mid-identifier.
-    // (Measured: doing this wrong took the suite from 4 failures to 15, every one of
-    // them a real detection that stopped firing.) Deriving the start from the match
-    // length is robust to either boundary style.
-    const tokenStart = m.index + m[0].length - entry.token.length;
-    if (tokenEndsCleanly(line, tokenStart, entry.token.length)) return true;
+    // (Measured: doing this wrong took the suite from 4 failures to 15, every one
+    // of them a real detection that stopped firing.)
+    //
+    // (b) The `[_]?` bridge makes the token's own span SHORTER than
+    // `entry.token` whenever the underscore was absent: `azure_devops` (11) can
+    // match the 10 characters of `azureDevops`. So the length to hand to
+    // `tokenEndsCleanly` is not `entry.token.length` either.
+    //
+    // Both fall out of ONE measurement instead of two guesses: strip the leading
+    // boundary's captured characters off the match, and what is left is exactly
+    // the token's own span — start and length — whatever the boundary's style and
+    // whether or not the bridge engaged.
+    const leadLength = m.groups?.lead?.length ?? 0;
+    const tokenStart = m.index + leadLength;
+    const tokenSpan = m[0].length - leadLength;
+    if (tokenEndsCleanly(line, tokenStart, tokenSpan)) return true;
   }
   return false;
 }
@@ -1581,6 +1648,24 @@ describe("db/ guard and core guard agree (B30 parity)", () => {
     "xgithuby",
     "githubrepo",
     "octokitfoo",
+    // B32: SNAKE_CASE-vs-CAMELCASE PAIRS. These are the probes whose absence made
+    // this defect invisible. Every firing probe above ended its token and every
+    // clean control was refused by the leading boundary, so the loop compared the
+    // two guards where they already agreed and certified nothing about the axis
+    // that actually drifted -- the internal `_` becoming optional.
+    //
+    // Both halves of each pair are present deliberately: the snake_case half alone
+    // passes on a bridge-less guard, and the camelCase half alone is the probe
+    // that failed. A pair is only meaningful as a pair.
+    //
+    // `azureDevopsWorkItem` is the longer case: the deny token
+    // `azure_devops` matches only its PREFIX of that identifier, so the trailing
+    // rule is then asked about `W` -- a camelCase hump. That is the shape the core
+    // guard documents at plugin-boundary.test.ts:296-304 as the reason its span
+    // arithmetic had to move off `token.length`, and it is what caught this file's
+    // own copy of that arithmetic being wrong under the bridge.
+    "azure_devops",
+    "azureDevopsWorkItem",
   ];
 
   /**
@@ -1677,6 +1762,91 @@ describe("db/ guard and core guard agree (B30 parity)", () => {
       const source = `const ${probe} = 1;`;
       expect(findViolations(source, "parity-probe.ts"), probe).toEqual([]);
       expect(await coreFindViolations(source), probe).toEqual([]);
+    }
+  });
+
+  /**
+   * B32: assert this file is comparing against the CURRENT core matcher
+   * GENERATION, not merely against whatever core happens to export today.
+   *
+   * Why this test exists at all, stated as the defect it would have caught. The
+   * behavioural loop above compares two guards by running them, which is the right
+   * shape -- but it certifies only that the two AGREE. B30 was approved in
+   * isolation against core's OLDER, narrower matcher: the two agreed because both
+   * were bridge-less, not because the shared policy was held. The moment B29 landed
+   * with B26's bridge on the core side, the pair diverged and a card that had
+   * already been reviewed went red in integration. An agreement test alone cannot
+   * distinguish "both are current" from "both are equally stale", and this project
+   * has now shipped that mistake twice (D-017/D-024/D-028/D-060 are the same class:
+   * a check that reports success for the wrong reason).
+   *
+   * So the generation is pinned structurally, on the core file's own source, and it
+   * is pinned as the BRIDGE specifically rather than as a version string: a version
+   * bump that changes something else cannot satisfy it, and narrowing core's matcher
+   * back to a literal token fails here rather than making this file's parity loop
+   * pass vacuously against a superseded sibling.
+   *
+   * Read-only by construction: this asserts the core file CONTAINS the bridge, and
+   * never edits it. Core's matcher is B29's approved content.
+   */
+  it("pins the core guard to the bridge generation this file is compared against", async () => {
+    const coreSource = readFileSync(
+      path.resolve(
+        REPO_ROOT,
+        "src",
+        "core",
+        "__tests__",
+        "plugin-boundary.test.ts",
+      ),
+      "utf8",
+    );
+
+    // (1) The bridge itself, spelled as the per-character rewrite core does. This
+    // is the line B29 introduced and this card depends on.
+    expect(
+      coreSource,
+      "the core guard no longer carries B26's `[_]?` snake_case -> camelCase bridge; if it was narrowed, this file's parity loop is now comparing against a superseded matcher generation and the agreement below is not evidence of anything",
+    ).toContain('if (char === "_") return "[_]?";');
+
+    // (2) And the `_`-terminated carve-out, which is the guard AGAINST over-bridging
+    // and the specific decision this file's own `tokenPattern` was written to
+    // mirror. Asserting (1) without (2) would accept a blanket bridge, which is the
+    // form measured to break two negative controls on the db side.
+    expect(
+      coreSource,
+      "the core guard lost its `_`-terminated carve-out, so its matcher now over-bridges and this file's does not; the two no longer share one policy",
+    ).toContain('if (token.endsWith("_")) {');
+
+    // (3) The behavioural consequence of (1)+(2), stated on the core guard itself.
+    // A structural assertion on a source string proves the text is there; this
+    // proves the text is live. `pullRequest` must fire on core's scanner, or the
+    // two structural assertions above are describing dead code.
+    expect(
+      (await coreFindViolations("const pullRequest = 1;")).length,
+      "the core guard does not fire on a camelCase provider identifier, so the bridge is present in source but not in behaviour",
+    ).toBeGreaterThan(0);
+    // ...and this file must agree with it, which is the whole point.
+    expect(
+      findViolations("const pullRequest = 1;", "parity-probe.ts").length,
+      "db guard must fire on a camelCase provider identifier once the bridge is mirrored",
+    ).toBeGreaterThan(0);
+
+    // (4) The bridge must not have cost core a negative control. Stated so that a
+    // future over-bridge on EITHER side fails here by name.
+    for (const lookAlike of [
+      "xgithuby",
+      "shadow",
+      "githubrepo",
+      "expr_value",
+    ]) {
+      expect(
+        await coreFindViolations(`const ${lookAlike} = 1;`),
+        `core guard must stay clean on ${lookAlike}`,
+      ).toEqual([]);
+      expect(
+        findViolations(`const ${lookAlike} = 1;`, "parity-probe.ts"),
+        `db guard must stay clean on ${lookAlike}`,
+      ).toEqual([]);
     }
   });
 
