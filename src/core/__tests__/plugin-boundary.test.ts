@@ -170,13 +170,24 @@ const TOKEN_PATTERNS = DENY_LIST.flatMap((entry) =>
  * Strip `//` line comments ONLY, replacing each stripped character with a space
  * so that every offset -- and therefore every line number -- is preserved.
  *
- * String, template and regex literals are tracked so that a `//` inside them is
- * not mistaken for a comment. Block comments are deliberately NOT stripped: the
+ * String and template literals are tracked so that a `//` inside them is not
+ * mistaken for a comment. Block comments are deliberately NOT stripped: the
  * comment policy requires a provider token inside `/* *\/` or JSDoc to fail.
+ *
+ * T6b ROOT CAUSE: the `//` branch used to be tested FIRST and unconditionally,
+ * so a `//` inside template-literal TEXT blanked the rest of the line -- provider
+ * tokens and all -- and the guard went green over them. Template state was NOT
+ * lost after an interpolation; the `//` strip simply ignored the literal state.
+ * The fix is to track the enclosing literal (`quote`) and honour `//` as a
+ * comment only in real code. Inside `${...}` we are back in real code, so a
+ * `//` there is still a genuine comment and is still stripped.
  */
 export function stripLineComments(source: string): string {
   const out = source.split("");
+  /** Open `${` depths of enclosing templates; 0 means "inside the expression". */
   const templateStack: number[] = [];
+  /** Enclosing literal delimiter, or null when we are in real code. */
+  let quote: string | null = null;
   let i = 0;
   const n = source.length;
 
@@ -189,6 +200,30 @@ export function stripLineComments(source: string): string {
   while (i < n) {
     const ch = source[i] as string;
     const next = source[i + 1];
+
+    // --- Literal text: nothing here is a comment or a delimiter. ---
+    if (quote !== null) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (quote === "`" && ch === "$" && next === "{") {
+        // Interpolated expression: its contents ARE real code.
+        templateStack.push(0);
+        quote = null;
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+        i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    // --- Real code. ---
 
     // line comment -> strip to end of line
     if (ch === "/" && next === "/") {
@@ -209,44 +244,32 @@ export function stripLineComments(source: string): string {
     }
 
     if (ch === '"' || ch === "'" || ch === "`") {
-      const quote = ch;
+      quote = ch;
       i += 1;
-      while (i < n) {
-        const c = source[i];
-        if (c === "\\") {
-          i += 2;
-          continue;
-        }
-        if (quote === "`" && c === "$" && source[i + 1] === "{") {
-          // Interpolated expression: parse its contents as real code.
-          templateStack.push(0);
-          i += 2;
-          break;
-        }
-        if (c === quote) {
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
-      if (templateStack.length > 0 && source[i - 1] !== "{")
-        templateStack.pop();
       continue;
     }
 
-    if (templateStack.length > 0) {
-      if (ch === "{" && source[i - 1] === "$") {
+    if (ch === "{") {
+      // A nested object/brace inside an interpolation, not the end of it.
+      if (templateStack.length > 0) {
         templateStack[templateStack.length - 1] =
           (templateStack[templateStack.length - 1] ?? 0) + 1;
-      } else if (ch === "}") {
-        const depth = templateStack[templateStack.length - 1] ?? 0;
-        if (depth === 0) {
-          templateStack.pop();
-          i += 1;
-          continue;
-        }
-        templateStack[templateStack.length - 1] = depth - 1;
       }
+      i += 1;
+      continue;
+    }
+
+    if (ch === "}" && templateStack.length > 0) {
+      const depth = templateStack[templateStack.length - 1] ?? 0;
+      if (depth === 0) {
+        // Interpolation closes: resume the enclosing template's TEXT. Without
+        // this, a `//` in that text would be honoured as a real comment.
+        templateStack.pop();
+        quote = "`";
+        i += 1;
+        continue;
+      }
+      templateStack[templateStack.length - 1] = depth - 1;
     }
 
     i += 1;

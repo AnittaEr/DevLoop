@@ -80,19 +80,26 @@ export async function checkDatabaseConnection(): Promise<DatabaseConnectionCheck
  * password authentication failed, unknown database) only lives on
  * `error.cause`. Without appending the cause, `db:check` cannot tell the
  * developer what actually went wrong.
+ *
+ * The parenthesised form is emitted only when there is a code to put inside the
+ * parentheses. A cause with no `.code` was previously given a bare trailing `)`
+ * with no matching `(` — T6b. Not every driver error carries a code, so the
+ * code-less form is the common case, not the exotic one.
  */
 function describeError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
   const cause = (error as { cause?: unknown }).cause;
+  const code = cause instanceof Error ? codeOf(cause) : "";
   const causeText =
     cause instanceof Error
-      ? [cause.message, codeOf(cause)].filter(Boolean).join(" (")
+      ? code
+        ? `${cause.message} (${code})`
+        : cause.message
       : cause === undefined
         ? ""
         : String(cause);
   if (!causeText) return error.message;
-  const detail = causeText.endsWith(")") ? causeText : `${causeText})`;
-  return `${error.message} — caused by: ${detail}`;
+  return `${error.message} — caused by: ${causeText}`;
 }
 
 /** Node system errors (ECONNREFUSED, ENOTFOUND, ...) carry a `code`. */
