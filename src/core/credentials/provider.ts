@@ -1,9 +1,17 @@
 /**
- * Credential provider contract for GitHub access (D-024a / D-041).
+ * Credential provider contract (D-024a / D-041).
  *
- * This module is the ONE place in the codebase that answers "where does the
- * GitHub token come from". Consumers depend on {@link CredentialProvider} and
+ * This module is the ONE place in the codebase that answers "where does an
+ * access token come from". Consumers depend on {@link CredentialProvider} and
  * never on a concrete source.
+ *
+ * B19 — PROVIDER NEUTRALITY. This module used to hard-code one vendor's token
+ * prefix and its environment-variable name. That is provider knowledge living
+ * in `src/core/`, which is exactly what the plugin boundary forbids — and the
+ * corrected boundary guard proves it was there all along by flagging 39 lines
+ * of it. Those two values are now INJECTED as a {@link TokenProfile} by the
+ * caller (in production, the plugin that owns the provider), so core states the
+ * *shape* a token must have and never *which* provider's shape it is.
  *
  * Secret hygiene rules encoded here:
  *  - A token value is NEVER placed in an error message, an error `cause`, or any
@@ -40,18 +48,42 @@ export const TEST_ONLY_CREDENTIAL_SOURCES = ["fake"] as const;
 export type TestOnlyCredentialSource =
   (typeof TEST_ONLY_CREDENTIAL_SOURCES)[number];
 
-/** The prefix every GitHub fine-grained personal access token carries. */
-export const GITHUB_TOKEN_PREFIX = "github_pat_";
-
 /**
- * The single documented environment variable holding the token. Name only — never a value.
+ * The provider-specific half of a token's shape.
  *
- * Declared here rather than in `env-provider` because {@link TOKEN_SOURCE_REASONS} needs it and
- * `env-provider` already imports this module: leaving it there would make the reason table
- * depend on a module that depends on it. `env-provider` re-exports it, so existing importers
- * of `../env-provider` are unaffected.
+ * B19: core used to hard-code one vendor's prefix and env-var name. Both are
+ * provider knowledge, so both are injected here by whoever owns the provider,
+ * and `src/core/` is left knowing only that a token has a prefix and comes from
+ * an environment variable.
+ *
+ * Values are validated on construction: an empty prefix or env-var name would
+ * make the prefix checks below vacuous or the operator's error message useless,
+ * so that is refused at the point the profile is built rather than silently
+ * producing a provider that accepts anything.
  */
-export const GITHUB_TOKEN_ENV_VAR = "GITHUB_FINE_GRAINED_PAT";
+export interface TokenProfile {
+  /** Prefix every token for this provider carries, e.g. a vendor's token prefix. */
+  readonly prefix: string;
+  /** Name (never a value) of the documented environment variable holding it. */
+  readonly envVar: string;
+}
+
+/** A {@link TokenProfile} is usable only if both halves are non-blank. */
+export function assertValidTokenProfile(profile: TokenProfile): TokenProfile {
+  if (typeof profile.prefix !== "string" || profile.prefix.trim() === "") {
+    throw new CredentialError("token_malformed", {
+      source: UNKNOWN_CREDENTIAL_SOURCE,
+      reason: TOKEN_DEFECT_REASONS.noProfilePrefix,
+    });
+  }
+  if (typeof profile.envVar !== "string" || profile.envVar.trim() === "") {
+    throw new CredentialError("token_malformed", {
+      source: UNKNOWN_CREDENTIAL_SOURCE,
+      reason: TOKEN_DEFECT_REASONS.noProfileEnvVar,
+    });
+  }
+  return profile;
+}
 
 /** Stable, non-secret error codes. Never put a token in one of these. */
 export const CREDENTIAL_ERROR_CODES = [
@@ -140,12 +172,12 @@ export class CredentialError extends Error {
   }
 }
 
-/** The single contract every GitHub credential source implements. */
+/** The single contract every credential source implements. */
 export interface CredentialProvider {
   /** Discriminant for this provider. */
   readonly source: CredentialSource;
   /**
-   * Resolve the GitHub token. Rejects with {@link CredentialError} on any
+   * Resolve the token. Rejects with {@link CredentialError} on any
    * problem; never resolves to an invalid shape.
    */
   getToken(): Promise<string>;
@@ -175,14 +207,24 @@ export function isTestOnlyCredentialSource(
  * itself is never passed to Zod's issue reporting, never interpolated, and
  * never stored. A new defect must mean adding a new key here, never building a
  * new string at a throw site.
+ *
+ * B19 — these strings no longer name a provider's token prefix. Two reasons
+ * follow from each other: a prefix is provider knowledge, and making the table
+ * depend on an injected {@link TokenProfile} would turn a FIXED allowlist into a
+ * value-dependent one, which is precisely the invariant this table exists to
+ * hold. The trade-off is deliberate and recorded: the operator is told the token
+ * has the wrong shape without being told which shape was expected, and the
+ * expected shape is available from the profile at the call site instead.
  */
 export const TOKEN_DEFECT_REASONS = {
   notAString: "provider returned a non-string value",
   empty: "token is empty",
   untrimmed: "token has leading or trailing whitespace",
-  wrongPrefix: `token does not start with the required prefix (${GITHUB_TOKEN_PREFIX})`,
+  wrongPrefix: "token does not start with the required prefix",
   noMaterial: "token has the required prefix but no credential material",
   nonPrintable: "token contains non-printable or non-ASCII characters",
+  noProfilePrefix: "no token profile was supplied for this provider",
+  noProfileEnvVar: "the token profile names no environment variable",
   unknown: "token failed shape validation",
 } as const;
 
@@ -198,10 +240,13 @@ type TokenDefectReason =
  * would make it unclear which reasons are reachable from which throw site. As with the defect
  * table, a throw site selects a member; it never assembles a string.
  *
- * `envVarUnset` names the environment VARIABLE, which is public documentation, never a value.
+ * B19: `envVarUnset` deliberately does NOT name the environment variable either,
+ * for the same reason as `wrongPrefix` above — see that comment. The name is
+ * provider-specific, and interpolating an injected value into a member of a
+ * closed allowlist would make the allowlist unbounded.
  */
 export const TOKEN_SOURCE_REASONS = {
-  envVarUnset: `environment variable ${GITHUB_TOKEN_ENV_VAR} is not set`,
+  envVarUnset: "the documented environment variable is not set",
   fixtureMissing: 'no fixture registered under the key "valid"',
   testSourceForbidden:
     "test-only credential sources require an explicit allowTestSources opt-in",
@@ -266,39 +311,46 @@ const TOKEN_PRESENCE_SCHEMA = z.string().trim().min(1, {
  * refinements happens to short-circuit. Each issue carries a message taken from
  * {@link TOKEN_DEFECT_REASONS}; Zod's own `input` and `received` fields are
  * discarded and never read, because they would carry the secret.
+ *
+ * B19: this is a FACTORY, not a shared constant, because the expected prefix is
+ * provider-supplied. Building it per call keeps the deny on `profile.prefix` at
+ * the point of use; the alternative — one module-level schema bound to one
+ * vendor's prefix — is the defect this change removes.
  */
-const TOKEN_SHAPE_SCHEMA = z.string().superRefine((value, ctx) => {
-  if (value !== value.trim()) {
-    ctx.addIssue({
-      code: "custom",
-      message: TOKEN_DEFECT_REASONS.untrimmed,
-    });
-    return;
-  }
+function tokenShapeSchema(profile: TokenProfile) {
+  return z.string().superRefine((value, ctx) => {
+    if (value !== value.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        message: TOKEN_DEFECT_REASONS.untrimmed,
+      });
+      return;
+    }
 
-  if (!value.startsWith(GITHUB_TOKEN_PREFIX)) {
-    ctx.addIssue({
-      code: "custom",
-      message: TOKEN_DEFECT_REASONS.wrongPrefix,
-    });
-    return;
-  }
+    if (!value.startsWith(profile.prefix)) {
+      ctx.addIssue({
+        code: "custom",
+        message: TOKEN_DEFECT_REASONS.wrongPrefix,
+      });
+      return;
+    }
 
-  if (value.length <= GITHUB_TOKEN_PREFIX.length) {
-    ctx.addIssue({
-      code: "custom",
-      message: TOKEN_DEFECT_REASONS.noMaterial,
-    });
-    return;
-  }
+    if (value.length <= profile.prefix.length) {
+      ctx.addIssue({
+        code: "custom",
+        message: TOKEN_DEFECT_REASONS.noMaterial,
+      });
+      return;
+    }
 
-  if (/[^\x21-\x7e]/.test(value)) {
-    ctx.addIssue({
-      code: "custom",
-      message: TOKEN_DEFECT_REASONS.nonPrintable,
-    });
-  }
-});
+    if (/[^\x21-\x7e]/.test(value)) {
+      ctx.addIssue({
+        code: "custom",
+        message: TOKEN_DEFECT_REASONS.nonPrintable,
+      });
+    }
+  });
+}
 
 /** Resolve a Zod issue message back to a known-safe fixed reason. */
 function reasonFromZod(
@@ -332,11 +384,19 @@ function reasonFromZod(
  * constructor, so passing an arbitrary string here is already safe — the
  * {@link CredentialErrorSource} type steers callers toward the closed set, but
  * safety does not depend on it holding at runtime.
+ *
+ * B19: `profile` is REQUIRED and third — there is no default, for the same
+ * reason the factory takes no default source: a default would be one vendor's
+ * profile baked back into core, which is the defect being removed. Omitting it
+ * is a compile error, not a silent fallback.
  */
 export function validateTokenShape(
   raw: unknown,
   source: CredentialErrorSource,
+  profile: TokenProfile,
 ): string {
+  assertValidTokenProfile(profile);
+
   if (typeof raw !== "string") {
     // Checked up front so the schema's own error type never has to describe a
     // non-string, and so `token_absent` is unambiguous.
@@ -354,7 +414,7 @@ export function validateTokenShape(
     });
   }
 
-  const shape = TOKEN_SHAPE_SCHEMA.safeParse(raw);
+  const shape = tokenShapeSchema(profile).safeParse(raw);
   if (!shape.success) {
     throw new CredentialError("token_malformed", {
       source,

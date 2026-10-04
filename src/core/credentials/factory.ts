@@ -11,12 +11,18 @@
 
 import {
   CredentialError,
+  TOKEN_DEFECT_REASONS,
   TOKEN_SOURCE_REASONS,
   UNKNOWN_CREDENTIAL_SOURCE,
+  assertValidTokenProfile,
   isCredentialSource,
   isTestOnlyCredentialSource,
 } from "./provider";
-import type { CredentialProvider, CredentialSource } from "./provider";
+import type {
+  CredentialProvider,
+  CredentialSource,
+  TokenProfile,
+} from "./provider";
 import { createEnvCredentialProvider } from "./env-provider";
 import type { EnvCredentialProviderOptions } from "./env-provider";
 import { createFakeCredentialProvider } from "./fakes";
@@ -29,9 +35,22 @@ export interface CreateCredentialProviderOptions {
    */
   readonly allowTestSources?: boolean;
   /** Passed through to the env provider when the `env` source is selected. */
-  readonly env?: EnvCredentialProviderOptions;
+  readonly env?: Omit<EnvCredentialProviderOptions, "profile">;
   /** Passed through to the fake provider when the `fake` source is selected. */
-  readonly fake?: FakeCredentialProviderOptions;
+  readonly fake?: Omit<FakeCredentialProviderOptions, "profile">;
+  /**
+   * Which provider's token shape to build for. Required.
+   *
+   * B19: the factory is the single sanctioned way to obtain a provider, so this
+   * is where the provider-specific half of a token's shape enters core — passed
+   * in by the caller, never defaulted. It is declared here rather than nested
+   * under `env`/`fake` because it is required for BOTH sources and because a
+   * caller must not be able to supply one source's profile for another's.
+   *
+   * Validated once here so an unusable profile fails before any provider is
+   * constructed rather than on the first token fetch.
+   */
+  readonly profile: TokenProfile;
 }
 
 /**
@@ -39,7 +58,8 @@ export interface CreateCredentialProviderOptions {
  *
  * @throws {CredentialError} `unknown_source` when `source` is missing or not a
  * known {@link CredentialSource}; `test_source_forbidden` when a test-only
- * source is requested without `allowTestSources`.
+ * source is requested without `allowTestSources`; `token_malformed` when
+ * `options.profile` is blank in either half.
  *
  * Secret hygiene: the rejected `source` value is NEVER stringified into the
  * error. `String(source)` on a caller-controlled argument is a leak by a second
@@ -54,8 +74,23 @@ export interface CreateCredentialProviderOptions {
  */
 export function createCredentialProvider(
   source: unknown,
-  options: CreateCredentialProviderOptions = {},
+  options: CreateCredentialProviderOptions,
 ): CredentialProvider {
+  // B19: `options` (and therefore `profile`) is REQUIRED by the type. It is
+  // still tolerated as absent at runtime, because this factory's documented
+  // contract is that ANY input yields a TYPED CredentialError rather than a
+  // TypeError — a plain property read on `undefined` would break that contract
+  // for a JS caller, or a TS caller who widened the argument. The failure is
+  // still loud and still names the cause.
+  const profile = options?.profile;
+  if (profile === undefined) {
+    throw new CredentialError("token_malformed", {
+      source: UNKNOWN_CREDENTIAL_SOURCE,
+      reason: TOKEN_DEFECT_REASONS.noProfilePrefix,
+    });
+  }
+  assertValidTokenProfile(profile);
+
   if (!isCredentialSource(source)) {
     throw new CredentialError("unknown_source", {
       source: UNKNOWN_CREDENTIAL_SOURCE,
@@ -74,9 +109,9 @@ export function createCredentialProvider(
 
   switch (typedSource) {
     case "env":
-      return createEnvCredentialProvider(options.env);
+      return createEnvCredentialProvider({ ...options.env, profile });
     case "fake":
-      return createFakeCredentialProvider(options.fake);
+      return createFakeCredentialProvider({ ...options.fake, profile });
     default: {
       // Exhaustiveness guard: a new source cannot be added without a branch here.
       // `void` so the assertion counts as a use — the variable's whole job is to

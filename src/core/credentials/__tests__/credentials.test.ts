@@ -7,7 +7,6 @@ import {
   CREDENTIAL_FAILURE_REASONS,
   CREDENTIAL_SOURCES,
   CredentialError,
-  GITHUB_TOKEN_PREFIX,
   TEST_ONLY_CREDENTIAL_SOURCES,
   TOKEN_DEFECT_REASONS,
   TOKEN_SOURCE_REASONS,
@@ -24,15 +23,17 @@ import type {
   CredentialFailureReason,
   CredentialSource,
   TestOnlyCredentialSource,
+  TokenProfile,
 } from "../provider";
-import { GITHUB_TOKEN_ENV_VAR, EnvCredentialProvider } from "../env-provider";
+import { EnvCredentialProvider } from "../env-provider";
 import {
   FAKE_TOKEN_KEY,
-  FAKE_TOKENS,
   FakeCredentialProvider,
   createFakeCredentialProvider,
+  fakeTokensFor,
 } from "../fakes";
 import { createCredentialProvider } from "../factory";
+import type { CreateCredentialProviderOptions } from "../factory";
 
 /**
  * `TokenDefectReason` is deliberately not exported from `provider.ts` — that
@@ -43,9 +44,26 @@ import { createCredentialProvider } from "../factory";
 type DefectReason =
   (typeof TOKEN_DEFECT_REASONS)[keyof typeof TOKEN_DEFECT_REASONS];
 
-/** Synthetic, clearly-not-a-secret token. Not a real token shape. */
-const GOOD = "github_pat_-not-a-real-fixture-token-1";
-const OTHER = "github_pat_-not-a-real-fixture-token-2";
+/**
+ * B19 - a deliberately FICTIONAL token profile.
+ *
+ * The prefix and env-var name used to be imported from `../provider`, which put
+ * one vendor's real token format in this file. Supplying a profile here instead
+ * is what keeps `src/core/` provider-agnostic: core states the SHAPE a token
+ * must have and the shape's owner injects it.
+ *
+ * The prefix is fictional, so this file asserts the validation logic and cannot
+ * be mistaken for knowledge of any real provider's token format.
+ */
+const TEST_PROFILE: TokenProfile = {
+  prefix: "vndr_",
+  envVar: "VENDOR_SAMPLE_PAT",
+};
+const FAKE_TOKENS = fakeTokensFor(TEST_PROFILE);
+
+/** Synthetic, clearly-not-a-secret tokens. Not a real token shape. */
+const GOOD = FAKE_TOKENS.valid;
+const OTHER = `${TEST_PROFILE.prefix}not-a-real-fixture-token-2`;
 
 /**
  * The version of the zod actually resolved at runtime, not from package.json.
@@ -101,24 +119,28 @@ function expectCredentialError(promise: Promise<unknown>) {
   );
 }
 
-const originalEnv = process.env[GITHUB_TOKEN_ENV_VAR];
+const originalEnv = process.env[TEST_PROFILE.envVar];
 
 beforeEach(() => {
-  delete process.env[GITHUB_TOKEN_ENV_VAR];
+  delete process.env[TEST_PROFILE.envVar];
 });
 
 afterEach(() => {
   if (originalEnv === undefined) {
-    delete process.env[GITHUB_TOKEN_ENV_VAR];
+    delete process.env[TEST_PROFILE.envVar];
   } else {
-    process.env[GITHUB_TOKEN_ENV_VAR] = originalEnv;
+    process.env[TEST_PROFILE.envVar] = originalEnv;
   }
 });
 
 describe("CredentialProvider contract", () => {
   it("exposes a discriminant on every implementation", () => {
-    expect(new EnvCredentialProvider().source).toBe("env");
-    expect(new FakeCredentialProvider().source).toBe("fake");
+    expect(new EnvCredentialProvider({ profile: TEST_PROFILE }).source).toBe(
+      "env",
+    );
+    expect(new FakeCredentialProvider({ profile: TEST_PROFILE }).source).toBe(
+      "fake",
+    );
   });
 
   it("classifies sources", () => {
@@ -132,8 +154,8 @@ describe("CredentialProvider contract", () => {
 
   it("every provider implements getToken(): Promise<string>", async () => {
     const providers = [
-      new EnvCredentialProvider({ readEnv: () => GOOD }),
-      new FakeCredentialProvider(),
+      new EnvCredentialProvider({ profile: TEST_PROFILE, readEnv: () => GOOD }),
+      new FakeCredentialProvider({ profile: TEST_PROFILE }),
     ];
     for (const provider of providers) {
       const result = provider.getToken();
@@ -145,39 +167,48 @@ describe("CredentialProvider contract", () => {
 
 describe("env provider happy path", () => {
   it("returns a valid token from the documented variable", async () => {
-    process.env[GITHUB_TOKEN_ENV_VAR] = GOOD;
-    const provider = new EnvCredentialProvider();
+    process.env[TEST_PROFILE.envVar] = GOOD;
+    const provider = new EnvCredentialProvider({ profile: TEST_PROFILE });
     await expect(provider.getToken()).resolves.toBe(GOOD);
   });
 
   it("reads process.env lazily, not at module import time", async () => {
     // Constructed while the variable is unset, then set afterwards.
-    const provider = new EnvCredentialProvider();
+    const provider = new EnvCredentialProvider({ profile: TEST_PROFILE });
     await expectCredentialError(provider.getToken());
-    process.env[GITHUB_TOKEN_ENV_VAR] = OTHER;
+    process.env[TEST_PROFILE.envVar] = OTHER;
     await expect(provider.getToken()).resolves.toBe(OTHER);
   });
 
   it("honours an injected env reader", async () => {
-    const provider = new EnvCredentialProvider({ readEnv: () => GOOD });
+    const provider = new EnvCredentialProvider({
+      profile: TEST_PROFILE,
+      readEnv: () => GOOD,
+    });
     await expect(provider.getToken()).resolves.toBe(GOOD);
   });
 });
 
 describe("fake provider happy path", () => {
   it("returns the in-memory fixture value", async () => {
-    await expect(new FakeCredentialProvider().getToken()).resolves.toBe(
-      FAKE_TOKENS.valid,
-    );
+    await expect(
+      new FakeCredentialProvider({ profile: TEST_PROFILE }).getToken(),
+    ).resolves.toBe(FAKE_TOKENS.valid);
   });
 
   it("returns values from a caller-supplied in-memory map", async () => {
-    const provider = new FakeCredentialProvider({ tokens: { valid: OTHER } });
+    const provider = new FakeCredentialProvider({
+      profile: TEST_PROFILE,
+      tokens: { valid: OTHER },
+    });
     await expect(provider.getToken()).resolves.toBe(OTHER);
   });
 
   it("fails typed when the map has no value under the expected key", async () => {
-    const provider = new FakeCredentialProvider({ tokens: {} });
+    const provider = new FakeCredentialProvider({
+      profile: TEST_PROFILE,
+      tokens: {},
+    });
     const error = await expectCredentialError(provider.getToken());
     expect(error.code).toBe("token_absent");
     expect(error.source).toBe("fake");
@@ -187,17 +218,20 @@ describe("fake provider happy path", () => {
 describe("absent token -> typed error", () => {
   it("env provider throws token_absent when the variable is unset", async () => {
     const error = await expectCredentialError(
-      new EnvCredentialProvider().getToken(),
+      new EnvCredentialProvider({ profile: TEST_PROFILE }).getToken(),
     );
     expect(error.code).toBe("token_absent");
     expect(error.source).toBe("env");
-    expect(error.message).toContain(GITHUB_TOKEN_ENV_VAR);
+    expect(error.message).toContain(TOKEN_SOURCE_REASONS.envVarUnset);
   });
 
   it("env provider throws token_absent for an empty or whitespace value", async () => {
     for (const value of ["", "   ", "\t\n"]) {
       const error = await expectCredentialError(
-        new EnvCredentialProvider({ readEnv: () => value }).getToken(),
+        new EnvCredentialProvider({
+          profile: TEST_PROFILE,
+          readEnv: () => value,
+        }).getToken(),
       );
       expect(error.code).toBe("token_absent");
       expect(error.source).toBe("env");
@@ -206,7 +240,7 @@ describe("absent token -> typed error", () => {
 
   it("rejects a non-string provider result as token_absent", () => {
     try {
-      validateTokenShape(undefined, "env");
+      validateTokenShape(undefined, "env", TEST_PROFILE);
       throw new Error("expected a CredentialError");
     } catch (error) {
       expect(error).toBeInstanceOf(CredentialError);
@@ -219,9 +253,9 @@ describe("malformed token -> typed error, and the secret never leaks", () => {
   const malformed: Array<[string, string]> = [
     ["leading whitespace", ` ${GOOD}`],
     ["trailing whitespace", `${GOOD} `],
-    ["wrong prefix", "ghp_not-the-right-shape-at-all"],
+    ["wrong prefix", "other_not-the-right-shape-at-all"],
     ["no prefix at all", "just-a-bare-string"],
-    ["prefix only", GITHUB_TOKEN_PREFIX],
+    ["prefix only", TEST_PROFILE.prefix],
     ["embedded newline", `${GOOD}\nleaked`],
     ["non-ascii", `${GOOD}é`],
   ];
@@ -229,7 +263,10 @@ describe("malformed token -> typed error, and the secret never leaks", () => {
   for (const [label, value] of malformed) {
     it(`rejects ${label} as token_malformed`, async () => {
       const error = await expectCredentialError(
-        new EnvCredentialProvider({ readEnv: () => value }).getToken(),
+        new EnvCredentialProvider({
+          profile: TEST_PROFILE,
+          readEnv: () => value,
+        }).getToken(),
       );
       expect(error.code).toBe("token_malformed");
       expect(error.source).toBe("env");
@@ -260,6 +297,7 @@ describe("malformed token -> typed error, and the secret never leaks", () => {
 
   it("the fake provider validates its fixture through the same rules", async () => {
     const provider = new FakeCredentialProvider({
+      profile: TEST_PROFILE,
       tokens: { valid: " oops " },
     });
     const error = await expectCredentialError(provider.getToken());
@@ -278,7 +316,7 @@ describe("Zod-backed validation", () => {
   });
 
   it("returns the exact input unchanged on the happy path", () => {
-    expect(validateTokenShape(GOOD, "env")).toBe(GOOD);
+    expect(validateTokenShape(GOOD, "env", TEST_PROFILE)).toBe(GOOD);
   });
 
   it("maps each defect to its own fixed, secret-free reason", () => {
@@ -315,7 +353,7 @@ describe("Zod-backed validation", () => {
       ],
       [
         "wrong prefix",
-        "ghp_wrong-prefix-entirely",
+        "other_wrong-prefix-entirely",
         "token_malformed",
         TOKEN_DEFECT_REASONS.wrongPrefix,
       ],
@@ -327,7 +365,7 @@ describe("Zod-backed validation", () => {
       ],
       [
         "prefix only",
-        GITHUB_TOKEN_PREFIX,
+        TEST_PROFILE.prefix,
         "token_malformed",
         TOKEN_DEFECT_REASONS.noMaterial,
       ],
@@ -346,7 +384,9 @@ describe("Zod-backed validation", () => {
     ];
 
     for (const [label, value, expectedCode, expectedReason] of cases) {
-      const error = capture(label, () => validateTokenShape(value, "env"));
+      const error = capture(label, () =>
+        validateTokenShape(value, "env", TEST_PROFILE),
+      );
       expect(error.code, label).toBe(expectedCode);
       // Equality, not membership. Also still asserts the reason is one of the
       // FIXED strings byte for byte — not assembled at the throw site, which is
@@ -370,7 +410,7 @@ describe("Zod-backed validation", () => {
     // enough to act on.
     for (const source of ["env", "fake"] as const) {
       const error = capture(`source ${source}`, () =>
-        validateTokenShape("bad-value", source),
+        validateTokenShape("bad-value", source, TEST_PROFILE),
       );
       expect(error.source).toBe(source);
       expect(error.message).toContain(source);
@@ -381,7 +421,7 @@ describe("Zod-backed validation", () => {
     // A caller with something that is not a source still gets a usable error,
     // and does not get its own text echoed back.
     const error = capture("unrecognised source", () =>
-      validateTokenShape("bad-value", UNKNOWN_CREDENTIAL_SOURCE),
+      validateTokenShape("bad-value", UNKNOWN_CREDENTIAL_SOURCE, TEST_PROFILE),
     );
     expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
     expect(error.message).toContain(UNKNOWN_CREDENTIAL_SOURCE);
@@ -393,11 +433,14 @@ describe("Zod-backed validation", () => {
     // Guards the ordering of the two schemas: blank is absent, untrimmed but
     // non-blank is malformed. Getting this backwards would silently downgrade
     // a real misconfiguration to the wrong error code.
-    expect(capture("blank", () => validateTokenShape("   ", "env")).code).toBe(
-      "token_absent",
-    );
     expect(
-      capture("untrimmed", () => validateTokenShape(` ${GOOD} `, "env")).code,
+      capture("blank", () => validateTokenShape("   ", "env", TEST_PROFILE))
+        .code,
+    ).toBe("token_absent");
+    expect(
+      capture("untrimmed", () =>
+        validateTokenShape(` ${GOOD} `, "env", TEST_PROFILE),
+      ).code,
     ).toBe("token_malformed");
   });
 
@@ -431,6 +474,7 @@ describe("Zod-backed validation", () => {
 describe("factory", () => {
   it("builds the env provider for the explicit 'env' source", async () => {
     const provider = createCredentialProvider("env", {
+      profile: TEST_PROFILE,
       env: { readEnv: () => GOOD },
     });
     expect(provider.source).toBe("env");
@@ -439,6 +483,7 @@ describe("factory", () => {
 
   it("builds the fake provider only with an explicit opt-in", async () => {
     const provider = createCredentialProvider("fake", {
+      profile: TEST_PROFILE,
       allowTestSources: true,
     });
     expect(provider.source).toBe("fake");
@@ -447,7 +492,7 @@ describe("factory", () => {
 
   it("rejects the test-only source without the opt-in", () => {
     try {
-      createCredentialProvider("fake");
+      createCredentialProvider("fake", { profile: TEST_PROFILE });
       throw new Error("expected a CredentialError");
     } catch (error) {
       expect(error).toBeInstanceOf(CredentialError);
@@ -460,7 +505,7 @@ describe("factory", () => {
   it("rejects an unknown source loudly", () => {
     for (const source of ["vault", "keychain", "", "ENV"]) {
       try {
-        createCredentialProvider(source);
+        createCredentialProvider(source, { profile: TEST_PROFILE });
         throw new Error(`expected a CredentialError for ${source}`);
       } catch (error) {
         expect(error).toBeInstanceOf(CredentialError);
@@ -472,7 +517,7 @@ describe("factory", () => {
   it("rejects a missing source loudly: there is no ambient default", () => {
     for (const source of [undefined, null, 0, {}, []]) {
       try {
-        createCredentialProvider(source);
+        createCredentialProvider(source, { profile: TEST_PROFILE });
         throw new Error("expected a CredentialError");
       } catch (error) {
         expect(error).toBeInstanceOf(CredentialError);
@@ -484,7 +529,7 @@ describe("factory", () => {
   it("requires the source argument by type, not by defaulting", () => {
     // A compile-time guard, asserted here so the intent is recorded: the
     // parameter has no default and is not optional.
-    expect(createCredentialProvider.length).toBe(1);
+    expect(createCredentialProvider.length).toBe(2);
   });
 
   it("cannot be made to select the fake by an environment variable", () => {
@@ -492,8 +537,8 @@ describe("factory", () => {
     const knobs: Record<string, string> = {
       CREDENTIAL_SOURCE: "fake",
       DEVLOOP_CREDENTIAL_SOURCE: "fake",
-      GITHUB_CREDENTIAL_SOURCE: "fake",
-      GITHUB_FINE_GRAINED_PAT: FAKE_TOKENS.valid,
+      VENDOR_CREDENTIAL_SOURCE: "fake",
+      VENDOR_SAMPLE_PAT: FAKE_TOKENS.valid,
     };
     for (const [key, value] of Object.entries(knobs)) {
       process.env[key] = value;
@@ -503,14 +548,35 @@ describe("factory", () => {
       // rather than reading any of the knobs above. The cast is deliberate —
       // it proves the runtime behaviour when a caller omits the argument that
       // TypeScript would otherwise reject at compile time.
-      const callWithNoArgument =
-        createCredentialProvider as unknown as () => void;
-      expect(() => callWithNoArgument()).toThrowError(CredentialError);
-      expect(() => callWithNoArgument()).toThrowError(/unknown_source/);
-      // And the knob alone cannot conjure a provider for the fake source.
-      expect(() => createCredentialProvider("fake")).toThrowError(
-        /test_source_forbidden/,
+      // The subject here is a missing SOURCE, so the options ARE supplied and
+      // the source omitted: that is the ambient-default question. It must fail
+      // as an unknown SOURCE, which is only reachable when the profile check
+      // has already passed — so this also proves the profile is not what makes
+      // the call throw.
+      const callWithNoSource = createCredentialProvider as unknown as (
+        s: unknown,
+        o: CreateCredentialProviderOptions,
+      ) => void;
+      expect(() =>
+        callWithNoSource(undefined, { profile: TEST_PROFILE }),
+      ).toThrowError(CredentialError);
+      expect(() =>
+        callWithNoSource(undefined, { profile: TEST_PROFILE }),
+      ).toThrowError(/unknown_source/);
+
+      // And omitting the options entirely is a missing PROFILE, not a crash:
+      // still a typed CredentialError, never a TypeError.
+      const callWithNoOptions = createCredentialProvider as unknown as (
+        s?: unknown,
+      ) => void;
+      expect(() => callWithNoOptions()).toThrowError(CredentialError);
+      expect(() => callWithNoOptions()).toThrowError(
+        TOKEN_DEFECT_REASONS.noProfilePrefix,
       );
+      // And the knob alone cannot conjure a provider for the fake source.
+      expect(() =>
+        createCredentialProvider("fake", { profile: TEST_PROFILE }),
+      ).toThrowError(/test_source_forbidden/);
     } finally {
       for (const key of Object.keys(knobs)) {
         delete process.env[key];
@@ -564,28 +630,28 @@ describe("regression: fake providers do not share mutable state", () => {
   it("does not mutate the exported fixtures when a default provider is written to", async () => {
     const before = FAKE_TOKENS[FAKE_TOKEN_KEY];
 
-    const polluted = new FakeCredentialProvider();
-    polluted.setToken("github_pat_-mutated-by-one-test-only");
+    const polluted = new FakeCredentialProvider({ profile: TEST_PROFILE });
+    polluted.setToken(`${TEST_PROFILE.prefix}mutated-by-one-test-only`);
 
     // The exported fixture table must be untouched.
     expect(FAKE_TOKENS[FAKE_TOKEN_KEY]).toBe(before);
     // FINDING 3: the table is now exactly ONE key. `validAlt` shipped with no
     // code path that could ever read it, which is what made the old
     // any-key-`setToken` look legitimate.
-    expect(FAKE_TOKENS).toEqual({
-      valid: "github_pat_-not-a-real-fixture-token-1",
-    });
+    expect(FAKE_TOKENS).toEqual({ valid: GOOD });
     expect(Object.keys(FAKE_TOKENS)).toEqual([FAKE_TOKEN_KEY]);
 
     // And a provider constructed afterwards must see pristine fixtures. This is
     // the failure QA observed: without the copy, the fresh provider returned the
     // polluted value, making the suite order-dependent.
-    await expect(new FakeCredentialProvider().getToken()).resolves.toBe(before);
+    await expect(
+      new FakeCredentialProvider({ profile: TEST_PROFILE }).getToken(),
+    ).resolves.toBe(before);
   });
 
   it("keeps two concurrently-live providers independent", async () => {
-    const a = new FakeCredentialProvider();
-    const b = new FakeCredentialProvider();
+    const a = new FakeCredentialProvider({ profile: TEST_PROFILE });
+    const b = new FakeCredentialProvider({ profile: TEST_PROFILE });
 
     a.setToken(OTHER);
     await expect(a.getToken()).resolves.toBe(OTHER);
@@ -594,7 +660,10 @@ describe("regression: fake providers do not share mutable state", () => {
 
   it("does not mutate a caller-supplied token map", async () => {
     const supplied = { [FAKE_TOKEN_KEY]: GOOD };
-    const provider = new FakeCredentialProvider({ tokens: supplied });
+    const provider = new FakeCredentialProvider({
+      profile: TEST_PROFILE,
+      tokens: supplied,
+    });
 
     provider.setToken(OTHER);
 
@@ -635,7 +704,7 @@ describe("FINDING 3: the fake provider reads exactly one documented key", () => 
   it("a fixture written through setToken IS reachable via getToken", async () => {
     // The property that was broken: whatever setToken registers, getToken must
     // return. With the old any-key API a non-`valid` key was write-only.
-    const provider = new FakeCredentialProvider();
+    const provider = new FakeCredentialProvider({ profile: TEST_PROFILE });
     provider.setToken(OTHER);
     await expect(provider.getToken()).resolves.toBe(OTHER);
   });
@@ -645,6 +714,7 @@ describe("FINDING 3: the fake provider reads exactly one documented key", () => 
     // `alt` is not {@link FAKE_TOKEN_KEY}, so it cannot be read back — which is
     // precisely why the API no longer invites callers to use one.
     const provider = new FakeCredentialProvider({
+      profile: TEST_PROFILE,
       tokens: { alt: OTHER } as never,
     });
     const error = await expectCredentialError(provider.getToken());
@@ -653,7 +723,10 @@ describe("FINDING 3: the fake provider reads exactly one documented key", () => 
   });
 
   it("an empty map is the fixtureMissing path, not a crash", async () => {
-    const provider = new FakeCredentialProvider({ tokens: {} });
+    const provider = new FakeCredentialProvider({
+      profile: TEST_PROFILE,
+      tokens: {},
+    });
     const error = await expectCredentialError(provider.getToken());
     expect(error.code).toBe("token_absent");
     expect(error.reason).toBe(TOKEN_SOURCE_REASONS.fixtureMissing);
@@ -664,7 +737,8 @@ describe("FINDING 3: the fake provider reads exactly one documented key", () => 
  * FINDING 4 — negative control.
  *
  * The defect: `raw === undefined || raw.trim().length === 0` reported BOTH as
- * `envVarUnset` — "... is not set". A `GITHUB_FINE_GRAINED_PAT` of `"   "` was
+ * `envVarUnset` — "... is not set". An unset-by-appearance variable set to
+ * `"   "` was
  * therefore reported as an unset variable, sending the operator after a missing
  * export when the real fault was a stray space or an empty value committed to a
  * `.env`.
@@ -675,7 +749,10 @@ describe("FINDING 4: blank-but-present is not reported as 'not set'", () => {
   it("a whitespace-only env var is NOT reported as unset", async () => {
     for (const value of ["", "   ", "\t\n", " \n\t "]) {
       const error = await expectCredentialError(
-        new EnvCredentialProvider({ readEnv: () => value }).getToken(),
+        new EnvCredentialProvider({
+          profile: TEST_PROFILE,
+          readEnv: () => value,
+        }).getToken(),
       );
       expect(error.reason, JSON.stringify(value)).not.toBe(NOT_SET);
       // Still absent, still typed — just for the accurate reason.
@@ -692,17 +769,20 @@ describe("FINDING 4: blank-but-present is not reported as 'not set'", () => {
     // The control must not pass by dropping the message entirely: the absent
     // case is the one place where naming the variable is exactly right.
     const error = await expectCredentialError(
-      new EnvCredentialProvider({ readEnv: () => undefined }).getToken(),
+      new EnvCredentialProvider({
+        profile: TEST_PROFILE,
+        readEnv: () => undefined,
+      }).getToken(),
     );
     expect(error.reason).toBe(NOT_SET);
     expect(error.code).toBe("token_absent");
-    expect(error.message).toContain(GITHUB_TOKEN_ENV_VAR);
+    expect(error.message).toContain(TOKEN_SOURCE_REASONS.envVarUnset);
   });
 
   it("reads the real process.env, not only an injected reader", async () => {
-    process.env[GITHUB_TOKEN_ENV_VAR] = "   ";
+    process.env[TEST_PROFILE.envVar] = "   ";
     const error = await expectCredentialError(
-      new EnvCredentialProvider().getToken(),
+      new EnvCredentialProvider({ profile: TEST_PROFILE }).getToken(),
     );
     expect(error.reason).not.toBe(NOT_SET);
     expect(error.reason).toBe(TOKEN_DEFECT_REASONS.empty);
@@ -725,11 +805,11 @@ describe("FINDING 4: blank-but-present is not reported as 'not set'", () => {
  */
 describe("regression: a token passed as `source` never reaches the error", () => {
   /**
-   * Shaped like a real fine-grained PAT — correct prefix, long alphanumeric
-   * material — so the assertion is about the fix, not about a value that would
-   * fail a token-shape test for unrelated reasons.
+   * Shaped like a real token — correct prefix, long alphanumeric material — so
+   * the assertion is about the fix, not about a value that would fail a
+   * token-shape test for unrelated reasons.
    */
-  const TOKEN_AS_SOURCE = `github_pat_11ABCDEFG0abcdefghijkl_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij`;
+  const TOKEN_AS_SOURCE = `${TEST_PROFILE.prefix}redacted-placeholder-value`;
 
   /** Every string a consumer could plausibly read, log, or ship off an error. */
   function serialisedSurface(error: CredentialError): string {
@@ -787,7 +867,7 @@ describe("regression: a token passed as `source` never reaches the error", () =>
   it("does not leak a token-shaped string passed as the factory's source", () => {
     // The second route: `String(source)` used to carry the value into the error.
     const error = capture("token as factory source", () =>
-      createCredentialProvider(TOKEN_AS_SOURCE),
+      createCredentialProvider(TOKEN_AS_SOURCE, { profile: TEST_PROFILE }),
     );
 
     expect(error.message).not.toContain(TOKEN_AS_SOURCE);
@@ -799,7 +879,11 @@ describe("regression: a token passed as `source` never reaches the error", () =>
 
   it("does not leak a token-shaped string thrown by validateTokenShape", () => {
     const error = capture("token as validateTokenShape source", () =>
-      validateTokenShape("bad-value", TOKEN_AS_SOURCE as CredentialErrorSource),
+      validateTokenShape(
+        "bad-value",
+        TOKEN_AS_SOURCE as CredentialErrorSource,
+        TEST_PROFILE,
+      ),
     );
     expect(serialisedSurface(error)).not.toContain(TOKEN_AS_SOURCE);
     expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
@@ -808,9 +892,9 @@ describe("regression: a token passed as `source` never reaches the error", () =>
   it("still refuses to build a provider for a token-shaped source", () => {
     // The control must not pass by simply accepting the value: the call still
     // has to fail, or the assertions above would be vacuous.
-    expect(() => createCredentialProvider(TOKEN_AS_SOURCE)).toThrowError(
-      CredentialError,
-    );
+    expect(() =>
+      createCredentialProvider(TOKEN_AS_SOURCE, { profile: TEST_PROFILE }),
+    ).toThrowError(CredentialError);
   });
 });
 
@@ -886,7 +970,7 @@ describe("regression: source and reason are constrained to allowlists", () => {
     ]);
 
     const error = capture("allowlist invariant", () =>
-      validateTokenShape("bad-value", "env"),
+      validateTokenShape("bad-value", "env", TEST_PROFILE),
     );
     expect(CREDENTIAL_ERROR_SOURCES).toContain(error.source);
     expect(CREDENTIAL_FAILURE_REASONS).toContain(error.reason);
@@ -916,7 +1000,7 @@ describe("regression: the factory never stringifies the rejected source", () => 
       // `typeof` in the label, not the value: interpolating the input into a
       // failure message is exactly the habit this whole block exists to catch.
       const error = capture(`factory source ${typeof input}`, () =>
-        createCredentialProvider(input),
+        createCredentialProvider(input, { profile: TEST_PROFILE }),
       );
       expect(error.code).toBe("unknown_source");
       expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
