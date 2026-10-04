@@ -13,6 +13,8 @@
  *    prefix) but never logged or echoed.
  */
 
+import { z } from "zod";
+
 /**
  * Discriminant identifying where a credential is read from.
  *
@@ -104,61 +106,133 @@ export function isTestOnlyCredentialSource(
 }
 
 /**
- * Validate the shape of a raw token value.
+ * The closed set of reasons a credential can be refused, each a FIXED string.
  *
- * NOTE: this is a hand-rolled validator rather than a Zod schema. The card
- * requires Zod-shaped validation but also forbids adding a dependency and puts
- * `bun.lock` off-limits, and `zod` is not present on this base. The checks below
- * mirror what a Zod schema would express, so swapping in `zod` later is a
- * mechanical change confined to this function.
+ * This exists so that no failure path can construct a reason from the offending
+ * value: reasons are looked up from this table by a stable key, and the value
+ * itself is never passed to Zod's issue reporting, never interpolated, and
+ * never stored. A new defect must mean adding a new key here, never building a
+ * new string at a throw site.
+ */
+export const TOKEN_DEFECT_REASONS = {
+  notAString: "provider returned a non-string value",
+  empty: "token is empty",
+  untrimmed: "token has leading or trailing whitespace",
+  wrongPrefix: `token does not start with the required prefix (${GITHUB_TOKEN_PREFIX})`,
+  noMaterial: "token has the required prefix but no credential material",
+  nonPrintable: "token contains non-printable or non-ASCII characters",
+  unknown: "token failed shape validation",
+} as const;
+
+type TokenDefectReason =
+  (typeof TOKEN_DEFECT_REASONS)[keyof typeof TOKEN_DEFECT_REASONS];
+
+/**
+ * Presence check: is there a token at all?
+ *
+ * `.trim()` before `.min(1)` is what makes a whitespace-only value *absent*
+ * rather than malformed. Failure here is `token_absent`.
+ */
+const TOKEN_PRESENCE_SCHEMA = z.string().trim().min(1, {
+  // Zod's own min-message would not be in the allowlist, so a blank value would
+  // be reported as the generic `unknown` reason. Overriding it keeps every
+  // reason a member of the fixed table, including for the empty case.
+  error: TOKEN_DEFECT_REASONS.empty,
+});
+
+/**
+ * Shape check, applied only to a value already known to be non-blank.
+ *
+ * All four checks live in one `superRefine` so their order — and therefore the
+ * reason a caller sees — is explicit rather than an artefact of how a chain of
+ * refinements happens to short-circuit. Each issue carries a message taken from
+ * {@link TOKEN_DEFECT_REASONS}; Zod's own `input` and `received` fields are
+ * discarded and never read, because they would carry the secret.
+ */
+const TOKEN_SHAPE_SCHEMA = z.string().superRefine((value, ctx) => {
+  if (value !== value.trim()) {
+    ctx.addIssue({
+      code: "custom",
+      message: TOKEN_DEFECT_REASONS.untrimmed,
+    });
+    return;
+  }
+
+  if (!value.startsWith(GITHUB_TOKEN_PREFIX)) {
+    ctx.addIssue({
+      code: "custom",
+      message: TOKEN_DEFECT_REASONS.wrongPrefix,
+    });
+    return;
+  }
+
+  if (value.length <= GITHUB_TOKEN_PREFIX.length) {
+    ctx.addIssue({
+      code: "custom",
+      message: TOKEN_DEFECT_REASONS.noMaterial,
+    });
+    return;
+  }
+
+  if (/[^\x21-\x7e]/.test(value)) {
+    ctx.addIssue({
+      code: "custom",
+      message: TOKEN_DEFECT_REASONS.nonPrintable,
+    });
+  }
+});
+
+/** Resolve a Zod issue message back to a known-safe fixed reason. */
+function reasonFromZod(
+  issues: readonly { message: string }[],
+): TokenDefectReason {
+  const known = new Set<string>(Object.values(TOKEN_DEFECT_REASONS));
+  const match = issues
+    .map((issue) => issue.message)
+    .find((message) => known.has(message));
+  return (
+    (match as TokenDefectReason | undefined) ?? TOKEN_DEFECT_REASONS.unknown
+  );
+}
+
+/**
+ * Validate the shape of a raw token value with Zod, and return it unchanged.
  *
  * Rejects, in order:
- *  - empty / whitespace-only            -> `token_absent`
- *  - leading or trailing whitespace     -> `token_malformed`
- *  - missing the required prefix        -> `token_malformed`
- *  - non-printable characters           -> `token_malformed`
+ *  - non-string, empty, or whitespace-only -> `token_absent`
+ *  - leading or trailing whitespace        -> `token_malformed`
+ *  - missing the required prefix           -> `token_malformed`
+ *  - prefix but no credential material     -> `token_malformed`
+ *  - non-printable characters              -> `token_malformed`
+ *
+ * Secret hygiene: the offending value reaches nothing but Zod's validator, and
+ * leaves only as one of the fixed {@link TOKEN_DEFECT_REASONS} strings. It is
+ * not echoed into the error, not used as a Zod issue message, and not attached
+ * as an error `cause`.
  */
 export function validateTokenShape(raw: unknown, source: string): string {
   if (typeof raw !== "string") {
+    // Checked up front so the schema's own error type never has to describe a
+    // non-string, and so `token_absent` is unambiguous.
     throw new CredentialError("token_absent", {
       source,
-      reason: "provider returned a non-string value",
+      reason: TOKEN_DEFECT_REASONS.notAString,
     });
   }
 
-  if (raw.trim().length === 0) {
+  const presence = TOKEN_PRESENCE_SCHEMA.safeParse(raw);
+  if (!presence.success) {
     throw new CredentialError("token_absent", {
       source,
-      reason: "token is empty",
+      reason: reasonFromZod(presence.error.issues),
     });
   }
 
-  if (raw !== raw.trim()) {
-    // The reason describes the defect, never the value.
+  const shape = TOKEN_SHAPE_SCHEMA.safeParse(raw);
+  if (!shape.success) {
     throw new CredentialError("token_malformed", {
       source,
-      reason: "token has leading or trailing whitespace",
-    });
-  }
-
-  if (!raw.startsWith(GITHUB_TOKEN_PREFIX)) {
-    throw new CredentialError("token_malformed", {
-      source,
-      reason: `token does not start with the required prefix (${GITHUB_TOKEN_PREFIX})`,
-    });
-  }
-
-  if (raw.length <= GITHUB_TOKEN_PREFIX.length) {
-    throw new CredentialError("token_malformed", {
-      source,
-      reason: "token has the required prefix but no credential material",
-    });
-  }
-
-  if (/[^\x21-\x7e]/.test(raw)) {
-    throw new CredentialError("token_malformed", {
-      source,
-      reason: "token contains non-printable or non-ASCII characters",
+      reason: reasonFromZod(shape.error.issues),
     });
   }
 

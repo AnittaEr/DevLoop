@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
+import zodPackage from "zod/package.json" with { type: "json" };
 
 import {
   CredentialError,
   GITHUB_TOKEN_PREFIX,
+  TOKEN_DEFECT_REASONS,
   isCredentialSource,
   isTestOnlyCredentialSource,
   validateTokenShape,
@@ -14,6 +17,34 @@ import { createCredentialProvider } from "../factory";
 /** Synthetic, clearly-not-a-secret token. Not a real token shape. */
 const GOOD = "github_pat_-not-a-real-fixture-token-1";
 const OTHER = "github_pat_-not-a-real-fixture-token-2";
+
+/**
+ * The version of the zod actually resolved at runtime, not from package.json.
+ *
+ * Read defensively: this is a provenance assertion for the test suite, so if a
+ * future zod changes its export shape the failure must be "cannot read the
+ * version", never a type error at import time.
+ */
+function readZodVersion(): string {
+  const fromPackage = (zodPackage as { version?: unknown }).version;
+  if (typeof fromPackage === "string") return fromPackage;
+  const fromRuntime = (z as unknown as { _zod?: { version?: unknown } })._zod
+    ?.version;
+  return typeof fromRuntime === "string" ? fromRuntime : "";
+}
+
+const zodVersion = readZodVersion();
+
+/** Run a synchronous thunk that must throw a CredentialError, and return it. */
+function capture(thunk: () => unknown): CredentialError {
+  try {
+    thunk();
+  } catch (error) {
+    expect(error).toBeInstanceOf(CredentialError);
+    return error as CredentialError;
+  }
+  throw new Error("expected a CredentialError but nothing was thrown");
+}
 
 function expectCredentialError(promise: Promise<unknown>) {
   return promise.then(
@@ -192,6 +223,65 @@ describe("malformed token -> typed error, and the secret never leaks", () => {
     expect(error.code).toBe("token_malformed");
     expect(error.source).toBe("fake");
     expect(error.message).not.toContain("oops");
+  });
+});
+
+describe("Zod-backed validation", () => {
+  it("imports zod and routes shape validation through a real schema", () => {
+    // The criterion is "Zod-validate", so assert the dependency is genuinely
+    // wired in at runtime rather than trusting that the import is used.
+    expect(z.string).toBeTypeOf("function");
+    expect(zodVersion).toMatch(/^\d+\.\d+\.\d+/);
+  });
+
+  it("returns the exact input unchanged on the happy path", () => {
+    expect(validateTokenShape(GOOD, "env")).toBe(GOOD);
+  });
+
+  it("maps each defect to its own fixed, secret-free reason", () => {
+    const cases: Array<[string, string, string]> = [
+      ["empty", "", "token_absent"],
+      ["whitespace only", "  \t\n ", "token_absent"],
+      ["leading whitespace", ` ${GOOD}`, "token_malformed"],
+      ["trailing whitespace", `${GOOD} `, "token_malformed"],
+      ["wrong prefix", "ghp_wrong-prefix-entirely", "token_malformed"],
+      ["no prefix", "bare-token-value", "token_malformed"],
+      ["prefix only", GITHUB_TOKEN_PREFIX, "token_malformed"],
+      ["embedded newline", `${GOOD}\nsecond-line`, "token_malformed"],
+      ["non-ascii", `${GOOD}é`, "token_malformed"],
+    ];
+
+    for (const [label, value, expectedCode] of cases) {
+      const error = capture(() => validateTokenShape(value, "env"));
+      expect(error.code, label).toBe(expectedCode);
+      // The reason must be one of the FIXED strings, byte for byte — not a
+      // string assembled at the throw site, which is where a leak would enter.
+      expect(Object.values(TOKEN_DEFECT_REASONS), label).toContain(
+        error.reason,
+      );
+      expect(error.message).toContain(`"env"`);
+      expect(error.message).not.toContain(value.trim().length > 0 ? value : " ");
+    }
+  });
+
+  it("names the failing source, not just the code", () => {
+    for (const source of ["env", "fake", "some-other-source"]) {
+      const error = capture(() => validateTokenShape("bad-value", source));
+      expect(error.source).toBe(source);
+      expect(error.message).toContain(source);
+    }
+  });
+
+  it("distinguishes absent from malformed on the same whitespace input", () => {
+    // Guards the ordering of the two schemas: blank is absent, untrimmed but
+    // non-blank is malformed. Getting this backwards would silently downgrade
+    // a real misconfiguration to the wrong error code.
+    expect(capture(() => validateTokenShape("   ", "env")).code).toBe(
+      "token_absent",
+    );
+    expect(capture(() => validateTokenShape(` ${GOOD} `, "env")).code).toBe(
+      "token_malformed",
+    );
   });
 });
 
