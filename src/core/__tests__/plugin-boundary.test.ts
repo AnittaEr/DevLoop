@@ -115,14 +115,29 @@ export type Violation = {
 };
 
 /**
- * Word-boundary matcher. `pr_` must not match `expr_`, and `ado` must not match
- * `shadow`; `\b` before the token is not always enough, so a trailing boundary is
- * enforced too when the token ends in a word character.
+ * Word-boundary matcher. `ado` must not match `shadow` and `pr_` must not match
+ * `expr_`, so both a leading and a trailing boundary are enforced.
+ *
+ * A trailing `\b` is only satisfiable when the token's last character is NOT a
+ * word character: `_` IS one, so `\b<token ending in _>\b` demands a boundary
+ * between `_` and the next character, and in any real identifier that next
+ * character is itself a word character. `pr_`/`mr_` were therefore inert: they
+ * sat in the deny-list on paper and could never fire in real code.
+ *
+ * For a `_`-terminated token the trailing boundary is instead expressed by the
+ * token itself (it ends on a delimiter, so `pr_` matches `foo_pr_bar` but not
+ * `spr_`), and the leading boundary becomes "not preceded by an alphanumeric":
+ * `_` and `.` are legitimate delimiters, so `expr_pr_foo` and `obj.pr_title`
+ * are caught while `expr_`/`xmr_` stay clean.
  */
 function tokenPattern(token: string): RegExp {
+  const escaped = escapeForRegExp(token);
+  if (token.endsWith("_")) {
+    return new RegExp(`(?:^|[^A-Za-z0-9])${escaped}`);
+  }
   const lead = /[A-Za-z0-9]/.test(token[0] ?? "") ? "\\b" : "";
   const trail = /[A-Za-z0-9_]/.test(token[token.length - 1] ?? "") ? "\\b" : "";
-  return new RegExp(`${lead}${escapeForRegExp(token)}${trail}`);
+  return new RegExp(`${lead}${escaped}${trail}`);
 }
 
 function escapeForRegExp(literal: string): string {
@@ -385,8 +400,45 @@ describe("plugin-boundary scanner (positive control)", () => {
     expect("pull_request".includes("github")).toBe(false);
   });
 
-  it("does not match 'pr_' inside a longer identifier such as expr_value", () => {
+  it("catches the underscore-suffixed families that were previously inert", () => {
+    // `pr_` / `mr_` are the provider abbreviation prefixes. Before this fix the
+    // matcher produced /\bpr_\b/, which is unsatisfiable inside an identifier,
+    // so both families were dead weight in the deny-list.
+    for (const snippet of [
+      "const foo_pr_bar = 1;",
+      "const expr_pr_foo = 1;",
+      "type T = { obj_pr_title: string };",
+      "obj.pr_title;",
+      "const a1_mr_b = 1;",
+      "type T = { x_mr_ref: string };",
+      "const _pr_ = 1;",
+      "const pr_queue = [];",
+    ]) {
+      const tokens = scanOne(snippet).map((v) => v.token);
+      expect(
+        tokens.some((t) => t === "pr_" || t === "mr_"),
+        `expected pr_/mr_ to fire on: ${snippet}`,
+      ).toBe(true);
+    }
+    // Spell the two families out explicitly so a family that stops being
+    // detected is a named failure rather than a generic non-empty check.
+    expect(scanOne("const foo_pr_bar = 1;").map((v) => v.token)).toContain(
+      "pr_",
+    );
+    expect(scanOne("const a1_mr_b = 1;").map((v) => v.token)).toContain("mr_");
+  });
+
+  it("still keeps prefixed look-alikes clean for the fixed families", () => {
+    // The fix widens the LEADING boundary for `_`-terminated tokens to
+    // "not preceded by an alphanumeric". `_` and `.` are legitimate delimiters,
+    // so these must NOT match: `expr_` and `xmr_` are different symbols.
     expect(scanOne("const expr_value = 1;")).toEqual([]);
+    expect(scanOne("const xmr_thing = 1;")).toEqual([]);
+    expect(scanOne("const spr_ = 1;")).toEqual([]);
+    expect(scanOne("const repr_ = 1;")).toEqual([]);
+    // And the unrelated `ado` / `shadow` protection is untouched.
+    expect(scanOne("const shadow = 1;")).toEqual([]);
+    expect(scanOne("const ado = 1;").map((v) => v.token)).toContain("ado");
   });
 
   it("catches generic source-control field names in a type literal", () => {
