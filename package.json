@@ -12,13 +12,18 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "bun run ./db/migrate.ts",
+    "db:check": "bun run ./db/check.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "1.1.0",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
+    "drizzle-orm": "0.45.3",
     "next": "15.5.27",
+    "postgres": "3.4.9",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "tailwind-merge": "2.5.4"
@@ -34,6 +39,7 @@
     "@types/react-dom": "19.2.0",
     "@vitejs/plugin-react": "5.0.4",
     "autoprefixer": "10.4.20",
+    "drizzle-kit": "0.31.11",
     "eslint": "9.39.5",
     "eslint-config-next": "15.5.27",
     "eslint-config-prettier": "9.1.0",
