@@ -2,11 +2,10 @@ import type { Config } from "tailwindcss";
 
 const config: Config = {
   darkMode: ["class"],
-  content: [
-    "./src/pages/**/*.{ts,tsx}",
-    "./src/components/**/*.{ts,tsx}",
-    "./src/app/**/*.{ts,tsx}",
-  ],
+  // Scan all of src/, not just app/ + components/: cn() and any future
+  // class-composing helper live under src/lib, and Tailwind drops class names
+  // it never sees in a content glob. Matches create-next-app and shadcn init.
+  content: ["./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
