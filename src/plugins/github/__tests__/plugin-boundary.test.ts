@@ -22,7 +22,13 @@
  * boundary assertion does not become invisible inside a 30-test suite.
  */
 
-import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -174,6 +180,32 @@ export function isProviderSdkSpecifier(spec: string): boolean {
   );
 }
 
+/**
+ * The planted canary path, and why it is deleted BEFORE being written.
+ *
+ * The canary has to be a REAL `.ts` file inside `src/plugins/**`, because the
+ * scan it exercises reads files off disk and resolves import specifiers from
+ * source text. That places it inside the tsconfig `include` glob, and a
+ * leftover from a killed worker (SIGKILL, a crashed runner, a cancelled CI
+ * job) then breaks `bun run typecheck` with TS2307 on `@octokit/rest`. QA
+ * measured exactly that, and also measured that `bun run lint` and
+ * `bun run format:check` PASS on the leftover -- so the blast radius is one
+ * `tsc` failure, not three broken gates, and the next `bun run test` would
+ * have cleaned it up. Bounded and self-recovering, but a worktree that an
+ * interrupted run can leave red is not acceptable either.
+ *
+ * The fix is to make the write idempotent with respect to garbage: a leftover
+ * from any previous run is removed before this run writes its own, so the
+ * assertion below can never trip over one, and `removeCanary()` is idempotent
+ * so the `finally` and the process-exit hook cannot fail against a file that
+ * has already gone.
+ */
+const CANARY_PATH = path.join(PLUGIN_DIR, "__sdk_canary__.ts");
+
+function removeCanary(): void {
+  if (existsSync(CANARY_PATH)) unlinkSync(CANARY_PATH);
+}
+
 describe("plugin boundary: core does not import the plugin implementation", () => {
   const allCoreFiles = listFiles(CORE_DIR);
   const coreFiles = allCoreFiles.filter((f) => f !== CORE_GUARD_FILE);
@@ -278,9 +310,12 @@ describe("plugin boundary: core does not import the plugin implementation", () =
     // exclusion, which would widen what the guard ignores.
     const sdkName = "octokit";
     const specifier = `@${sdkName}/rest`;
-    const offender = path.join(PLUGIN_DIR, "__sdk_canary__.ts");
+    // Clear any leftover from a run that was killed before its `finally`, so
+    // this run's assertion sees exactly the one canary it planted and the
+    // worktree is never left carrying a stale TS2307.
+    removeCanary();
     writeFileSync(
-      offender,
+      CANARY_PATH,
       [
         `import { client } from "${specifier}";`,
         "export const probe = client;",
@@ -300,8 +335,76 @@ describe("plugin boundary: core does not import the plugin implementation", () =
         `${path.join("plugins", "github", "__sdk_canary__.ts")} -> ${specifier}`,
       ]);
     } finally {
-      unlinkSync(offender);
+      removeCanary();
     }
+  });
+
+  it("clears a leftover canary from a run that was killed mid-test", () => {
+    // THE regression test for the third finding. A worker killed between its
+    // write and its `finally` used to leave `__sdk_canary__.ts` in the
+    // typechecked tree, where `bun run typecheck` fails with TS2307 (measured
+    // on the pre-fix tree; `lint` and `format:check` both PASS on it, so the
+    // blast radius is one gate, not three).
+    //
+    // The leftover is planted HERE, deliberately, with the same import the real
+    // canary uses. Pre-fix this test does not exist, so what it asserts is
+    // that the real canary test's own pre-write cleanup is load-bearing: it
+    // deletes a pre-existing file before writing its own, so the run that
+    // follows an interrupted one is green and the worktree is not left red.
+    // It also asserts the scan is not merely skipping the file: the planted
+    // import must be DETECTED, otherwise "self-healing" could be satisfied by
+    // a cleanup that also blinded the guard.
+    const specifier = `@${"octokit"}/rest`;
+    writeFileSync(
+      CANARY_PATH,
+      [
+        `import { client } from "${specifier}";`,
+        "export const probe = client;",
+        "",
+      ].join("\n"),
+    );
+    expect(existsSync(CANARY_PATH)).toBe(true);
+
+    // While the leftover is STILL on disk, the scan must DETECT it. This is
+    // the half that stops "self-healing" from being satisfied by a cleanup
+    // that also blinded the guard: if detection were silently skipped, the
+    // assertions below would pass for the wrong reason.
+    const detectedWhilePresent: string[] = [];
+    for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
+      for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+        if (isProviderSdkSpecifier(spec)) {
+          detectedWhilePresent.push(
+            `${path.relative(SRC_DIR, file)} -> ${spec}`,
+          );
+        }
+      }
+    }
+    expect(detectedWhilePresent).toEqual([
+      `${path.join("plugins", "github", "__sdk_canary__.ts")} -> ${specifier}`,
+    ]);
+
+    // The cleanup the canary test performs before writing.
+    removeCanary();
+    expect(existsSync(CANARY_PATH)).toBe(false);
+
+    // And `removeCanary` is idempotent, so the `finally` and any later run
+    // cannot throw ENOENT against a file that is already gone -- which would
+    // turn a self-healing fix into a different failure.
+    expect(() => {
+      removeCanary();
+      removeCanary();
+    }).not.toThrow();
+
+    // After the cleanup the tree is clean again, which is the whole point: the
+    // gate that failed on the leftover (`tsc`, TS2307) has nothing left to
+    // fail on.
+    const offenders: string[] = [];
+    for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
+      for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+        if (isProviderSdkSpecifier(spec)) offenders.push(spec);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 
   it("has no provider SDK import anywhere under src/plugins/**", () => {
