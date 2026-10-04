@@ -35,9 +35,16 @@ reporter).
 
 - `e2e/home.spec.ts` — HTTP 200, the root `Hello World` heading, the document
   title, and the initial render of the shadcn/ui button.
-- `e2e/interaction.spec.ts` — clicking the button produces a visible DOM change
-  and no hydration errors are logged. This is the class of defect jsdom unit
-  tests cannot catch.
+- `e2e/interaction.spec.ts` — clicking the button produces a visible DOM change,
+  and the page logs no React hydration failure while doing so. This is the class
+  of defect jsdom unit tests cannot catch.
+- `e2e/support/hydration.ts` — not a spec; the shared matcher both specs use to
+  recognise a hydration failure. Because `e2e` runs against a **minified
+  production** build, React reports mismatches as `Minified React error #418`
+  (and `#421`–`#425`) rather than the word "hydration", so the matcher accepts
+  both the full development text and those numbered codes. If you add a spec that
+  cares about hydration, use `collectHydrationErrors(page)` rather than
+  `/hydrat/i` — a bare `/hydrat/i` filter silently matches nothing here.
 
 Chromium only. No Firefox/WebKit projects and no visual-regression baselines
 yet.

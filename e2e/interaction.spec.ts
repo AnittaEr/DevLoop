@@ -1,24 +1,20 @@
 import { expect, test } from "@playwright/test";
+import { collectHydrationErrors } from "./support/hydration";
 
 /**
  * Proves the client-component boundary actually works in a real browser:
  * React must hydrate the island and the click must produce a visible DOM
  * change. A server/client split mistake shows up here as a status line that
- * never changes (or as a console/hydration error), not just as a type error.
+ * never changes, and as a hydration error on the console.
+ *
+ * The hydration check is load-bearing, not decoration — see
+ * e2e/support/hydration.ts for why a naive `/hydrat/i` filter silently
+ * matches nothing against this config's production build.
  */
 test.describe("client interaction", () => {
   test("clicking the button updates the status text", async ({ page }) => {
-    const hydrationErrors: string[] = [];
-    page.on("console", (message) => {
-      if (message.type() === "error" && /hydrat/i.test(message.text())) {
-        hydrationErrors.push(message.text());
-      }
-    });
-    page.on("pageerror", (error) => {
-      if (/hydrat/i.test(error.message)) {
-        hydrationErrors.push(error.message);
-      }
-    });
+    // Listeners must be attached before the first navigation.
+    const hydrationErrors = collectHydrationErrors(page);
 
     await page.goto("/");
 
