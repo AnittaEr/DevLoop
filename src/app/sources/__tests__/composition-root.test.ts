@@ -26,6 +26,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { CanonicalEvent } from "@/core/events/canonical-event";
+import { isIso8601DateTime } from "@/core/evidence/timeline";
 // Imported statically, not dynamically: the read path under test is the same
 // one T7b exercises, and a dynamic import here would make a path typo surface
 // as a runtime rejection inside the test rather than a compile error.
@@ -33,7 +34,7 @@ import {
   fromCanonicalEventRow,
   toCanonicalEventRow,
 } from "../../../../db/canonical-event-mapper";
-import type { PluginDescriptor } from "@/core/plugins/plugin";
+import type { PluginDescriptor, RegisteredPlugin } from "@/core/plugins/plugin";
 import { PluginRegistry } from "@/core/plugins/registry";
 import {
   FakeHttpTransport,
@@ -47,7 +48,9 @@ import type { CanonicalEventWriter, SyncResult } from "../index";
 import {
   REPOSITORY_ENV_VAR,
   SOURCE_NAME,
+  SYNC_FAILURE_CODES,
   SourceConfigurationError,
+  SyncPersistenceError,
   createSourceRegistry,
   fetchCanonicalEvents,
   getSourceRegistry,
@@ -425,6 +428,229 @@ describe("composition root: fetched events persist through the Drizzle client", 
         process.env.DATABASE_URL = previous;
       }
     }
+  });
+});
+
+describe("composition root: a writer refusal is reported, not thrown", () => {
+  /**
+   * Sub-millisecond precision on a `timestamptz`: orderable in the domain,
+   * unrepresentable on write.
+   *
+   * MEASURED at this branch's base (`69a79fd`) before any edit, through the REAL
+   * `syncSource` path:
+   *
+   *   isIso8601DateTime("2026-01-02T03:04:05.123456Z") -> true
+   *   toCanonicalEventRow(same value) -> TypeError: CanonicalEvent.occurredAt
+   *     carries more precision than a Date can hold (3 fractional digits); it
+   *     would be silently truncated on write: "2026-01-02T03:04:05.123456Z"
+   *   syncSource(...) -> that same TypeError escaping uncaught, 0 rows written
+   *
+   * The first two are pinned below so the disagreement cannot be "fixed" by
+   * quietly narrowing either layer -- this suite asserts the guard's behaviour
+   * while BOTH halves still disagree, which is the state the fix must tolerate.
+   *
+   * WHY A SECOND PLUGIN RATHER THAN A FIXTURE OVERRIDE. This suite lives outside
+   * `src/plugins/**`, so it may not name a provider-native field in order to
+   * inject one: `plugin-boundary.test.ts` fails the build when it does, and it
+   * is right to. The refusal is a property of the `CanonicalEvent` CONTRACT, not
+   * of any one source's native shape, so it is driven through a second
+   * registered plugin that emits the neutral contract directly. That also makes
+   * the point the card cares about: the guard is provider-neutral and holds
+   * under a swap.
+   */
+  const SUB_MILLISECOND = "2026-01-02T03:04:05.123456Z";
+
+  /** The neutral name the second plugin registers under. */
+  const SECOND = "ticketing";
+
+  /**
+   * A plugin emitting `count` events, the one at position `refuseAt` carrying
+   * `occurredAt: SUB_MILLISECOND` and every other a representable instant.
+   */
+  function pluginWithSubMillisecondAt(
+    refuseAt: number,
+    count = 1,
+  ): RegisteredPlugin {
+    const name = SECOND;
+    return {
+      describe: () => ({ name, version: "0.0.1", requiresAuth: false }),
+      fetchItems: async () => ({
+        items: Array.from({ length: count }, (_, index) => ({ n: index })),
+      }),
+      mapToCanonicalEvents: (raw) =>
+        raw.map((item) => {
+          const index = Number((item as { n?: unknown }).n);
+          const at =
+            index === refuseAt ? SUB_MILLISECOND : "2026-01-01T00:00:00Z";
+          return {
+            id: `${name}:${index}`,
+            source: name,
+            externalId: `${name}-${index}`,
+            type: "mention" as const,
+            title: `refusal canary ${index}`,
+            occurredAt: at,
+            metadata: {},
+          };
+        }),
+    };
+  }
+
+  /** A registry whose `SECOND` source yields `count` events, one unwritable. */
+  function registryRefusing(
+    refuseAt: number,
+    count = 1,
+  ): { registry: PluginRegistry; writer: RecordingWriter } {
+    const registry = createSourceRegistry({
+      repository: FIXTURE_REPOSITORY,
+      transport: new FakeHttpTransport({ byPage: {} }),
+      readEnv: fixtureEnv,
+      additionalPlugins: [pluginWithSubMillisecondAt(refuseAt, count)],
+    });
+    return { registry, writer: new RecordingWriter() };
+  }
+
+  it("pins the disagreement: the domain accepts what the writer refuses", () => {
+    // If this ever goes false, one layer moved and the other is now untested.
+    expect(isIso8601DateTime(SUB_MILLISECOND)).toBe(true);
+    expect(() =>
+      toCanonicalEventRow({
+        id: "x",
+        source: SOURCE_NAME,
+        externalId: "e",
+        type: "issue",
+        title: "t",
+        occurredAt: SUB_MILLISECOND,
+        metadata: {},
+      }),
+    ).toThrow(TypeError);
+  });
+
+  it("returns a classified failure instead of letting the TypeError escape", async () => {
+    const { registry, writer } = registryRefusing(0);
+
+    const result = await syncSource({ registry, source: SECOND, writer });
+
+    // The specific classified outcome, not merely "did not throw" -- a catch
+    // block that swallowed everything would fail here.
+    expect(result.failure).toBeDefined();
+    expect(result.failure?.code).toBe("event_not_persistable");
+    expect(SYNC_FAILURE_CODES.eventNotPersistable).toBe(
+      "event_not_persistable",
+    );
+    // Nothing was written: all-or-nothing, and the count says so.
+    expect(result.persisted).toBe(0);
+    expect(writer.batches).toHaveLength(0);
+    // The fetched events are still returned -- the fetch succeeded, and a
+    // caller showing them alongside the refusal is what makes it actionable.
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.occurredAt).toBe(SUB_MILLISECOND);
+  });
+
+  it("preserves the writer's own rejection message, verbatim", async () => {
+    const { registry, writer } = registryRefusing(0);
+
+    const result = await syncSource({ registry, source: SECOND, writer });
+
+    // The writer's job is to know what survives a timestamptz bind, so ITS
+    // reason is the reason. Asserted as the exact message the mapper throws --
+    // including the offending value -- so the classification cannot quietly
+    // become a generic "invalid event" that has swallowed the real cause.
+    expect(result.failure?.detail).toBe(
+      `CanonicalEvent.occurredAt carries more precision than a Date can hold ` +
+        `(3 fractional digits); it would be silently truncated on write: ` +
+        JSON.stringify(SUB_MILLISECOND),
+    );
+    // A caller can therefore see WHY the event was refused, and which one.
+    expect(result.failure?.detail).toMatch(/precision than a Date can hold/);
+    expect(result.failure?.eventId).toBe(`${SECOND}:0`);
+    expect(result.failure?.externalId).toBe(`${SECOND}-0`);
+    expect(result.failure?.index).toBe(0);
+  });
+
+  it("names the refused event when it is not the only one on the page", async () => {
+    // The first two events are writable, the third is not: the classification
+    // must carry the RIGHT index and ids, which it cannot do if it reports a
+    // blanket page-level failure.
+    const { registry, writer } = registryRefusing(2, 3);
+
+    const result = await syncSource({ registry, source: SECOND, writer });
+
+    expect(result.failure?.index).toBe(2);
+    expect(result.failure?.eventId).toBe(`${SECOND}:2`);
+    expect(result.failure?.externalId).toBe(`${SECOND}-2`);
+    expect(result.events).toHaveLength(3);
+    // The writable events are NOT persisted: the batch is all-or-nothing, so a
+    // partial write could never be reported as a plain success.
+    expect(writer.batches).toHaveLength(0);
+  });
+
+  it("omits the failure field entirely on a healthy sync", async () => {
+    // The happy path must be unchanged, and an always-present `failure:
+    // undefined` key would make `if (result.failure)` untestable for callers.
+    const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
+    const writer = new RecordingWriter();
+
+    const result = await syncSource({ registry, writer });
+
+    expect(result.persisted).toBe(2);
+    expect(result.failure).toBeUndefined();
+    expect(writer.totalRows).toBe(2);
+  });
+
+  it("still throws for a credential failure, which has no classification", async () => {
+    // The boundary guard is NARROW on purpose. A credential failure has no
+    // `SyncFailure` to report, and laundering it into one would be a lie: the
+    // events never arrived, so there is no refused event to name.
+    const { registry } = registryWith(
+      { "1": { body: TWO_ITEMS } },
+      { readEnv: () => undefined },
+    );
+    const writer = new RecordingWriter();
+
+    await expect(syncSource({ registry, writer })).rejects.toThrow(
+      /credential/,
+    );
+  });
+
+  it("throws SyncPersistenceError from a direct persistCanonicalEvents call", async () => {
+    // The lower-level function KEEPS throwing, so a caller that bypasses
+    // syncSource cannot lose a write silently. It carries the same information
+    // the returned failure does.
+    const { registry } = registryRefusing(0);
+    const events = await fetchCanonicalEvents(registry, SECOND);
+
+    let caught: unknown;
+    try {
+      await persistCanonicalEvents(events, new RecordingWriter());
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(SyncPersistenceError);
+    const failure = (caught as SyncPersistenceError).failure;
+    expect(failure.code).toBe("event_not_persistable");
+    expect(failure.detail).toContain("precision than a Date can hold");
+    expect((caught as Error).message).toContain("event_not_persistable");
+  });
+
+  it("does not launder a non-TypeError from the writer into a refusal", async () => {
+    // Only `TypeError` -- the mapper's own rejection type -- is classified. An
+    // Error thrown from inside the mapper's internals is a bug, and must not be
+    // reported to the caller as "this event was refused".
+    const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
+    const events = await fetchCanonicalEvents(registry);
+    // A writer whose failure is a genuine, unclassified fault.
+    const brokenWriter: CanonicalEventWriter = {
+      insert: () => ({
+        values: async () => {
+          throw new RangeError("connection pool exhausted");
+        },
+      }),
+    };
+
+    await expect(persistCanonicalEvents(events, brokenWriter)).rejects.toThrow(
+      RangeError,
+    );
   });
 });
 
