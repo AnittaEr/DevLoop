@@ -16,7 +16,7 @@ import {
 } from "@/core/events/canonical-event";
 import type { CanonicalEvent } from "@/core/events/canonical-event";
 import type { FetchedPage } from "@/core/plugins/plugin";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   GitHubSourcePlugin,
@@ -708,11 +708,10 @@ describe("choke points: arbitrary input cannot become a canonical value", () => 
 
 describe("GitHubSourcePlugin: no network in tests", () => {
   const realFetch = globalThis.fetch;
-  afterEachRestore();
 
-  function afterEachRestore(): void {
+  afterEach(() => {
     globalThis.fetch = realFetch;
-  }
+  });
 
   beforeEach(() => {
     // Trip a canary in place of fetch for the duration of this block. If any
