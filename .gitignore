@@ -3,6 +3,10 @@ node_modules
 .pnp
 .pnp.js
 
+# bun is the confirmed package manager (D4/D-024a) - never commit npm lockfiles
+package-lock.json
+npm-shrinkwrap.json
+
 # next.js
 .next/
 out/
