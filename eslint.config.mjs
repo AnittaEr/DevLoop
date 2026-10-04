@@ -43,8 +43,12 @@ const compat = new FlatCompat({ baseDirectory: __dirname });
  * bare relative siblings within core -- including the one-level
  * `../events/canonical-event` hop that core code legitimately makes. Note too
  * that `src/core/plugins/**` is the plugin CONTRACT, not the implementation
- * namespace, so a core file importing `./plugin` or `./registry` is correct and
- * unmatched here. And every import made by `src/app/**` is exempt by design:
+ * namespace, so a core file importing the contract is correct and unmatched
+ * here -- both `./plugin`/`./registry` (same-directory, never matched) and the
+ * one-level `../plugins/plugin` / `../plugins/registry` hop from a file deeper
+ * in the tree (matched by the family below and then explicitly negated there,
+ * so the contract stays importable while `../plugins/<impl>` stays denied).
+ * And every import made by `src/app/**` is exempt by design:
  * the composition root is SUPPOSED to import from core and wire concrete
  * plugins there. That is why this block is scoped to `src/core/**` and nothing
  * else, and why the ticket's negative control matters.
@@ -66,7 +70,22 @@ const CORE_PLUGIN_BOUNDARY_PATTERNS = [
   },
   {
     // A relative hop out of core into that same namespace.
-    group: ["../plugins/*", "../providers/*"],
+    //
+    // The two negations are load-bearing, not decoration. `../plugins/*` from a
+    // file inside `src/core/**` resolves into `src/core/plugins/**`, which is
+    // the plugin CONTRACT tree, not the implementation namespace -- so without
+    // them the rule would forbid exactly the imports family 1's own message
+    // promises are legal (`SourcePlugin`, `PluginRegistry`), and a deny-list that
+    // flags legitimate core imports is worse than having no rule. Everything
+    // else under that hop (e.g. `../plugins/github/impl`) is still denied.
+    // Verified with real lint output in the T8 handoff: a core file importing
+    // both contracts plus `../plugins/github/impl` errors on the impl line only.
+    group: [
+      "../plugins/*",
+      "!../plugins/plugin",
+      "!../plugins/registry",
+      "../providers/*",
+    ],
     message:
       "Plugin boundary: src/core/** must not import the plugin/provider implementation namespace.",
   },
