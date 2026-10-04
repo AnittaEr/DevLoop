@@ -10,6 +10,8 @@
 
 import type { TokenProfile } from "@/core/credentials/provider";
 
+import { GITHUB_TOKEN_PROFILE } from "../token-profile";
+
 import type {
   HttpTransport,
   TransportRequest,
@@ -20,24 +22,24 @@ import type {
 export const FIXTURE_REPOSITORY = "acme/widgets";
 
 /**
- * The GitHub token profile, declared HERE rather than in `src/core/**`.
+ * The GitHub token profile, re-exported from the plugin's non-test module.
  *
  * B19 (`40138c2`) made `profile` a REQUIRED option on the fake credential
  * provider and removed core's hard-coded GitHub prefix and env-var name, so
  * every consumer must now state which provider's token shape it is validating
- * against. The vendor half of that knowledge belongs to the plugin: a default
- * inside core could only be GitHub's prefix (re-opening the leak B19 closed)
- * or a neutral one, which would break the real assertion that the token this
- * plugin puts on the wire starts with `github_pat_`
- * (`github-plugin.test.ts:154`).
+ * against. The vendor half of that knowledge belongs to the plugin, so it is
+ * DECLARED once in `../token-profile` and re-exported here under this name:
+ * one declaration, and no way for the production call site's profile to drift
+ * away from the one these tests validate against.
+ *
+ * Re-exported rather than restated so the 6 `createFakeCredentialProvider`
+ * call sites in `github-plugin.test.ts` and the `FIXTURE_MATERIAL` equality
+ * assertion below keep their existing names and behaviour byte-identical.
  *
  * `envVar` is a NAME, never a value, and is never read here -- these tests
  * construct no real credential and read no environment.
  */
-export const GITHUB_PROFILE: TokenProfile = {
-  prefix: "github_pat_",
-  envVar: "GITHUB_TOKEN",
-};
+export const GITHUB_PROFILE: TokenProfile = GITHUB_TOKEN_PROFILE;
 
 /**
  * The synthetic material core appends to a profile's prefix.
