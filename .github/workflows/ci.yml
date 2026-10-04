@@ -71,10 +71,10 @@ jobs:
 
   # A separate job, not more steps in `verify`, so a red e2e is its own named
   # check in the PR checks list and can be told apart from a red unit test
-  # without opening a log. There is deliberately NO `needs: verify` edge: that
-  # would serialise the two jobs and reintroduce exactly the coupling this
-  # split exists to remove. Both jobs run concurrently on their own runners and
-  # report independent status and independent timing.
+  # without opening a log. There is deliberately no dependency edge on
+  # `verify`: that would serialise the two jobs and reintroduce exactly the
+  # coupling this split exists to remove. Both jobs run concurrently on their
+  # own runners and report independent status and independent timing.
   e2e:
     name: e2e
     runs-on: ubuntu-latest
@@ -111,9 +111,9 @@ jobs:
           fi
 
       # Dependencies are re-installed here rather than carried over from
-      # `verify` by upload/download-artifact: the round-trip would add a second
-      # large transfer and a new failure mode to the critical path, and buys
-      # little against the Chromium download.
+      # `verify` as a build artifact: the round-trip would add a second large
+      # transfer and a new failure mode to the critical path, and buys little
+      # against the Chromium download.
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
