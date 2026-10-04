@@ -115,14 +115,29 @@ export type Violation = {
 };
 
 /**
- * Word-boundary matcher. `pr_` must not match `expr_`, and `ado` must not match
- * `shadow`; `\b` before the token is not always enough, so a trailing boundary is
- * enforced too when the token ends in a word character.
+ * Word-boundary matcher. `ado` must not match `shadow` and `pr_` must not match
+ * `expr_`, so both a leading and a trailing boundary are enforced.
+ *
+ * A trailing `\b` is only satisfiable when the token's last character is NOT a
+ * word character: `_` IS one, so `\b<token ending in _>\b` demands a boundary
+ * between `_` and the next character, and in any real identifier that next
+ * character is itself a word character. `pr_`/`mr_` were therefore inert: they
+ * sat in the deny-list on paper and could never fire in real code.
+ *
+ * For a `_`-terminated token the trailing boundary is instead expressed by the
+ * token itself (it ends on a delimiter, so `pr_` matches `foo_pr_bar` but not
+ * `spr_`), and the leading boundary becomes "not preceded by an alphanumeric":
+ * `_` and `.` are legitimate delimiters, so `expr_pr_foo` and `obj.pr_title`
+ * are caught while `expr_`/`xmr_` stay clean.
  */
 function tokenPattern(token: string): RegExp {
+  const escaped = escapeForRegExp(token);
+  if (token.endsWith("_")) {
+    return new RegExp(`(?:^|[^A-Za-z0-9])${escaped}`);
+  }
   const lead = /[A-Za-z0-9]/.test(token[0] ?? "") ? "\\b" : "";
   const trail = /[A-Za-z0-9_]/.test(token[token.length - 1] ?? "") ? "\\b" : "";
-  return new RegExp(`${lead}${escapeForRegExp(token)}${trail}`);
+  return new RegExp(`${lead}${escaped}${trail}`);
 }
 
 function escapeForRegExp(literal: string): string {
@@ -155,13 +170,24 @@ const TOKEN_PATTERNS = DENY_LIST.flatMap((entry) =>
  * Strip `//` line comments ONLY, replacing each stripped character with a space
  * so that every offset -- and therefore every line number -- is preserved.
  *
- * String, template and regex literals are tracked so that a `//` inside them is
- * not mistaken for a comment. Block comments are deliberately NOT stripped: the
+ * String and template literals are tracked so that a `//` inside them is not
+ * mistaken for a comment. Block comments are deliberately NOT stripped: the
  * comment policy requires a provider token inside `/* *\/` or JSDoc to fail.
+ *
+ * T6b ROOT CAUSE: the `//` branch used to be tested FIRST and unconditionally,
+ * so a `//` inside template-literal TEXT blanked the rest of the line -- provider
+ * tokens and all -- and the guard went green over them. Template state was NOT
+ * lost after an interpolation; the `//` strip simply ignored the literal state.
+ * The fix is to track the enclosing literal (`quote`) and honour `//` as a
+ * comment only in real code. Inside `${...}` we are back in real code, so a
+ * `//` there is still a genuine comment and is still stripped.
  */
 export function stripLineComments(source: string): string {
   const out = source.split("");
+  /** Open `${` depths of enclosing templates; 0 means "inside the expression". */
   const templateStack: number[] = [];
+  /** Enclosing literal delimiter, or null when we are in real code. */
+  let quote: string | null = null;
   let i = 0;
   const n = source.length;
 
@@ -174,6 +200,30 @@ export function stripLineComments(source: string): string {
   while (i < n) {
     const ch = source[i] as string;
     const next = source[i + 1];
+
+    // --- Literal text: nothing here is a comment or a delimiter. ---
+    if (quote !== null) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (quote === "`" && ch === "$" && next === "{") {
+        // Interpolated expression: its contents ARE real code.
+        templateStack.push(0);
+        quote = null;
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+        i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+
+    // --- Real code. ---
 
     // line comment -> strip to end of line
     if (ch === "/" && next === "/") {
@@ -194,44 +244,32 @@ export function stripLineComments(source: string): string {
     }
 
     if (ch === '"' || ch === "'" || ch === "`") {
-      const quote = ch;
+      quote = ch;
       i += 1;
-      while (i < n) {
-        const c = source[i];
-        if (c === "\\") {
-          i += 2;
-          continue;
-        }
-        if (quote === "`" && c === "$" && source[i + 1] === "{") {
-          // Interpolated expression: parse its contents as real code.
-          templateStack.push(0);
-          i += 2;
-          break;
-        }
-        if (c === quote) {
-          i += 1;
-          break;
-        }
-        i += 1;
-      }
-      if (templateStack.length > 0 && source[i - 1] !== "{")
-        templateStack.pop();
       continue;
     }
 
-    if (templateStack.length > 0) {
-      if (ch === "{" && source[i - 1] === "$") {
+    if (ch === "{") {
+      // A nested object/brace inside an interpolation, not the end of it.
+      if (templateStack.length > 0) {
         templateStack[templateStack.length - 1] =
           (templateStack[templateStack.length - 1] ?? 0) + 1;
-      } else if (ch === "}") {
-        const depth = templateStack[templateStack.length - 1] ?? 0;
-        if (depth === 0) {
-          templateStack.pop();
-          i += 1;
-          continue;
-        }
-        templateStack[templateStack.length - 1] = depth - 1;
       }
+      i += 1;
+      continue;
+    }
+
+    if (ch === "}" && templateStack.length > 0) {
+      const depth = templateStack[templateStack.length - 1] ?? 0;
+      if (depth === 0) {
+        // Interpolation closes: resume the enclosing template's TEXT. Without
+        // this, a `//` in that text would be honoured as a real comment.
+        templateStack.pop();
+        quote = "`";
+        i += 1;
+        continue;
+      }
+      templateStack[templateStack.length - 1] = depth - 1;
     }
 
     i += 1;
@@ -385,8 +423,45 @@ describe("plugin-boundary scanner (positive control)", () => {
     expect("pull_request".includes("github")).toBe(false);
   });
 
-  it("does not match 'pr_' inside a longer identifier such as expr_value", () => {
+  it("catches the underscore-suffixed families that were previously inert", () => {
+    // `pr_` / `mr_` are the provider abbreviation prefixes. Before this fix the
+    // matcher produced /\bpr_\b/, which is unsatisfiable inside an identifier,
+    // so both families were dead weight in the deny-list.
+    for (const snippet of [
+      "const foo_pr_bar = 1;",
+      "const expr_pr_foo = 1;",
+      "type T = { obj_pr_title: string };",
+      "obj.pr_title;",
+      "const a1_mr_b = 1;",
+      "type T = { x_mr_ref: string };",
+      "const _pr_ = 1;",
+      "const pr_queue = [];",
+    ]) {
+      const tokens = scanOne(snippet).map((v) => v.token);
+      expect(
+        tokens.some((t) => t === "pr_" || t === "mr_"),
+        `expected pr_/mr_ to fire on: ${snippet}`,
+      ).toBe(true);
+    }
+    // Spell the two families out explicitly so a family that stops being
+    // detected is a named failure rather than a generic non-empty check.
+    expect(scanOne("const foo_pr_bar = 1;").map((v) => v.token)).toContain(
+      "pr_",
+    );
+    expect(scanOne("const a1_mr_b = 1;").map((v) => v.token)).toContain("mr_");
+  });
+
+  it("still keeps prefixed look-alikes clean for the fixed families", () => {
+    // The fix widens the LEADING boundary for `_`-terminated tokens to
+    // "not preceded by an alphanumeric". `_` and `.` are legitimate delimiters,
+    // so these must NOT match: `expr_` and `xmr_` are different symbols.
     expect(scanOne("const expr_value = 1;")).toEqual([]);
+    expect(scanOne("const xmr_thing = 1;")).toEqual([]);
+    expect(scanOne("const spr_ = 1;")).toEqual([]);
+    expect(scanOne("const repr_ = 1;")).toEqual([]);
+    // And the unrelated `ado` / `shadow` protection is untouched.
+    expect(scanOne("const shadow = 1;")).toEqual([]);
+    expect(scanOne("const ado = 1;").map((v) => v.token)).toContain("ado");
   });
 
   it("catches generic source-control field names in a type literal", () => {
