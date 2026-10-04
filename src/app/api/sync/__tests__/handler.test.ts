@@ -2,18 +2,32 @@
  * Unit tests for the POST /api/sync handler (T15).
  *
  * NO real network and NO real token anywhere in this file: the registry is built
- * from a fake `SourcePlugin`, the persistence target is an in-memory writer,
- * and the credential is an obviously-fake sentinel string that exists only to
- * be searched for. `bun run test` therefore needs neither a network nor a
- * `.env`, exactly as the composition root's own tests do.
+ * from a fake `SourcePlugin`, the credential is an obviously-fake sentinel string
+ * that exists only to be searched for. `bun run test` therefore needs neither a
+ * network nor a `.env`, exactly as the composition root's own tests do.
  *
  * The token-leak assertions are the reason the sentinel is so loud: a test that
  * greps for "the token we happened to use" proves nothing if the token is a
  * realistic string that could plausibly appear in an error for other reasons.
  * `ghp_NOT_A_REAL_TOKEN_leak_canary_4d2f` cannot appear anywhere by accident.
+ *
+ * ONE BLOCK NEEDS A REAL DATABASE, AND IS GATED ON IT. The "the shipped
+ * idempotency note tells the truth" block runs the real `persistCanonicalEvents`
+ * against a real migrated Postgres, because a fake writer cannot falsify the
+ * route's shipped contract — it can only agree with it. That is the whole point
+ * of that block: T15's prose described a plain `INSERT`, T16 replaced it with an
+ * `ON CONFLICT DO UPDATE` upsert, and every fake-writer test stayed green over
+ * the contradiction. This block is gated on `DATABASE_URL` so a developer with
+ * no database skips it cleanly, and it is named in `vitest.db.config.ts` so the
+ * `db round trip` CI job executes it rather than reporting a skipped green.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+
+import { toCanonicalEventRow } from "../../../../../db/canonical-event-mapper";
+import { canonicalEvents } from "../../../../../db/schema";
+import { closeDb, getDb } from "@/lib/db/client";
 
 import type { CanonicalEvent } from "@/core/events/canonical-event";
 import type { PluginRegistry } from "@/core/plugins/registry";
@@ -33,7 +47,11 @@ import {
   GITHUB_PLUGIN_ERROR_REASONS,
 } from "@/plugins/github/github-errors";
 
-import { handleSyncRequest, SYNC_OUTCOMES } from "../handler";
+import {
+  handleSyncRequest,
+  SYNC_IS_IDEMPOTENT,
+  SYNC_OUTCOMES,
+} from "../handler";
 
 /** Obviously fake, obviously searchable, and impossible to reach accidentally. */
 const SENTINEL_TOKEN = "ghp_NOT_A_REAL_TOKEN_leak_canary_4d2f";
@@ -157,6 +175,154 @@ function registryWith(plugin: ReturnType<typeof fakePlugin>): PluginRegistry {
  */
 const realSync = syncSource;
 
+/**
+ * The shipped note, checked against a REAL database rather than against prose.
+ *
+ * WHY THIS BLOCK IS SEPARATE FROM EVERYTHING ABOVE IT. Every other test in this
+ * file injects a fake writer, so the whole suite can be green while the route's
+ * `idempotencyNote` describes a write path that does not exist. That is exactly
+ * the defect this block was added for: T15 documented the route while the write
+ * path was a plain `INSERT`, T16 made it `ON CONFLICT DO UPDATE`, and the prose
+ * shipped unchanged — telling every caller "not idempotent … does fail with
+ * outcome `already_present`" over a route that upserts. The unit tests could not
+ * have caught it: `idempotent` was typed the literal `false`, so
+ * `expect(body.idempotent).toBe(false)` compared a literal to itself and passed
+ * no matter what the database did.
+ *
+ * So the assertion here is deliberately at the SEAM the note talks about. It
+ * runs the real `handleSyncRequest` over the real `persistCanonicalEvents`
+ * against a real migrated Postgres, twice, and then asserts that the note the
+ * handler shipped agrees with what the database actually did. If a future change
+ * makes the write path a plain INSERT again, this goes red — which is the point:
+ * the contract must be re-derived by execution, not re-asserted by a comment.
+ *
+ * Collected by the default suite (which has no database, so it skips) AND named
+ * in `vitest.db.config.ts`, so `bun run test:db` in the `db round trip` job
+ * actually executes it rather than reporting a skipped green.
+ */
+const connectionString = process.env.DATABASE_URL;
+const describeWithDb = connectionString ? describe : describe.skip;
+
+describeWithDb(
+  "the shipped idempotency note tells the truth (real database)",
+  () => {
+    const DB_EVENT: CanonicalEvent = {
+      id: "code_hosting:acme/db-note#1",
+      source: "code_hosting",
+      externalId: "acme/db-note#1",
+      type: "issue",
+      title: "first title",
+      occurredAt: "2026-10-04T10:00:00.000Z",
+      metadata: {},
+    };
+
+    async function clearRow(): Promise<void> {
+      await getDb()
+        .delete(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, DB_EVENT.externalId));
+    }
+
+    afterEach(clearRow);
+
+    afterAll(async () => {
+      if (connectionString) await closeDb();
+    });
+
+    it("proves a repeat call UPDATES in place and does NOT raise 23505, so the note's claim is load-bearing", async () => {
+      // FIRST CALL. The production writer is used — no injected fake — because the
+      // whole question is what the real query does on a repeat.
+      const first = await handleSyncRequest({
+        registry: registryWith(fakePlugin([DB_EVENT])),
+      });
+      expect(first.status).toBe(200);
+      expect(first.body.outcome).toBe(SYNC_OUTCOMES.synced);
+      expect(first.body.persisted).toBe(1);
+
+      // SECOND CALL, same natural key, CHANGED title. This is the measurement the
+      // old note was wrong about: it claimed this call would fail with
+      // `already_present`. It does not — it returns 200 and converges.
+      const second = await handleSyncRequest({
+        registry: registryWith(
+          fakePlugin([{ ...DB_EVENT, title: "second title" }]),
+        ),
+      });
+      expect(second.status).toBe(200);
+      expect(second.body.outcome).toBe(SYNC_OUTCOMES.synced);
+      expect(second.body.persisted).toBe(1);
+
+      // ONE row, holding the NEW value: the update is in place, not a duplicate
+      // and not a silent discard.
+      const rows = await getDb()
+        .select()
+        .from(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, DB_EVENT.externalId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.title).toBe("second title");
+
+      // AND THE SHIPPED CONTRACT AGREES WITH THAT MEASUREMENT. Every phrase below
+      // is a claim a caller reads; each is checked against the behaviour proven
+      // above, so the note cannot drift away from the write path again while every
+      // gate stays green.
+      const note = second.body.idempotencyNote;
+      expect(second.body.idempotent).toBe(SYNC_IS_IDEMPOTENT);
+      expect(note).toMatch(/ON CONFLICT DO UPDATE/i);
+      expect(note).toMatch(/upsert/i);
+      // The claims the old note made, all now proven false by this same test.
+      expect(note).not.toMatch(/not idempotent/i);
+      expect(note).not.toMatch(/plain INSERT/i);
+      expect(note).not.toMatch(/instead of updating existing rows/i);
+      expect(note).not.toMatch(/does fail with outcome/i);
+
+      // The outcome's own message must agree with the note in the SAME body.
+      expect(second.body.message).not.toMatch(/not idempotent/i);
+    });
+
+    it("keeps `already_present` REACHABLE against the real database, as a primary-key-only collision", async () => {
+      // The flip side, so the fix cannot be mistaken for having deleted a failure
+      // mode. A row colliding on PRIMARY KEY `id` while its natural key is free is
+      // invisible to `ON CONFLICT (source, external_id)`, so the primary key still
+      // raises 23505 and the route still classifies it. Seeded with a raw insert,
+      // because the upsert would absorb this shape rather than raise it.
+      await getDb()
+        .insert(canonicalEvents)
+        .values(toCanonicalEventRow(DB_EVENT));
+
+      const colliding: CanonicalEvent = {
+        ...DB_EVENT,
+        // Same PRIMARY KEY, different natural key on BOTH columns.
+        externalId: "acme/db-note#2",
+        title: "colliding on the primary key only",
+      };
+
+      const { status, body } = await handleSyncRequest({
+        registry: registryWith(fakePlugin([colliding])),
+      });
+
+      expect(status).toBe(409);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.alreadyPresent);
+      expect(body.ok).toBe(false);
+
+      // The message must attribute it to the PRIMARY KEY — the old text blamed the
+      // natural-key unique constraint refusing "a repeat", which this measurement
+      // contradicts.
+      expect(body.message).toMatch(/PRIMARY KEY/i);
+      expect(body.message).not.toMatch(/already stored/i);
+
+      // And the conflicting row left NO trace: the original is untouched.
+      const rows = await getDb()
+        .select()
+        .from(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, DB_EVENT.externalId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.title).toBe(DB_EVENT.title);
+
+      await getDb()
+        .delete(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, colliding.externalId));
+    });
+  },
+);
+
 describe("POST /api/sync handler", () => {
   it("reports a persisted count and counts by type on success", async () => {
     const writer = recordingWriter();
@@ -216,15 +382,82 @@ describe("POST /api/sync handler", () => {
     expect(writer.written).toHaveLength(0);
   });
 
-  it("states in every response that the route is not idempotent", async () => {
+  it("reports that repeating the route is safe, against the shipped constant", async () => {
     const { body } = await handleSyncRequest({
       registry: registryWith(fakePlugin([event()])),
       writer: recordingWriter(),
     });
 
-    expect(body.idempotent).toBe(false);
-    expect(body.idempotencyNote).toMatch(/not idempotent/i);
-    expect(body.idempotencyNote).toMatch(/already_present/);
+    // Asserted against `SYNC_IS_IDEMPOTENT` -- the SAME exported constant
+    // `body()` assigns -- rather than against a literal repeated here. The old
+    // assertion was `expect(body.idempotent).toBe(false)` on a field typed the
+    // literal `false` and assigned the constant `false`: a literal compared to
+    // itself, which passes whatever the route actually does. That tautology is
+    // how this batch shipped a note saying "not idempotent" over an
+    // `ON CONFLICT DO UPDATE` upsert with every gate green.
+    expect(body.idempotent).toBe(SYNC_IS_IDEMPOTENT);
+    // And the constant is not left to drift into a tautology either: it must be
+    // the boolean `true`, which `toBe(true)` can only satisfy by the value
+    // being read off a real response body.
+    expect(SYNC_IS_IDEMPOTENT).toBe(true);
+    expect(typeof body.idempotent).toBe("boolean");
+  });
+
+  it("states the real write path in the note, and does NOT claim a repeat fails", async () => {
+    const { body } = await handleSyncRequest({
+      registry: registryWith(fakePlugin([event()])),
+      writer: recordingWriter(),
+    });
+
+    const note = body.idempotencyNote;
+
+    // The note must NAME the mechanism it now describes. A note that still said
+    // "plain INSERT" would fail here.
+    expect(note).toMatch(/ON CONFLICT DO UPDATE/i);
+    expect(note).toMatch(/upsert/i);
+    expect(note).toMatch(/UNIQUE \(source, external_id\)/);
+
+    // ...and must NOT still claim a repeat is refused, which is the specific
+    // falsehood this test exists to kill. Each of these phrases was in the
+    // shipped note while the route upserted.
+    expect(note).not.toMatch(/not idempotent/i);
+    expect(note).not.toMatch(/plain INSERT/i);
+    expect(note).not.toMatch(/instead of updating existing rows/i);
+    expect(note).not.toMatch(/does fail with outcome/i);
+  });
+
+  it("keeps `already_present` reachable, and describes it as a PRIMARY-KEY conflict", async () => {
+    // `already_present` is still a real, correct outcome -- the upsert absorbs
+    // the natural key only, so a primary-key-only collision still raises 23505.
+    // This test pins that the classification survives the prose fix, so the fix
+    // cannot be mistaken for deleting a failure mode.
+    //
+    // The 23505 is injected through the EXISTING `recordingWriter(failWith)`
+    // seam rather than a bespoke fake, because that helper throws from inside
+    // `onConflictDoUpdate` -- the point production's query executes -- so the
+    // path under test is the real one.
+    const { status, body } = await handleSyncRequest({
+      registry: registryWith(fakePlugin([event()])),
+      writer: recordingWriter(
+        Object.assign(new Error("duplicate key value"), {
+          cause: { code: "23505" },
+        }),
+      ),
+    });
+
+    expect(status).toBe(409);
+    expect(body.outcome).toBe(SYNC_OUTCOMES.alreadyPresent);
+    expect(body.ok).toBe(false);
+
+    // The message must attribute it to the primary key, NOT to the natural key
+    // a repeat would hit -- the old text claimed the unique constraint refused
+    // a repeat insert, which is false.
+    expect(body.message).toMatch(/PRIMARY KEY/i);
+    expect(body.message).not.toMatch(/already stored/i);
+
+    // The note shipped in the SAME body must not contradict the outcome it
+    // accompanies.
+    expect(body.idempotencyNote).not.toMatch(/not idempotent/i);
   });
 });
 
@@ -337,7 +570,19 @@ describe("POST /api/sync failure modes are distinct", () => {
     expect(body.outcome).toBe(SYNC_OUTCOMES.upstreamUnreachable);
   });
 
-  it("reports a repeat insert as already_present rather than success", async () => {
+  it("reports a 23505 unique violation as already_present rather than success", async () => {
+    // RENAMED. The old title was "reports a repeat insert as already_present
+    // rather than success", which asserted the very falsehood this batch fixes:
+    // a repeat insert is NOT what raises 23505, because the write path is an
+    // `ON CONFLICT DO UPDATE` upsert and a repeat converges. What still raises
+    // 23505 is a PRIMARY-KEY-only collision, which the upsert cannot absorb.
+    //
+    // The test body is unchanged and still correct — a 23505 arriving from the
+    // writer is classified as `already_present`/409 and never as a successful
+    // write. Only the title made a claim the route does not honour, and a wrong
+    // test name is the same defect class as the wrong response prose: it tells
+    // the next reader something untrue about their own system.
+    //
     // Postgres unique-violation, wrapped by Drizzle the way a real driver
     // failure arrives: the SQLSTATE lives on `cause`, not on the outer error.
     const wrapped = Object.assign(

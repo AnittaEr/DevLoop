@@ -198,16 +198,34 @@ test.describe("POST /api/sync", () => {
     }
   });
 
-  test("always tells the caller the route is not idempotent", async ({
+  test("tells the caller a repeat call is safe, from the real response", async ({
     request,
   }) => {
     const { body } = await postSync(request);
 
-    // A caller reading only the JSON must not mistake this for safe-to-retry.
-    // True on every path, success or failure — which is why it is asserted
-    // without regard to the outcome the environment produced.
-    expect(body.idempotent).toBe(false);
-    expect(body.idempotencyNote).toContain("already_present");
+    // A caller reading only the JSON must be told the truth about retrying.
+    // Asserted on every path, success or failure — which is why it does not
+    // condition on the outcome the environment produced.
+    //
+    // Asserted against `true` on a field that is TYPED `boolean`, deliberately.
+    // It used to be typed the literal `false` and asserted with `toBe(false)`,
+    // so the comparison was a literal against itself and passed no matter what
+    // the route did. Widening the type to `boolean` is what makes this a real
+    // assertion: the value can only be `true` here if it was read off the
+    // response body the route actually produced.
+    expect(body.idempotent).toBe(true);
+    expect(typeof body.idempotent).toBe("boolean");
+
+    // The note must describe the write path that exists -- an `ON CONFLICT DO
+    // UPDATE` upsert on the natural key -- and must not still tell a caller that
+    // a repeat call fails. Those are the exact phrases the shipped note carried
+    // while the route upserted, so they are pinned as absent.
+    expect(body.idempotencyNote).toMatch(/ON CONFLICT DO UPDATE/i);
+    expect(body.idempotencyNote).not.toMatch(/not idempotent/i);
+    expect(body.idempotencyNote).not.toMatch(/plain INSERT/i);
+    expect(body.idempotencyNote).not.toMatch(
+      /instead of updating existing rows/i,
+    );
   });
 
   test("refuses GET, so a browser prefetch or crawler cannot trigger a write", async ({
@@ -238,9 +256,15 @@ test.describe("POST /api/sync", () => {
    * GitHub. That is inherent to proving the route reachable over HTTP, which
    * this card requires, and it CANNOT be neutralised from here: the server's
    * environment is fixed by `playwright.config.ts`, which is DO NOT TOUCH.
-   * A second local run reports `already_present` (HTTP 409) for the same rows,
-   * which is exactly the non-idempotency this card is required to surface, and
-   * is why the assertions above are written to accept every outcome.
+   *
+   * A second local run does NOT report `already_present`: the write path is an
+   * `ON CONFLICT DO UPDATE` upsert on `UNIQUE (source, external_id)`, so a
+   * second run over the same rows converges and is reported as `synced`. An
+   * earlier version of this comment claimed a second run reports
+   * `already_present`; that was true when the write path was a plain INSERT and
+   * became false when T16 added the upsert — the class of drift this card exists
+   * to remove. `already_present` remains reachable, but only for a
+   * primary-key-only collision, which a repeat of the same page cannot produce.
    */
   test("refuses to sync before resolving a credential when the environment is unconfigured", async ({
     request,

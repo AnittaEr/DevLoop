@@ -33,22 +33,30 @@
  *     duplicate-key message quotes the conflicting key values and a message
  *     match would be a leak surface.
  *
- * IDEMPOTENCY -- READ THIS BEFORE TRUSTING A SECOND CALL.
+ * REPEATED CALLS -- READ THIS BEFORE TRUSTING A SECOND CALL.
  *
- * `persistCanonicalEvents` performs a plain `INSERT`, not an upsert. Calling
- * this route twice therefore does NOT duplicate rows -- `canonical_events`
- * carries `UNIQUE (source, external_id)` (`db/schema.ts`) and the second insert
- * is refused by the database -- but the second call is NOT a no-op either: it
- * fails. That outcome is surfaced as its own `already_present` result rather
- * than being reported as a success, because "silently duplicated" and
- * "silently claimed success while writing nothing" are the two worst
- * available outcomes and both are worse than an explicit refusal.
+ * `persistCanonicalEvents` is an `ON CONFLICT DO UPDATE` upsert whose arbiter is
+ * the natural key `UNIQUE (source, external_id)`
+ * (`src/app/sources/index.ts`). A second call carrying the same
+ * `(source, external_id)` therefore does NOT duplicate rows and does NOT fail:
+ * it converges on the existing row and overwrites the mutable columns in place,
+ * which is the behaviour a sync pipeline actually wants. A repeat of the same
+ * page is a success, reported as `synced`, with `persisted` counting the rows
+ * the upsert wrote.
  *
- * The response carries `idempotent: false` and a fixed explanation, so a caller
- * reading only the JSON still learns it. The real fix is an `onConflictDoUpdate`
- * upsert in the persistence layer; that belongs to the persistence card that
- * already owns `canonical_events`, not here, and inventing an idempotency key
- * at the HTTP layer would paper over the real defect instead of naming it.
+ * WHAT STILL REACHES `already_present`, AND WHY IT IS STILL HERE. The upsert
+ * absorbs a collision on its own key only. A row whose PRIMARY KEY `id` collides
+ * while its `(source, external_id)` does not is invisible to `ON CONFLICT`, so
+ * the primary key raises SQLSTATE 23505 and this route maps it to
+ * `already_present` / HTTP 409. That is a genuine, reachable outcome meaning
+ * "two different events are claiming one primary key" -- a conflict to report,
+ * not a retry -- so the classification, the status and `isUniqueViolation` stay
+ * exactly as they are. Only the PROSE was wrong before: it described a plain
+ * `INSERT`, which is not what this batch ships.
+ *
+ * The response says all of this in every body, via `idempotent` plus a fixed
+ * `idempotencyNote`, so a caller reading only the JSON is not misled about
+ * either half.
  */
 
 import type { CanonicalEventWriter } from "@/app/sources";
@@ -91,9 +99,12 @@ export const SYNC_OUTCOMES = {
   /** The request to the upstream source could not be completed. */
   upstreamUnreachable: "upstream_unreachable",
   /**
-   * The rows are already present: the unique constraint on
-   * `(source, external_id)` refused a repeat insert. Reported distinctly
-   * because it is what a second call to this route actually produces.
+   * A row in this page collides on its PRIMARY KEY `id` while its
+   * `(source, external_id)` does not, so the natural-key upsert cannot absorb
+   * it and the primary key raises 23505. Reported distinctly because it is a
+   * real conflict between two DIFFERENT events -- deliberately NOT reachable by
+   * simply calling this route twice, which the upsert makes a convergent
+   * success. See {@link SYNC_IS_IDEMPOTENT}.
    */
   alreadyPresent: "already_present",
   /** Anything else. Still never carries upstream or driver text. */
@@ -134,17 +145,34 @@ const OUTCOME_MESSAGES: Readonly<Record<SyncOutcome, string>> = {
   [SYNC_OUTCOMES.upstreamUnreachable]:
     "The request to the source could not be completed.",
   [SYNC_OUTCOMES.alreadyPresent]:
-    "Every event in this page is already stored. Calling this route again re-reads the same page and is refused by the unique constraint rather than updating in place.",
+    "A row in this page collides on its PRIMARY KEY id while its (source, external_id) does not, which the natural-key upsert cannot absorb. This is not what a repeat call produces — a repeat converges and succeeds. Treat it as a conflict to resolve, not as a retry.",
   [SYNC_OUTCOMES.internalError]:
     "The sync failed for a reason this route does not classify.",
 };
 
 /**
+ * The truth value for {@link SyncResponseBody.idempotent}, in ONE place.
+ *
+ * Exported so the unit suite can assert the shipped response against the same
+ * constant the handler assigns, instead of against a literal it repeats by hand.
+ * The previous shape -- `readonly idempotent: false` plus an inline `false` at
+ * the assignment, asserted by `toBe(false)` -- compared a literal to itself and
+ * therefore passed whatever the route actually did, which is how the shipped
+ * prose came to contradict the upsert with every gate green.
+ */
+export const SYNC_IS_IDEMPOTENT = true;
+
+/**
  * The honest statement about repeated calls, shipped in every response so a
- * caller reading only the JSON cannot mistake this for a safe-to-retry route.
+ * caller reading only the JSON is told both halves: a repeat is SAFE and
+ * convergent, and `already_present` means something else entirely.
+ *
+ * One module-level constant rather than a literal at the use site, so the value
+ * asserted by the unit suite and the value a caller reads cannot drift apart.
+ * `SYNC_IS_IDEMPOTENT` is what `body()` assigns; it is not inlined.
  */
 const IDEMPOTENCY_NOTE =
-  "Not idempotent. The write path is a plain INSERT guarded by UNIQUE (source, external_id), so a repeat call cannot duplicate rows but does fail with outcome `already_present` instead of updating existing rows.";
+  "Repeating this call is safe and converges: the write path is an ON CONFLICT DO UPDATE upsert on UNIQUE (source, external_id), so a repeat cannot duplicate rows and does not fail — it updates the existing row's mutable columns to the source's current view. `already_present` is NOT what a repeat produces; it is reserved for a row whose PRIMARY KEY id collides while its (source, external_id) does not, which ON CONFLICT cannot absorb and which is reported as a conflict (HTTP 409) rather than a retry.";
 
 export interface SyncResponseBody {
   readonly ok: boolean;
@@ -164,8 +192,27 @@ export interface SyncResponseBody {
   readonly byType: Readonly<Record<string, number>>;
   /** Upstream HTTP status, when and only when the source answered non-2xx. */
   readonly upstreamStatus?: number;
-  /** Always false. See {@link IDEMPOTENCY_NOTE}. */
-  readonly idempotent: false;
+  /**
+   * Whether a REPEATED call is safe, i.e. whether calling this route again with
+   * the same page is a convergent success rather than a refusal.
+   *
+   * TRUE as of the natural-key upsert: `persistCanonicalEvents` is
+   * `ON CONFLICT DO UPDATE` on `UNIQUE (source, external_id)`, so a repeat
+   * converges on the existing row instead of duplicating it or failing.
+   *
+   * It is deliberately NOT typed as the literal `true`. T15 typed it `false` and
+   * assigned the constant `false`, which made `expect(body.idempotent).toBe(false)`
+   * a tautology -- a test comparing a literal to itself passes whatever the
+   * behaviour is, and that is exactly how this batch shipped a response body
+   * whose prose contradicted its own write path. `boolean` makes flipping it a
+   * compile error at the assignment site, where the constant lives, instead of a
+   * silent lie at runtime.
+   *
+   * The one collision it does NOT absorb is a primary-key-only conflict, and
+   * that is reported as `already_present`, not as a retry. See
+   * {@link IDEMPOTENCY_NOTE}, shipped in every response.
+   */
+  readonly idempotent: boolean;
   readonly idempotencyNote: string;
 }
 
@@ -386,7 +433,7 @@ function body(
     persisted,
     byType,
     ...(upstreamStatus === undefined ? {} : { upstreamStatus }),
-    idempotent: false,
+    idempotent: SYNC_IS_IDEMPOTENT,
     idempotencyNote: IDEMPOTENCY_NOTE,
   };
 }

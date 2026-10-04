@@ -78,8 +78,20 @@ export default defineConfig({
     // — but `src/__tests__/db-suite-registry.test.ts` fails the DEFAULT suite if
     // any `*.test.ts` under `src/**` requires a database and is absent from this
     // list. So this list can now only be wrong loudly.
+    //
+    // `handler.test.ts` JOINED THE REGISTRY BECAUSE OF ITS OWN DEFECT FIX. Its
+    // "the shipped idempotency note tells the truth" block runs the real
+    // `persistCanonicalEvents` against a real Postgres and then checks the
+    // route's shipped `idempotencyNote` against what the database actually did.
+    // A fake writer cannot falsify that contract, only agree with it — which is
+    // how this batch shipped a note saying "not idempotent" over an
+    // `ON CONFLICT DO UPDATE` upsert with every gate green. Without this entry
+    // the block would be collected by `vitest.config.ts`, whose `verify` job has
+    // no database, and reported SKIPPED inside a green run: the same defect
+    // B35 and B37 exist for, in a third file.
     include: [
       "db/**/__tests__/**/*.test.ts",
+      "src/app/api/sync/__tests__/handler.test.ts",
       "src/app/sources/__tests__/persist-canonical-events-upsert.test.ts",
       "src/lib/db/__tests__/client.test.ts",
     ],

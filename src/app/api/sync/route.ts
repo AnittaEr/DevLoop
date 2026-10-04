@@ -12,12 +12,15 @@
  *   GET. `dynamic = "force-dynamic"` is set because the route's entire output
  *   depends on live upstream and database state; a cached 200 would be a lie.
  *
- * IS IT SAFE TO CALL REPEATEDLY? NO -- and the response says so, in every
- * response, in `idempotent: false` plus `idempotencyNote`. Calling it twice
- * cannot duplicate rows (`UNIQUE (source, external_id)`), but the second call
- * FAILS with `already_present` / HTTP 409 rather than updating existing rows.
- * The full reasoning is in `handler.ts`; this card must not invent an
- * idempotency key to paper over a persistence-layer gap.
+ * IS IT SAFE TO CALL REPEATEDLY? YES -- and the response says so, in every
+ * response, in `idempotent: true` plus `idempotencyNote`. The write path is an
+ * `ON CONFLICT DO UPDATE` upsert whose arbiter is
+ * `UNIQUE (source, external_id)`, so calling it twice cannot duplicate rows and
+ * does not fail: the second call converges on the existing row and refreshes its
+ * mutable columns from the source's current view. `already_present` / HTTP 409 is
+ * still reachable, but NOT by repeating this route -- it is reserved for a row
+ * whose PRIMARY KEY `id` collides while its `(source, external_id)` does not,
+ * which `ON CONFLICT` cannot absorb. The full reasoning is in `handler.ts`.
  *
  * No authentication here (explicitly out of scope for this card). DevLoop is
  * local-only in v1 (D2) and the route binds through `next start` on localhost.
