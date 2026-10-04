@@ -1,24 +1,24 @@
 /**
  * Environment-backed credential provider.
  *
- * Reads the GitHub fine-grained PAT from a single documented environment
- * variable. The variable is read lazily inside {@link EnvCredentialProvider.getToken},
- * never at module import time, so importing this module has no side effects and
- * tests can mutate `process.env` freely.
+ * Reads a provider's access token from the single environment variable named by
+ * the injected {@link TokenProfile}. The variable is read lazily inside
+ * {@link EnvCredentialProvider.getToken}, never at module import time, so
+ * importing this module has no side effects and tests can mutate `process.env`
+ * freely.
+ *
+ * B19: the variable NAME is no longer known here. It arrives on the profile, so
+ * this module stays provider-agnostic even though its whole job is to read one
+ * specific provider's token.
  */
 
 import {
   CredentialError,
-  GITHUB_TOKEN_ENV_VAR,
   TOKEN_SOURCE_REASONS,
+  assertValidTokenProfile,
   validateTokenShape,
 } from "./provider";
-import type { CredentialProvider } from "./provider";
-
-// Re-exported so existing importers of `../env-provider` keep working: the
-// constant now lives in `provider` because the reason allowlist needs it, and
-// `env-provider` imports `provider`, so declaring it here would be circular.
-export { GITHUB_TOKEN_ENV_VAR };
+import type { CredentialProvider, TokenProfile } from "./provider";
 
 /**
  * Minimal shape of the environment reader. Injecting it keeps the provider
@@ -31,17 +31,31 @@ export interface EnvCredentialProviderOptions {
    * Environment reader. Defaults to reading `process.env` lazily at call time.
    */
   readonly readEnv?: EnvReader;
+  /**
+   * Which provider's token to read, and from which variable.
+   *
+   * Required — there is deliberately no default profile, because any default
+   * would be one vendor's prefix and variable name living in `src/core/`
+   * (B19). Supplying one is how a caller says which provider this is for.
+   */
+  readonly profile: TokenProfile;
 }
 
 export class EnvCredentialProvider implements CredentialProvider {
   readonly source = "env" as const;
 
   private readonly readEnv: EnvReader;
+  private readonly profile: TokenProfile;
 
-  constructor(options: EnvCredentialProviderOptions = {}) {
+  constructor(options: EnvCredentialProviderOptions) {
+    // Validated once here as well as inside validateTokenShape: a blank profile
+    // should fail where it is supplied, not on the first token fetch.
+    assertValidTokenProfile(options.profile);
     // Bound lazily: `process.env` is dereferenced on every getToken() call,
     // not once at module/constructor evaluation time.
-    this.readEnv = options.readEnv ?? (() => process.env[GITHUB_TOKEN_ENV_VAR]);
+    this.readEnv =
+      options.readEnv ?? (() => process.env[options.profile.envVar]);
+    this.profile = options.profile;
   }
 
   async getToken(): Promise<string> {
@@ -52,8 +66,11 @@ export class EnvCredentialProvider implements CredentialProvider {
       // set", because it is the only case where the variable has no value at
       // all.
       //
-      // Names the variable so the operator can fix it. The variable NAME is not
-      // a secret; a token value could never appear here because there is none.
+      // The reason is a FIXED string that does not name the variable: the name
+      // is provider-specific and provider-supplied, and interpolating it would
+      // put an unbounded value into a closed allowlist of reasons (see
+      // TOKEN_SOURCE_REASONS in ./provider). A token value could never appear
+      // here either, because there is none.
       throw new CredentialError("token_absent", {
         source: this.source,
         reason: TOKEN_SOURCE_REASONS.envVarUnset,
@@ -65,12 +82,12 @@ export class EnvCredentialProvider implements CredentialProvider {
     // set" sends the operator to look for a missing export when the real fault
     // is a stray space or an empty value committed to a `.env`. `validateTokenShape`
     // classifies whitespace-only as absent with a reason that says exactly that.
-    return validateTokenShape(raw, this.source);
+    return validateTokenShape(raw, this.source, this.profile);
   }
 }
 
 export function createEnvCredentialProvider(
-  options?: EnvCredentialProviderOptions,
+  options: EnvCredentialProviderOptions,
 ): EnvCredentialProvider {
   return new EnvCredentialProvider(options);
 }
