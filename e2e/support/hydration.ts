@@ -11,12 +11,21 @@ import type { Page } from "@playwright/test";
  *
  * So we match both forms:
  *
- *  - Development builds, where React emits the full text
- *    ("Hydration failed because the server rendered ...", "Text content does
- *    not match server-rendered HTML").
+ *  - Development builds, where React emits the full text. Most of it contains
+ *    the substring "hydrat" ("Hydration failed because the server rendered
+ *    ...", "Recovered from a hydration error ..."), but the text-content
+ *    mismatch (#425) does NOT — it reads "Text content does not match
+ *    server-rendered HTML" — so it needs its own pattern,
+ *    {@link DEV_TEXT_MISMATCH}. Without that pattern the dev-mode path
+ *    silently missed the single most common mismatch.
  *  - Production builds, where the same failures are minified to
  *    "Minified React error #418" / "#423" / "#425". The code list below is
  *    the hydration family from React's own scripts/error-codes/codes.json.
+ *
+ * A bare `#NNN` is NOT accepted: the numbered form is honoured only behind
+ * React's own {@link MINIFIED_REACT_ERROR} prefix or the accompanying
+ * react.dev/errors/<code> link. Accepting any `error #NNN` made an unrelated
+ * `POST /api 500 (error #418)` fail the suite.
  *
  * If a future React renumbers these, the negative control in the T7 handoff
  * (inject a server/client mismatch, confirm the spec goes red) is the thing
@@ -31,10 +40,29 @@ const HYDRATION_CODES = new Set([
   "425", // Text content does not match server-rendered HTML
 ]);
 
+/**
+ * React's production-build prefix: "Minified React error #418; visit
+ * https://react.dev/errors/418?invariant_id=418 for more information."
+ */
+const MINIFIED_REACT_ERROR = /minified react error #?(\d{3})\b/i;
+
+/**
+ * The documentation link React appends to the same message. Accepted as an
+ * equivalent, because it carries the same code and is just as unambiguous.
+ */
+const REACT_ERROR_LINK = /react\.dev\/errors\/(\d{3})\b/i;
+
+/**
+ * React's development-build text for #425 — "Text content does not match
+ * server-rendered HTML." The one hydration-family message with no "hydrat" in
+ * it, so `/hydrat/i` alone cannot see it.
+ */
+const DEV_TEXT_MISMATCH = /text content (?:does not|did not) match/i;
+
 export function isHydrationError(text: string): boolean {
   if (/hydrat/i.test(text)) return true;
-  // "Minified React error #418" — also matches the react.dev/errors/418 link.
-  const match = /(?:error\s*)#?(\d{3})\b/i.exec(text);
+  if (DEV_TEXT_MISMATCH.test(text)) return true;
+  const match = MINIFIED_REACT_ERROR.exec(text) ?? REACT_ERROR_LINK.exec(text);
   return match !== null && HYDRATION_CODES.has(match[1]!);
 }
 
