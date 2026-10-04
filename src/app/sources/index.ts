@@ -41,6 +41,7 @@ import {
 } from "@/plugins/github/github-plugin";
 import type { HttpTransport } from "@/plugins/github/transport";
 import { createFetchTransport } from "@/plugins/github/transport";
+import { GITHUB_TOKEN_PROFILE } from "@/plugins/github/token-profile";
 
 export { SOURCE_NAME };
 
@@ -119,6 +120,9 @@ function credentialProviderFor(
   readEnv: EnvReader | undefined,
 ): ReturnType<typeof createCredentialProvider> {
   return createCredentialProvider("env", {
+    // The token shape belongs to the plugin that owns the wire format, so it
+    // is passed in from there rather than defaulted here or held in core.
+    profile: GITHUB_TOKEN_PROFILE,
     ...(readEnv === undefined ? {} : { env: { readEnv } }),
   });
 }
