@@ -31,7 +31,10 @@ import { createCredentialProvider } from "@/core/credentials/factory";
 import type { EnvReader } from "@/core/credentials/env-provider";
 import type { RegisteredPlugin } from "@/core/plugins/plugin";
 import { PluginRegistry } from "@/core/plugins/registry";
-import type { NewCanonicalEventRow } from "../../../db/schema";
+import type {
+  CanonicalEventRow,
+  NewCanonicalEventRow,
+} from "../../../db/schema";
 import { canonicalEvents } from "../../../db/schema";
 import { toCanonicalEventRow } from "../../../db/canonical-event-mapper";
 import { getDb } from "@/lib/db/client";
@@ -77,6 +80,71 @@ export const SOURCE_CONFIGURATION_REASONS = {
 
 export type SourceConfigurationReason =
   (typeof SOURCE_CONFIGURATION_REASONS)[keyof typeof SOURCE_CONFIGURATION_REASONS];
+
+/**
+ * Codes for a {@link SyncFailure}. A closed set, for the same reason
+ * {@link SOURCE_CONFIGURATION_REASONS} is one: a failure site selects a member,
+ * it never assembles a code from anything at runtime.
+ *
+ * Deliberately ONE code for every mapper rejection rather than one per reason.
+ * The writer already distinguishes its own rejections by message, and this
+ * module does not re-derive that taxonomy — a second classification of the same
+ * throw sites is precisely how two layers drift apart, which is the disagreement
+ * this guard exists to surface. {@link SyncFailure.detail} carries the writer's
+ * own message verbatim instead.
+ */
+export const SYNC_FAILURE_CODES = {
+  /** The writer refused at least one event; nothing was written. */
+  eventNotPersistable: "event_not_persistable",
+} as const;
+
+export type SyncFailureCode =
+  (typeof SYNC_FAILURE_CODES)[keyof typeof SYNC_FAILURE_CODES];
+
+/**
+ * A classified, reported sync failure.
+ *
+ * `detail` is the writer's rejection message carried VERBATIM, and it names the
+ * offending value. That is the point of the guard: the caller learns not merely
+ * that a sync failed but WHY an event was refused, without this module
+ * paraphrasing a rule the persistence layer owns.
+ */
+export interface SyncFailure {
+  readonly code: SyncFailureCode;
+  /** Position of the refused event in the fetched page, 0-based. */
+  readonly index: number;
+  /** Canonical id of the refused event, so it can be found and re-fetched. */
+  readonly eventId: string;
+  /** Provider-scoped id of the refused event, the same value under a swap. */
+  readonly externalId: string;
+  /** The writer's own rejection message, unaltered. */
+  readonly detail: string;
+}
+
+/**
+ * Raised when the writer refuses an event, carrying the same information a
+ * returned {@link SyncFailure} does.
+ *
+ * `persistCanonicalEvents` throws it so a direct caller cannot silently lose a
+ * write; `syncSource` catches it and reports it as a {@link SyncFailure} on the
+ * result, so the user-facing loop answers with a typed outcome instead of an
+ * exception escaping a route handler as an opaque 500.
+ */
+export class SyncPersistenceError extends Error {
+  override readonly name = "SyncPersistenceError";
+
+  readonly failure: SyncFailure;
+
+  constructor(failure: SyncFailure) {
+    super(
+      `event ${JSON.stringify(failure.eventId)} at position ${failure.index} ` +
+        `was refused by the canonical_events writer (${failure.code}): ` +
+        failure.detail,
+    );
+    this.failure = failure;
+    Object.setPrototypeOf(this, SyncPersistenceError.prototype);
+  }
+}
 
 export interface SourceRegistryOptions {
   /** `owner/name` of the repository to read. Required. */
@@ -246,20 +314,67 @@ export interface CanonicalEventWriter {
  * An empty list is a no-op rather than a query: a source that has nothing new
  * must not cost a round trip, and Drizzle rejects an empty `values()`.
  *
+ * THE MAP IS GUARDED, and this is the fix for a layer disagreement. The domain's
+ * `isIso8601DateTime` accepts any fractional-digit count — deliberately, because
+ * a sub-millisecond instant is still orderable, and narrowing it to what a
+ * `timestamptz` bind survives would be re-deciding the domain's validity rule
+ * from the storage layer. The WRITER then refuses to silently truncate it. Both
+ * answers are right, so the disagreement is not resolved here by changing either
+ * one: `toCanonicalEventRow` is called one event at a time and its rejection is
+ * converted into a {@link SyncPersistenceError} that names the refused event.
+ * Nothing is written when any event is refused — the batch is all-or-nothing, so
+ * a partial write could not be reported as a success.
+ *
  * @returns how many rows were written.
+ * @throws SyncPersistenceError if the writer refuses any event, carrying the
+ * writer's own rejection message verbatim.
  */
 export async function persistCanonicalEvents(
   events: readonly CanonicalEvent[],
   writer?: CanonicalEventWriter,
 ): Promise<number> {
   if (events.length === 0) return 0;
-  const rows = events.map(toCanonicalEventRow);
+  const rows = mapRows(events);
   // Resolved INSIDE the guard rather than as a default parameter value: a
   // default is evaluated on every call, including when a writer is supplied, so
   // `writer = getDb()` would demand DATABASE_URL from a caller that never
   // touches the database at all.
   await (writer ?? getDb()).insert(canonicalEvents).values(rows);
   return rows.length;
+}
+
+/**
+ * Map every event to its row, or throw the FIRST refusal as a classified
+ * {@link SyncPersistenceError}.
+ *
+ * Per-event rather than one `events.map(toCanonicalEventRow)`, so the refused
+ * event's index and ids are known. The FIRST rejection is reported, not an
+ * aggregate: the writer stops at the first, and collecting all of them would
+ * mean re-running the mapper to enumerate — pointless, since a page that has one
+ * unusable instant has a data problem the caller must fix upstream, and fixing
+ * it is what makes the rest of the page writable.
+ *
+ * Only a `TypeError` is classified. Anything else from this call is a bug in
+ * this module or in the mapper's internals, and is left to propagate rather than
+ * being laundered into a "the event was refused" answer that would be a lie.
+ */
+function mapRows(events: readonly CanonicalEvent[]): CanonicalEventRow[] {
+  const rows: CanonicalEventRow[] = [];
+  for (const [index, event] of events.entries()) {
+    try {
+      rows.push(toCanonicalEventRow(event));
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      throw new SyncPersistenceError({
+        code: SYNC_FAILURE_CODES.eventNotPersistable,
+        index,
+        eventId: event.id,
+        externalId: event.externalId,
+        detail: error.message,
+      });
+    }
+  }
+  return rows;
 }
 
 export interface SyncOptions {
@@ -277,11 +392,28 @@ export interface SyncResult {
   readonly events: CanonicalEvent[];
   /** How many rows were written. */
   readonly persisted: number;
+  /**
+   * Present only when the sync did NOT complete.
+   *
+   * Absent on success. On refusal it carries the classification AND the
+   * writer's own reason, and `persisted` is `0` — the batch is all-or-nothing,
+   * so there is no partial count to report.
+   */
+  readonly failure?: SyncFailure;
 }
 
 /**
  * The user-facing loop this card exists to make reachable: fetch work from a
  * source, then persist the canonical events it maps to.
+ *
+ * A writer refusal is RETURNED, not thrown. This is the boundary half of the
+ * fix: a `CanonicalEvent` the domain considers valid can still be one the
+ * writer refuses, and that must reach the caller as a typed, actionable outcome
+ * rather than an exception escaping to whatever called this — which, once T15
+ * makes this a production route handler, is an opaque 500 with no indication of
+ * which event or why. Everything else about the sync still throws: a transport
+ * or credential failure has no classification to report and is genuinely
+ * exceptional.
  */
 export async function syncSource(options: SyncOptions): Promise<SyncResult> {
   const events = await fetchCanonicalEvents(
@@ -293,6 +425,11 @@ export async function syncSource(options: SyncOptions): Promise<SyncResult> {
   // ?? getDb()` is an argument expression, so `getDb()` would be evaluated on
   // every call and demand DATABASE_URL from a caller that has nothing to
   // persist. The callee resolves it inside its own empty-list guard.
-  const persisted = await persistCanonicalEvents(events, options.writer);
-  return { events, persisted };
+  try {
+    const persisted = await persistCanonicalEvents(events, options.writer);
+    return { events, persisted };
+  } catch (error) {
+    if (!(error instanceof SyncPersistenceError)) throw error;
+    return { events, persisted: 0, failure: error.failure };
+  }
 }
