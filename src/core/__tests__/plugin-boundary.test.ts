@@ -170,9 +170,14 @@ const TOKEN_PATTERNS = DENY_LIST.flatMap((entry) =>
  * Strip `//` line comments ONLY, replacing each stripped character with a space
  * so that every offset -- and therefore every line number -- is preserved.
  *
- * String and template literals are tracked so that a `//` inside them is not
- * mistaken for a comment. Block comments are deliberately NOT stripped: the
+ * String, template and REGEX literals are tracked so that a `//` inside them is
+ * not mistaken for a comment. Block comments are deliberately NOT stripped: the
  * comment policy requires a provider token inside `/* *\/` or JSDoc to fail.
+ *
+ * (Base f07b894's header claimed "String, template and regex literals are
+ * tracked" while its code tracked only strings and templates -- a false claim.
+ * Regex tracking is now actually implemented; this header describes what the
+ * scanner does.)
  *
  * T6b ROOT CAUSE: the `//` branch used to be tested FIRST and unconditionally,
  * so a `//` inside template-literal TEXT blanked the rest of the line -- provider
@@ -181,13 +186,73 @@ const TOKEN_PATTERNS = DENY_LIST.flatMap((entry) =>
  * The fix is to track the enclosing literal (`quote`) and honour `//` as a
  * comment only in real code. Inside `${...}` we are back in real code, so a
  * `//` there is still a genuine comment and is still stripped.
+ *
+ * B13 ROOT CAUSE: regex literals were not tracked at all, so
+ * `const re = /[//]/; const pr_title = 1;` blanked everything after the `//`
+ * and reported ZERO violations -- a `//` inside a regex literal (very commonly
+ * written as a character class matching a slash) hid provider vocabulary, and
+ * hid the bare `github` token too. Regex bodies are therefore scanned like any
+ * other literal text: entered on an expression-position `/`, exited on an
+ * unescaped `/` outside a character class, with trailing flags consumed.
+ *
+ * Telling a regex START from a division is the only genuinely ambiguous decision
+ * in this scanner, so it fails toward the guard: an unrecognised preceding token
+ * is read as "a regex may start here", which leaves the `//` VISIBLE (more
+ * detection) rather than stripping a line that should not be stripped.
  */
+const REGEX_START_AFTER_PUNCTUATION = new Set([
+  "(",
+  "[",
+  "{",
+  ",",
+  ";",
+  ":",
+  "=",
+  "!",
+  "&",
+  "|",
+  "?",
+  "+",
+  "-",
+  "*",
+  "%",
+  "^",
+  "~",
+  "<",
+  ">",
+  "}",
+  "\n",
+]);
+
+/** Keywords after which a `/` starts a regex, not a division. */
+const REGEX_START_AFTER_KEYWORD = new Set([
+  "return",
+  "typeof",
+  "instanceof",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "case",
+  "do",
+  "else",
+  "yield",
+  "await",
+  "throw",
+]);
+
 export function stripLineComments(source: string): string {
   const out = source.split("");
   /** Open `${` depths of enclosing templates; 0 means "inside the expression". */
   const templateStack: number[] = [];
   /** Enclosing literal delimiter, or null when we are in real code. */
   let quote: string | null = null;
+  /** True while scanning a regex body; `regexInCharClass` is true inside `[...]`. */
+  let regexInCharClass = false;
+  let regexOpen = false;
+  /** Offset of the `[` that opened the current character class. */
+  let regexClassStart = -1;
   let i = 0;
   const n = source.length;
 
@@ -197,9 +262,80 @@ export function stripLineComments(source: string): string {
     }
   };
 
+  /**
+   * Does a `/` at offset `at` open a regex literal, or divide two values?
+   *
+   * Decided by a BACKWARD scan of the current line for the last significant
+   * character, rather than by threading state through the main loop. The
+   * backward scan is stateless, so it cannot drift out of sync with `i`, and it
+   * cannot be desynchronised by a construct the main loop handles specially.
+   *
+   * Fails toward the guard: if no significant character is found on the line
+   * (or the file starts), a regex is assumed -- that keeps a `//` inside the
+   * literal VISIBLE to the deny-list instead of silently stripping the line.
+   */
+  const regexAllowedHere = (at: number): boolean => {
+    let k = at - 1;
+    while (k >= 0 && !/[\S]/.test(source[k] as string)) k -= 1;
+    if (k < 0) return true;
+    const c = source[k] as string;
+    if (REGEX_START_AFTER_PUNCTUATION.has(c)) return true;
+    // An identifier-ish character means we are after a VALUE; a regex may only
+    // follow one of the keywords listed (e.g. `return /[//]/`).
+    if (/[A-Za-z0-9_$]/.test(c)) {
+      let start = k;
+      while (start >= 0 && /[A-Za-z0-9_$]/.test(source[start] as string)) {
+        start -= 1;
+      }
+      const word = source.slice(start + 1, k + 1);
+      return REGEX_START_AFTER_KEYWORD.has(word);
+    }
+    // `)`, `]`, `++`, `--`: a `/` here divides.
+    return false;
+  };
+
   while (i < n) {
     const ch = source[i] as string;
     const next = source[i + 1];
+
+    // --- Regex body: nothing here is a comment or a delimiter. ---
+    if (regexOpen) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "\n") {
+        // Unterminated (illegal JS, but recovery must not eat the rest of the
+        // file): leave regex mode and reprocess this character as real code.
+        regexOpen = false;
+        i += 1;
+        continue;
+      }
+      if (regexInCharClass) {
+        // Inside `[...]` a `]` in FIRST position is a literal member, not a close
+        // (so `/[]/]/` is scanned as one literal), and `[` / `/` are members too.
+        if (ch === "]" && i > regexClassStart) {
+          regexInCharClass = false;
+        }
+        i += 1;
+        continue;
+      }
+      if (ch === "[") {
+        regexInCharClass = true;
+        regexClassStart = i;
+        i += 1;
+        continue;
+      }
+      if (ch === "/") {
+        regexOpen = false;
+        i += 1;
+        // Flags (gimsuyvd) belong to the literal and can never open a comment.
+        while (i < n && /[a-z]/i.test(source[i] as string)) i += 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
 
     // --- Literal text: nothing here is a comment or a delimiter. ---
     if (quote !== null) {
@@ -225,6 +361,15 @@ export function stripLineComments(source: string): string {
 
     // --- Real code. ---
 
+    // regex literal -> its body is literal text, not code
+    if (ch === "/" && next !== "/" && next !== "*" && regexAllowedHere(i)) {
+      regexOpen = true;
+      regexInCharClass = false;
+      regexClassStart = -1;
+      i += 1;
+      continue;
+    }
+
     // line comment -> strip to end of line
     if (ch === "/" && next === "/") {
       let end = i;
@@ -249,16 +394,6 @@ export function stripLineComments(source: string): string {
       continue;
     }
 
-    if (ch === "{") {
-      // A nested object/brace inside an interpolation, not the end of it.
-      if (templateStack.length > 0) {
-        templateStack[templateStack.length - 1] =
-          (templateStack[templateStack.length - 1] ?? 0) + 1;
-      }
-      i += 1;
-      continue;
-    }
-
     if (ch === "}" && templateStack.length > 0) {
       const depth = templateStack[templateStack.length - 1] ?? 0;
       if (depth === 0) {
@@ -270,6 +405,16 @@ export function stripLineComments(source: string): string {
         continue;
       }
       templateStack[templateStack.length - 1] = depth - 1;
+      i += 1;
+      continue;
+    }
+
+    if (ch === "{") {
+      // A nested object/brace inside an interpolation, not the end of it.
+      if (templateStack.length > 0) {
+        templateStack[templateStack.length - 1] =
+          (templateStack[templateStack.length - 1] ?? 0) + 1;
+      }
     }
 
     i += 1;
@@ -507,5 +652,75 @@ describe("plugin-boundary scanner (positive control)", () => {
     expect(stripped).toHaveLength(2);
     expect(stripped[0]).toBe(" ".repeat(line.length));
     expect(stripped[1]).toBe("export const n = 1;");
+  });
+});
+
+/**
+ * B13 regression: a `//` inside a REGEX literal must not be read as a line
+ * comment. Before this, `const re = /[//]/; const pr_title = 1;` blanked the
+ * whole rest of the line and reported ZERO violations -- the `//` inside a
+ * character class (the natural way to write "match a slash") hid both the
+ * underscore-suffixed families and the bare `github` token from hard rule 1.
+ *
+ * This is the case base f07b894's doc comment claimed and never implemented.
+ */
+describe("plugin-boundary scanner (regex literals, B13)", () => {
+  const scanOne = (snippet: string) => findViolations(snippet, "fixture.ts");
+
+  it("catches a token hidden behind a `//` inside a regex character class", () => {
+    const v = scanOne("const re = /[//]/; const pr_title = 1;");
+    expect(v.map((x) => x.token)).toContain("pr_");
+    expect(v[0]?.line).toBe(1);
+  });
+
+  it("catches the bare `github` token hidden the same way", () => {
+    expect(
+      scanOne("const re = /[//]/; const github = 1;").map((x) => x.token),
+    ).toContain("github");
+  });
+
+  it("sees tokens after every regex shape that can contain `//`", () => {
+    for (const snippet of [
+      "const re = /[//]/; const pull_request = 1;",
+      "const re = /a\\/b/; const pr_title = 1;",
+      "const re = /[//]/gi; const pr_title = 1;",
+      "const re = /a/b/; const pr_title = 1;",
+      "function f() { return /[//]/; } const mr_x = 1;",
+      "const re =\n  /[//]/;\nconst pr_title = 1;",
+      "const s = `${/[//]/}`; const pr_title = 1;",
+    ]) {
+      expect(
+        scanOne(snippet).length,
+        `expected a violation after the regex in: ${snippet}`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("still strips a real // comment that follows a regex literal", () => {
+    // The regex ends at its closing `/`; only what follows is a comment.
+    expect(scanOne("const re = /[//]/; // pr_hidden")).toEqual([]);
+    expect(scanOne("const re = /a\\/b/; // pr_hidden")).toEqual([]);
+  });
+
+  it("still treats a division as division, not as a regex start", () => {
+    // `a / b / c` must not open a regex that swallows the rest of the file.
+    expect(scanOne("const q = a / b / c; // pr_hidden")).toEqual([]);
+    expect(scanOne("const q = a / b;\nconst n = 1; // pr_hidden")).toEqual([]);
+  });
+
+  it("preserves T6b: template TEXT keeps its token, interpolation does not", () => {
+    // Both halves of T6b's root-cause fix, re-asserted by execution. Regressing
+    // either is worse than the regex bug being fixed.
+    expect(
+      scanOne("const s = `a // pr_hidden`;").map((x) => x.token),
+    ).toContain("pr_");
+    expect(scanOne("const s = `${a // pr_hidden\n}`;")).toEqual([]);
+  });
+
+  it("preserves T6b: a `//` in a string is not a comment either", () => {
+    expect(
+      scanOne('const s = "a // pr_hidden";').map((x) => x.token),
+    ).toContain("pr_");
+    expect(scanOne("// pr_hidden\nconst n = 1;")).toEqual([]);
   });
 });
