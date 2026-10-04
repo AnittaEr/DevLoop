@@ -16,9 +16,12 @@ describe("next.config outputFileTracingRoot", () => {
     // Next.js print a multiple-lockfiles / inferred-workspace-root warning.
     // Pinning the tracing root must keep the resolved root inside the repo no
     // matter what lockfiles exist above it.
+    const repoRoot = path.resolve(__dirname, "../..");
     const tracingRoot = String(nextConfig.outputFileTracingRoot);
 
     expect(path.isAbsolute(tracingRoot)).toBe(true);
-    expect(tracingRoot.split(path.sep)).toContain("DevLoop");
+    // Derive the expected segment from the repo root rather than hardcoding a
+    // directory name, so the assertion holds in any checkout location.
+    expect(tracingRoot.split(path.sep)).toContain(path.basename(repoRoot));
   });
 });
