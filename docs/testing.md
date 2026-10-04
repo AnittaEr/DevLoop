@@ -4,14 +4,14 @@ Two independent runners. Neither replaces the other.
 
 ## Commands
 
-| Command               | What it runs                                                   |
-| --------------------- | -------------------------------------------------------------- |
-| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`.        |
-| `bun run lint`        | ESLint over the repo.                                          |
-| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).   |
-| `bun run build`       | `next build` — production build.                               |
-| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium. |
-| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.       |
+| Command               | What it runs                                                                           |
+| --------------------- | -------------------------------------------------------------------------------------- |
+| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
+| `bun run lint`        | ESLint over the repo.                                                                  |
+| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
+| `bun run build`       | `next build` — production build.                                                       |
+| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
+| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.                               |
 
 ## End-to-end tests
 
@@ -21,12 +21,15 @@ bun run build         # required — e2e runs the production server
 bun run e2e
 ```
 
-`e2e` **requires a build**. `playwright.config.ts` starts the app with
-`bun run start` (`next start`), which serves `.next/` — without a prior
-`bun run build` the server has nothing to serve. `reuseExistingServer` is
-`!process.env.CI`, so a local run is fast if you already have `next dev` or
-`next start` on port 3000, while CI always starts a fresh server and never
-silently reuses a stale one.
+`e2e` **requires a build unless it can reuse a running server.**
+`playwright.config.ts` starts the app with `bun run start` (`next start`),
+which serves `.next/` — so if Playwright has to start that server itself, a
+prior `bun run build` is mandatory or it has nothing to serve. The exception is
+`reuseExistingServer`, which is `!process.env.CI`: locally, when something is
+already answering on port 3000, Playwright reuses it and no build of your own
+is needed. CI always starts a fresh server, so on CI the build is always
+required. If you are unsure which case you are in, run `bun run build` — it is
+never wrong, only occasionally unnecessary.
 
 Set `CI=true` to get CI behaviour locally (2 retries, `forbidOnly`, the `line`
 reporter).
@@ -38,22 +41,46 @@ reporter).
 - `e2e/interaction.spec.ts` — clicking the button produces a visible DOM change,
   and the page logs no React hydration failure while doing so. This is the class
   of defect jsdom unit tests cannot catch.
-- `e2e/support/hydration.ts` — not a spec; the shared matcher both specs use to
-  recognise a hydration failure. Because `e2e` runs against a **minified
-  production** build, React reports mismatches as `Minified React error #418`
-  (and `#421`–`#425`) rather than the word "hydration", so the matcher accepts
-  both the full development text and those numbered codes. If you add a spec that
-  cares about hydration, use `collectHydrationErrors(page)` rather than
-  `/hydrat/i` — a bare `/hydrat/i` filter silently matches nothing here.
+- `e2e/support/hydration.ts` — not a spec; the shared matcher, used by
+  `interaction.spec.ts` only (`home.spec.ts` does not call it). Because `e2e`
+  runs against a **minified production** build, React reports mismatches as
+  `Minified React error #418` (and `#421`–`#425`) rather than the word
+  "hydration", so the matcher accepts both the full development text and those
+  numbered codes. A bare `#NNN` is not accepted — the code is only honoured
+  behind React's `Minified React error` prefix or the `react.dev/errors/<code>`
+  link, so an unrelated `POST /api 500 (error #418)` does not fail the suite.
+  If you add a spec that cares about hydration, use
+  `collectHydrationErrors(page)` rather than `/hydrat/i` — a bare `/hydrat/i`
+  filter silently matches almost nothing here.
 
 Chromium only. No Firefox/WebKit projects and no visual-regression baselines
 yet.
 
 ## CI status
 
-**CI does NOT run `e2e` yet.** `.github/workflows/` is owned by a separate
-ticket; the e2e job is not wired into CI. Until it is, a green CI run says
-nothing about the e2e specs — run `bun run e2e` locally.
+CI has **two jobs**, both defined in `.github/workflows/ci.yml`:
 
-Vitest and Playwright do not overlap: Vitest's include is
-`src/**/*.test.{ts,tsx}`, and the Playwright specs live in `e2e/*.spec.ts`.
+- `verify` — `bun install --frozen-lockfile`, `bun run format:check`,
+  `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`.
+- `e2e` — verifies the lockfile, installs dependencies, runs `bun run build`,
+  then installs Chromium, then runs `bun run e2e`. The build must precede the
+  e2e steps (see the ordering note in `ci.yml`).
+
+They run concurrently on their own runners and report independent status and
+timing. A green CI run therefore **does** cover the e2e specs: the `e2e` job
+reports under its own check name, so a red e2e is visible as `e2e` rather than
+hidden inside a green aggregate. Note that CI _reports_ this check but does not
+_enforce_ it — the repository has no branch protection and no rulesets, so
+nothing on GitHub requires any check to pass before a PR can be merged. A human
+reviewer decides whether a red `e2e` blocks the merge. `bun run e2e` remains the
+local equivalent of the `e2e` job, and carries the same build requirement
+described under "End-to-end tests" above — a prior `bun run build`, not
+something `playwright.config.ts` does for you.
+
+Vitest's include is `["src/**/*.test.{ts,tsx}", "e2e/**/*.test.{ts,tsx}"]`
+(source of truth: `vitest.config.ts`). The `e2e/**` half is deliberate — the
+shared harness helpers under `e2e/support/` must be resolvable by Vitest so
+they can carry Vitest negative controls. The two runners still never pick up
+each other's files: Playwright's `testMatch` is `*.spec.ts`, so a `.test.ts`
+under `e2e/` is invisible to `playwright test`, and a `.spec.ts` under `e2e/`
+is invisible to Vitest.

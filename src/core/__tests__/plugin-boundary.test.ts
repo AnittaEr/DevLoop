@@ -196,9 +196,19 @@ const TOKEN_PATTERNS = DENY_LIST.flatMap((entry) =>
  * unescaped `/` outside a character class, with trailing flags consumed.
  *
  * Telling a regex START from a division is the only genuinely ambiguous decision
- * in this scanner, so it fails toward the guard: an unrecognised preceding token
- * is read as "a regex may start here", which leaves the `//` VISIBLE (more
- * detection) rather than stripping a line that should not be stripped.
+ * in this scanner. It fails toward the guard on an unrecognised preceding token
+ * (an empty line, or the start of the file): that keeps a `//` inside a regex
+ * literal VISIBLE (more detection) rather than stripping a line that should not
+ * be stripped.
+ *
+ * ONE DELIBERATE CARVE-OUT runs the other way, and B18 is about it. A `/` is read
+ * as a DIVISION -- a false negative for the guard -- when the preceding character
+ * is `]`, `++`, `--`, or a `)` that closes a grouping or call paren. That is the
+ * safe-looking reading of the syntax but the dangerous one for this test, because
+ * misreading a regex as a division lets a `//` blank the line. B18 closed the
+ * `)` half of that carve-out for control-statement headers (`if (x) /[//]/;`,
+ * where the body really can be a regex-literal statement); `]`/`++`/`--` remain
+ * carve-outs, and a value-expression `)` remains one too.
  */
 const REGEX_START_AFTER_PUNCTUATION = new Set([
   "(",
@@ -242,6 +252,22 @@ const REGEX_START_AFTER_KEYWORD = new Set([
   "throw",
 ]);
 
+/**
+ * Keywords whose header paren is a CONTROL paren, not a grouping or call paren.
+ *
+ * B18: after `if (x)` a `/` opens a regex-literal STATEMENT; after the `)` of
+ * `(a / b)` or `f(a)` it divides. The `)` character alone cannot tell the two
+ * apart, so the decision is delegated to the keyword owning the matching `(`.
+ */
+const CONTROL_PAREN_KEYWORDS = new Set([
+  "if",
+  "while",
+  "for",
+  "with",
+  "switch",
+  "catch",
+]);
+
 export function stripLineComments(source: string): string {
   const out = source.split("");
   /** Open `${` depths of enclosing templates; 0 means "inside the expression". */
@@ -253,6 +279,30 @@ export function stripLineComments(source: string): string {
   let regexOpen = false;
   /** Offset of the `[` that opened the current character class. */
   let regexClassStart = -1;
+  /**
+   * B20: paren nesting as SEEN BY THE MAIN LOOP, not re-derived by a second
+   * backward pass. Each entry is one unclosed `(` with the keyword that owned it,
+   * plus the `lastTopLevelSemi` value in force when it was pushed.
+   *
+   * Because the main loop only reaches this code in REAL CODE, parens inside
+   * strings, template text, interpolations, regex bodies and comments never
+   * enter the stack -- they are consumed by the `quote` / `templateStack` /
+   * `regexOpen` branches above. That is the whole point: one lexical model, so
+   * a `(` or `)` in literal text cannot desynchronise the count.
+   */
+  const parenStack: { keyword: string }[] = [];
+  /**
+   * B20: offsets of the `)` characters that closed a CONTROL header paren. This
+   * is the recorded answer `closesControlHeaderParen` reads.
+   */
+  const controlCloseParens = new Set<number>();
+  /**
+   * B20: offsets of EVERY `)` the main loop saw in real code. Its purpose is to
+   * let `closesControlHeaderParen` distinguish "this `)` is real code and closed a
+   * non-control paren, so `/` divides" (a definite `false`) from "the main loop
+   * never saw this `)` as code at all" (the defensive fallback).
+   */
+  const recordedCloseParens = new Set<number>();
   let i = 0;
   const n = source.length;
 
@@ -290,8 +340,49 @@ export function stripLineComments(source: string): string {
       const word = source.slice(start + 1, k + 1);
       return REGEX_START_AFTER_KEYWORD.has(word);
     }
-    // `)`, `]`, `++`, `--`: a `/` here divides.
+    // `)`, `]`, `++`, `--`: a `/` here divides -- unless the `)` closes a
+    // CONTROL header paren, whose body may be a regex-literal statement.
+    if (c === ")") return closesControlHeaderParen(k);
     return false;
+  };
+
+  /**
+   * Does the `)` at `closeAt` close the header paren of a control statement
+   * (`if (...)`, `while (...)`, `for (...)`, `with (...)`, `switch (...)`,
+   * `catch (...)`)?
+   *
+   * B18 ROOT CAUSE: the `)` branch of `regexAllowedHere` was an unconditional
+   * "this divides". In a control statement's BODY a `/` opens a regex-literal
+   * statement -- `if (x) /[//]/;` -- so the `//` inside the character class was
+   * read as a line comment and blanked the rest of the line, hiding every
+   * deny-listed token after it. Nothing about the `)` itself distinguishes the
+   * two cases, so this walks back to the matching `(` and reads the keyword
+   * that owns it: a control keyword means "statement body", anything else
+   * (grouping, call, arrow params) means "a value just ended, so `/` divides".
+   *
+   * Matching is no longer RE-DERIVED here. B20: the function used to walk
+   * backward over raw characters counting `(`/`)`, which had no notion of string
+   * or template literals. A `(` inside a string pushed the count off and the walk
+   * landed on the wrong paren or ran out of line and fell through to the
+   * `return true` fallback below -- which is what produced BOTH of B20's
+   * defects:
+   *
+   *   if (label === "(") /[//]/; const pr_title = "PR";   ->  []   (missed)
+   *   const x = (")") / c; // pr_hidden                   ->  ["pr_"] (false +)
+   *
+   * The main loop now records, for every `)` in real code, whether the paren it
+   * closed was a control header -- so this is a set lookup, not a second lexer.
+   * A `)` in a string, template, interpolation, regex or comment never reaches
+   * the main loop's paren handling, so it can neither push nor pop the stack.
+   *
+   * Fails toward the guard: an offset the main loop never recorded (only
+   * reachable if this is called on a `)` that was inside literal text, which the
+   * main loop cannot do) returns `true`, so a `//` stays visible.
+   */
+  const closesControlHeaderParen = (closeAt: number): boolean => {
+    if (controlCloseParens.has(closeAt)) return true;
+    if (recordedCloseParens.has(closeAt)) return false;
+    return true;
   };
 
   while (i < n) {
@@ -390,6 +481,45 @@ export function stripLineComments(source: string): string {
 
     if (ch === '"' || ch === "'" || ch === "`") {
       quote = ch;
+      i += 1;
+      continue;
+    }
+
+    // --- Paren nesting (B20). Reached only in REAL CODE: the literal-text,
+    // regex and comment branches above `continue` before this point, so a
+    // paren inside a string, template, interpolation, regex body or comment can
+    // neither push nor pop here. `closesControlHeaderParen` reads the two sets
+    // this fills, which is how the control-header decision and the nesting
+    // count share ONE lexical model instead of two.
+    if (ch === "(") {
+      // The keyword immediately owning this `(` decides what a `/` after its
+      // `)` means. Same identifier scan the forward loop has always used.
+      let wordEnd = i - 1;
+      while (wordEnd >= 0 && !/\S/.test(source[wordEnd] as string)) {
+        wordEnd -= 1;
+      }
+      let wordStart = wordEnd;
+      while (
+        wordStart >= 0 &&
+        /[A-Za-z0-9_$]/.test(source[wordStart] as string)
+      ) {
+        wordStart -= 1;
+      }
+      const word = source.slice(wordStart + 1, wordEnd + 1);
+      parenStack.push({
+        keyword: CONTROL_PAREN_KEYWORDS.has(word) ? word : "",
+      });
+      i += 1;
+      continue;
+    }
+
+    if (ch === ")") {
+      recordedCloseParens.add(i);
+      const popped = parenStack.pop();
+      // An unmatched `)` (illegal JS, or a `)` the main loop reached without a
+      // matching `(`) leaves nothing popped; treat it as non-control so a `/`
+      // here divides, rather than guessing "control".
+      if (popped?.keyword) controlCloseParens.add(i);
       i += 1;
       continue;
     }
@@ -722,5 +852,323 @@ describe("plugin-boundary scanner (regex literals, B13)", () => {
       scanOne('const s = "a // pr_hidden";').map((x) => x.token),
     ).toContain("pr_");
     expect(scanOne("// pr_hidden\nconst n = 1;")).toEqual([]);
+  });
+});
+
+/**
+ * B20: a string literal inside a control header defeated
+ * `closesControlHeaderParen`, so the guard reported green over a
+ * provider-bound core.
+ *
+ * Until this fix, `closesControlHeaderParen` matched the header `(` with its own
+ * BACKWARD character count over the raw line -- a second, independent lexical
+ * model with no notion of strings. A `(` or `)` inside a string literal pushed
+ * that count off, so it landed on the wrong paren or ran off the start of the
+ * line and fell through to the `return true` fallback. Both directions of that
+ * bug are measured below, by execution, at the pre-fix head 78199bb:
+ *
+ *   Defect 1, FALSE NEGATIVE (the deciding case):
+ *     if (label === "(") /[//]/; const pr_title = "PR";   ->  []   pr_ MISSED
+ *     if (label === "x") /[//]/; const pr_title = "PR";   ->  ["pr_"]
+ *     if (x) /[//]/; const pr_title = "PR";               ->  ["pr_"]
+ *
+ *   Defect 2, FALSE POSITIVE (the converse):
+ *     const x = (")") / c; // pr_hidden                   ->  ["pr_"]  WRONG
+ *
+ * Defect 2's shape is a GENUINE regex (`/[//]/`), not a literal `)`. QA's own
+ * first report asserted cubic's literal-`)` snippets were a false positive, then
+ * re-measured and WITHDREW that: those snippets are real comments, so detecting
+ * them is correct. The false positive needs the `)` to be inside a string and
+ * the `//` to be inside a real regex, so the surplus `)` survives the backward
+ * count, exhausts it, and lands on the fail-toward-the-guard fallback.
+ *
+ * The fix makes the forward main loop record, for every `)` in real code, the
+ * keyword that owned the matching `(` (`parenStack` / `controlCloseParens` /
+ * `recordedCloseParens` above), so `closesControlHeaderParen` is a set lookup
+ * against the SAME lexical state that already tracks quotes, templates and
+ * regex bodies. No second lexer.
+ */
+describe("plugin-boundary scanner (string literals in parens, B20)", () => {
+  const scanOne = (snippet: string) => findViolations(snippet, "fixture.ts");
+  const tokensOf = (snippet: string) => scanOne(snippet).map((v) => v.token);
+
+  it("DEFECT 1: catches a token behind a control header whose string contains `(`", () => {
+    // The exact snippet QA measured as `TOKENS: []` at 78199bb. `pr_` is the
+    // deny-list token it was hiding, so this fails loudly if the hole reopens.
+    expect(
+      tokensOf('if (label === "(") /[//]/; const pr_title = "PR";'),
+    ).toContain("pr_");
+  });
+
+  it("DEFECT 1: the same header with a paren-free string is the control", () => {
+    // Paired control: only the literal `(` differed, so only the literal `(` may
+    // be what broke it.
+    expect(
+      tokensOf('if (label === "x") /[//]/; const pr_title = "PR";'),
+    ).toContain("pr_");
+    expect(tokensOf('if (x) /[//]/; const pr_title = "PR";')).toContain("pr_");
+  });
+
+  it("DEFECT 1: covers `(` in a string across every control keyword", () => {
+    for (const keyword of ["if", "while", "for", "switch"]) {
+      const snippet = `${keyword} (label === "(") /[//]/; const pr_title = "PR";`;
+      expect(
+        tokensOf(snippet),
+        `expected pr_ to fire after ${keyword}: ${snippet}`,
+      ).toContain("pr_");
+    }
+    // `(` in a string together with a nested paren and a trailing condition.
+    expect(
+      tokensOf('if (a === "(" && (b || c)) /[//]/; const mr_state = 1;'),
+    ).toContain("mr_");
+  });
+
+  it("DEFECT 2: a `)` in a string does not make a genuine regex open a comment", () => {
+    // The regex here is GENUINE (`/[//]/`) and the token is real code, so the
+    // ONLY thing that can produce `["pr_"]` is the backward count landing on the
+    // fail-toward-the-guard fallback. At 78199bb this returned ["pr_"].
+    expect(tokensOf('const x = (")") /[//]/; const mr_state = 1;')).toEqual([]);
+  });
+
+  it("DEFECT 2: a `)` in a string keeps the `/` after it a division", () => {
+    // Same surplus-`)` shape, no regex: the `//` must still strip.
+    expect(tokensOf('const x = (")") / c; // pr_hidden')).toEqual([]);
+    expect(tokensOf('const x = ("(") / c; // pr_hidden')).toEqual([]);
+    expect(tokensOf('const x = (")" + a) / c; // pr_hidden')).toEqual([]);
+    expect(tokensOf('const x = (")" || b) / c; // pr_hidden')).toEqual([]);
+    expect(tokensOf('const x = f((")")) / c; // pr_hidden')).toEqual([]);
+  });
+
+  it("DEFECT 2: the no-paren-in-a-string control must still detect", () => {
+    // The anti-vacuity pair: a string with NO paren must not stop detection, so
+    // a fix that simply made every string-containing-header case clean would
+    // fail here.
+    expect(tokensOf("const x = (a + b) / c; const mr_state = 1;")).toContain(
+      "mr_",
+    );
+    expect(tokensOf('const x = (")") / c; const mr_state = 1;')).toContain(
+      "mr_",
+    );
+    expect(
+      tokensOf('const s = ")"; const y = f(a) / c; const mr_state = 1;'),
+    ).toContain("mr_");
+  });
+
+  it("DEFECT 2: a string `)` must not make a later control header's `/` a regex", () => {
+    // The surplus has to be consumed by the correct paren, not merely absorbed:
+    // after the fix this control header still reports, and its own real comment
+    // still strips.
+    expect(
+      tokensOf('const x = (")") / c; if (a) /[//]/; const pr_title = 1;'),
+    ).toContain("pr_");
+    expect(
+      tokensOf('const x = (")") / c; if (a) /[//]/; // pr_hidden'),
+    ).toEqual([]);
+  });
+
+  it("handles parens inside TEMPLATE text and interpolations", () => {
+    // The forward loop's `quote`/`` ` ``-text branch and its `templateStack`
+    // interpolation branch both `continue` before the paren handling, so a paren
+    // in either place cannot move the stack. Asserted rather than assumed, with
+    // the detection side AND the comment side of each shape.
+    // Template TEXT holding a paren, then a call paren that must divide:
+    expect(
+      tokensOf("const s = `) `; const y = f(a) / c; // pr_hidden"),
+    ).toEqual([]);
+    expect(
+      tokensOf("const s = `( `; const y = f(a) / c; const mr_state = 1;"),
+    ).toContain("mr_");
+    // An INTERPOLATION whose expression contains a paren in a nested string.
+    expect(
+      tokensOf(
+        'const s = `${")"}`; const y = f(a) /[//]/; const pr_title = 1;',
+      ),
+    ).toEqual([]);
+    expect(
+      tokensOf('const s = `${")"}`; const y = f(a) / c; // pr_hidden'),
+    ).toEqual([]);
+    // A paren in template text must not break a following control header.
+    expect(
+      tokensOf("const s = `) `; if (a) /[//]/; const pr_title = 1;"),
+    ).toContain("pr_");
+  });
+
+  it("handles a `)` inside a REGEX body, which is also literal text", () => {
+    // `/)/` is a real regex whose body holds a `)`. Before this fix that body
+    // paren counted toward the header search and could desynchronise it.
+    expect(
+      tokensOf("const r = /)/; if (a) /[//]/; const pr_title = 1;"),
+    ).toContain("pr_");
+    expect(tokensOf("const r = /)/; const y = f(a) / c; // pr_hidden")).toEqual(
+      [],
+    );
+  });
+
+  it("does not regress any pre-existing B13 / B18 shape", () => {
+    // Everything B13 and B18 pinned, re-asserted in one place so a B20 fix that
+    // traded one hole for another is a single named failure here.
+    for (const snippet of [
+      // B13: regex bodies containing `//`.
+      "const re = /[//]/; const pr_title = 1;",
+      "const re = /a\\/b/; const pr_title = 1;",
+      "const re = /[//]/gi; const pr_title = 1;",
+      "function f() { return /[//]/; } const mr_x = 1;",
+      // B18: control headers, all keywords, and nested parens.
+      "if (x) /[//]/; const pr_title = 1;",
+      "while (x) /[//]/; const pr_title = 1;",
+      "for (;;) /[//]/; const pr_title = 1;",
+      "if (a ? b : c) /[//]/; const pr_title = 1;",
+      "with (o) /[//]/; const pr_title = 1;",
+      "switch (x) /[//]/; const pr_title = 1;",
+      "try { f(); } catch (e) /[//]/; const pr_title = 1;",
+      "if ((x)) /[//]/; const pr_title = 1;",
+      "if (f(1)) /[//]/; const pr_title = 1;",
+      "for (let i = 0; i < n; i++) /[//]/; const mr_state = 1;",
+    ]) {
+      expect(
+        tokensOf(snippet),
+        `expected pr_/mr_ to still fire in: ${snippet}`,
+      ).not.toEqual([]);
+    }
+
+    // And the anti-vacuity side: a real `//` must STILL strip in every one of the
+    // string-bearing shapes, so B20 did not fix a false negative by opening a
+    // false-positive flood.
+    for (const snippet of [
+      'if (label === "(") /[//]/; // pr_hidden',
+      'if (label === "(") f(); // pr_hidden',
+      'while (x === "(") /[//]/; // pr_hidden',
+      'const x = (")") / c; // pr_hidden',
+      "const s = `) `; if (a) /[//]/; // pr_hidden",
+    ]) {
+      expect(
+        tokensOf(snippet),
+        `expected a real comment to still strip in: ${snippet}`,
+      ).toEqual([]);
+    }
+  });
+});
+
+/**
+ * B18: `if (x) /[//]/;` -- a regex literal in a control statement's BODY.
+ *
+ * `regexAllowedHere` decided regex-vs-division from the previous significant
+ * character alone, and its final branch read any `)` as "a value just ended, so
+ * this `/` divides". That is right for `(a / b)` and wrong for a control
+ * statement's body, where a bare regex-literal STATEMENT is valid. The `//`
+ * inside the character class was then read as a line comment and blanked the
+ * rest of the line, so every deny-listed token after it became invisible:
+ *
+ *   if (x) /[//]/; const pr_title = 1;   ->  []   (zero violations)
+ *
+ * The four shapes below are the exact cases QA measured at c75a335 and confirmed
+ * MISSED. Each is asserted by the deny-list token it was hiding, not by a
+ * marker or a proxy, so a scanner mutation that stops detecting these fails
+ * here rather than passing quietly.
+ */
+describe("plugin-boundary scanner (regex after a control paren, B18)", () => {
+  const scanOne = (snippet: string) => findViolations(snippet, "fixture.ts");
+  const tokensOf = (snippet: string) => scanOne(snippet).map((v) => v.token);
+
+  it("catches a token hidden behind `//` after each control header paren", () => {
+    // Every one of these returned [] at c75a335. Named individually so a
+    // regression in any single header keyword is a distinct failure.
+    for (const snippet of [
+      "if (x) /[//]/; const pr_title = 1;",
+      "while (x) /[//]/; const pr_title = 1;",
+      "for (;;) /[//]/; const pr_title = 1;",
+      "if (a ? b : c) /[//]/; const pr_title = 1;",
+    ]) {
+      expect(
+        tokensOf(snippet),
+        `expected pr_ to fire after the control paren in: ${snippet}`,
+      ).toContain("pr_");
+    }
+  });
+
+  it("catches the hidden token for with / switch / catch headers too", () => {
+    // Not in QA's original four, but they are the same shape and the keyword
+    // set that fixes the four would be wrong if it omitted them.
+    for (const snippet of [
+      "with (o) /[//]/; const pr_title = 1;",
+      "switch (x) /[//]/; const pr_title = 1;",
+      "try { f(); } catch (e) /[//]/; const pr_title = 1;",
+    ]) {
+      expect(
+        tokensOf(snippet),
+        `expected pr_ to fire after the control paren in: ${snippet}`,
+      ).toContain("pr_");
+    }
+  });
+
+  it("still detects through NESTED parens inside the control condition", () => {
+    // The backward depth count must land on the header `(` owned by the control
+    // keyword, not on an inner grouping or call paren.
+    for (const [snippet, token] of [
+      ["if ((x)) /[//]/; const pr_title = 1;", "pr_"],
+      ["if (f(1)) /[//]/; const pr_title = 1;", "pr_"],
+      ["if (a && (b || c)) /[//]/; const mr_state = 1;", "mr_"],
+      ["for (let i = 0; i < n; i++) /[//]/; const mr_state = 1;", "mr_"],
+    ] as const) {
+      expect(
+        tokensOf(snippet),
+        `expected ${token} to fire after the control paren in: ${snippet}`,
+      ).toContain(token);
+    }
+  });
+
+  it("does NOT treat a value-expression `)` as a regex start", () => {
+    // THE ANTI-VACUITY CASE. A naive "any `)` allows a regex" fix passes the
+    // four cases above and re-opens a false positive here: a `/` that DIVIDES a
+    // value just closed by `)` would be read as a regex start, and the regex
+    // would then run to the next unescaped `/` -- swallowing real code and
+    // re-exposing tokens that sit behind what should be a comment.
+    //
+    // NOTE the shape: `(a / b)` is NOT enough to catch that mutation, because
+    // its `/` follows the identifier `b`, so the `)` branch is never consulted.
+    // The `/` has to be the one DIRECTLY after the `)`, which is what these
+    // four are. Measured: with `if (c === ")") return true`, the first line
+    // reports `pr_` from behind a genuine comment, and this test is the only
+    // thing in the suite that sees it.
+    expect(scanOne("const x = (a + b) / c; // pr_hidden")).toEqual([]);
+    expect(scanOne("const x = f(a) / c; // pr_hidden")).toEqual([]);
+    expect(scanOne("const x = (a) / c; // pr_hidden")).toEqual([]);
+    // And the token must still be visible when it is real code, not a comment.
+    expect(
+      scanOne("const x = (a + b) / c; const mr_state = 1;").map((v) => v.token),
+    ).toContain("mr_");
+    // Grouping and call parens keep dividing (both pinned green at c75a335).
+    expect(
+      scanOne("const q = (a / b); const mr_state = 1;").map((v) => v.token),
+    ).toContain("mr_");
+    expect(scanOne("const q = (a / b); // pr_hidden")).toEqual([]);
+    expect(scanOne("const q = f(a / b); // pr_hidden")).toEqual([]);
+    // And the plain chained-division case B13 pinned stays a division.
+    expect(scanOne("const r = a / b / c; // pr_hidden")).toEqual([]);
+  });
+
+  it("does not regress the shapes B13 already closed", () => {
+    // The pre-existing fix must remain in force; a `)`-handling change that
+    // broke these would be a straight trade, not a fix.
+    for (const snippet of [
+      "switch (x) {} /[//]/; const pr_title = 1;",
+      "do /[//]/; while (x); const pr_title = 1;",
+      "const f = () => /[//]/; const pr_title = 1;",
+      "if (x) { /[//]/; } const pr_title = 1;",
+      "const re = /[//]/; const pr_title = 1;",
+    ]) {
+      expect(
+        tokensOf(snippet),
+        `expected pr_ to still fire in: ${snippet}`,
+      ).toContain("pr_");
+    }
+  });
+
+  it("keeps a real // comment after a control-statement body a comment", () => {
+    // The fix must not make the scanner treat EVERY `/` after `)` as a regex
+    // start: a genuine line comment still has to strip.
+    expect(scanOne("if (x) f(); // pr_hidden")).toEqual([]);
+    expect(scanOne("if (x) /[//]/; // pr_hidden")).toEqual([]);
+    expect(scanOne("while (x) g(); // pr_hidden")).toEqual([]);
   });
 });

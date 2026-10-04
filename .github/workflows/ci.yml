@@ -13,8 +13,11 @@ concurrency:
 
 jobs:
   verify:
-    name: lint, typecheck, test, build
+    name: format, lint, typecheck, test, build
     runs-on: ubuntu-latest
+    # Its own budget, back at the original 15: the Chromium download and the
+    # apt-get dependency install that forced the raise to 25 now live in the
+    # separate `e2e` job, which runs concurrently rather than in series.
     timeout-minutes: 15
     env:
       # Vitest/Next must behave as they do on a headless runner, and no TTY may be
@@ -65,3 +68,97 @@ jobs:
 
       - name: Build
         run: bun run build
+
+  # A separate job, not more steps in `verify`, so a red e2e is its own named
+  # check in the PR checks list and can be told apart from a red unit test
+  # without opening a log. There is deliberately no dependency edge on
+  # `verify`: that would serialise the two jobs and reintroduce exactly the
+  # coupling this split exists to remove. Both jobs run concurrently on their
+  # own runners and report independent status and independent timing.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    # Larger than `verify`'s 15 because this job carries the apt-get system
+    # dependency install and the ~170 MB Chromium download on top of install
+    # and build.
+    timeout-minutes: 25
+    env:
+      # GitHub Actions already exports `CI=true` into every step, so this
+      # declaration is explicit documentation and robustness, not a behavioural
+      # requirement: removing it would not change what Playwright sees here.
+      # It is worth stating anyway, because playwright.config.ts does read
+      # `process.env.CI` — lines 12-14 and 32 — to select retries=2, forbidOnly,
+      # the line reporter and reuseExistingServer:false. Declaring the value we
+      # depend on at the job level means the intent survives a runner-default
+      # change or a future job that opts out, and it keeps the e2e mode pinned
+      # to the one B16 proved on a real runner.
+      CI: true
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      # Same guard as `verify`, for the same reason: bun 1.3.x
+      # `--frozen-lockfile` exits 0 when bun.lock is absent entirely and
+      # silently resolves from the registry instead. Without this step here, a
+      # PR that deleted the lockfile would still get a green `e2e`.
+      - name: Verify lockfile is committed
+        run: |
+          if [ ! -f bun.lock ]; then
+            echo "::error::bun.lock is missing from the repository. Run 'bun install' and commit the lockfile."
+            exit 1
+          fi
+
+      # Dependencies are re-installed here rather than carried over from
+      # `verify` as a build artifact: the round-trip would add a second large
+      # transfer and a new failure mode to the critical path, and buys little
+      # against the Chromium download.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Build is re-run here rather than handed over as an artifact, because
+      # playwright.config.ts webServer runs `bun run start` (next start), which
+      # serves the .next/ output. The Build step inside `verify` runs
+      # concurrently and produces nothing this job can consume. This is also why
+      # the e2e steps below must come AFTER this Build step, never before it.
+      - name: Build
+        run: bun run build
+
+      # ── e2e ──────────────────────────────────────────────────────────────────
+      # Everything below runs the Playwright suite for real, in this job, so
+      # when it goes red the PR checks list says e2e failed rather than naming
+      # six other gates that passed.
+      #
+      # `--with-deps` is deliberate and NOT optional. A GitHub runner has no
+      # Chromium and none of the shared libraries Chromium dlopen()s at startup
+      # (libnss3, libatk-1.0, libgbm, libasound2, the X11/i18n/gtk family). The
+      # plain `playwright install chromium` only downloads the browser; the first
+      # launch then dies with "error while loading shared libraries". On
+      # ubuntu-latest the deps install is the single most common reason this
+      # step fails, so it is provisioned up front rather than discovered.
+      # `playwright install --with-deps` == install browser + `playwright
+      # install-deps`, i.e. an apt-get run of Playwright's own pinned package
+      # list; it is not the same thing as Playwright's docker image.
+      - name: Install Chromium and its system dependencies
+        run: bunx playwright install --with-deps chromium
+
+      # `bun run e2e` = `playwright test`. playwright.config.ts already pins
+      # everything a headless runner needs, so this is a plain invocation:
+      #   - CI:true is set at job level, so retries=2, forbidOnly, line reporter
+      #     and reuseExistingServer:false all take effect.
+      #   - webServer.command is `bun run start` (next start), which serves the
+      #     .next/ output produced by the Build step above — hence e2e must run
+      #     AFTER build, never before it. Playwright polls http://127.0.0.1:3000
+      #     and only starts the server itself because reuseExistingServer is
+      #     false under CI.
+      #   - The chromium project uses the bundled channel-less Chrome build and
+      #     runs headless by default, identical to local behaviour.
+      # No secrets: the specs are local-only and the server needs no database or
+      # credential provider.
+      - name: E2E (Playwright)
+        run: bun run e2e
