@@ -13,40 +13,59 @@ Milestone **M0 — Foundation**. This branch contains the project scaffold only.
 | Styling   | Tailwind CSS + shadcn/ui                   |
 | Testing   | Vitest + Testing Library                   |
 | Quality   | ESLint (`next/core-web-vitals`) + Prettier |
+| Packages  | bun                                        |
 
 ## Requirements
 
-- Node.js 20 or newer
-- npm 10 or newer
+- bun 1.3.10 (see `packageManager` in `package.json`)
 
 ## Getting started
 
 ```bash
-npm install     # install dependencies
-npm run dev     # http://localhost:3000
+bun install     # install dependencies
+bun run dev     # http://localhost:3000
 ```
 
 ## Scripts
 
 | Script                 | Purpose                         |
 | ---------------------- | ------------------------------- |
-| `npm run dev`          | Start the dev server            |
-| `npm run build`        | Production build                |
-| `npm start`            | Serve the production build      |
-| `npm run lint`         | ESLint (`next/core-web-vitals`) |
-| `npm run typecheck`    | `tsc --noEmit`                  |
-| `npm test`             | Vitest, single run              |
-| `npm run test:watch`   | Vitest in watch mode            |
-| `npm run format`       | Prettier write                  |
-| `npm run format:check` | Prettier check (no writes)      |
+| `bun run dev`          | Start the dev server            |
+| `bun run build`        | Production build                |
+| `bun run start`        | Serve the production build      |
+| `bun run lint`         | ESLint (`next/core-web-vitals`) |
+| `bun run typecheck`    | `tsc --noEmit`                  |
+| `bun run test`         | Vitest, single run              |
+| `bun run test:watch`   | Vitest in watch mode            |
+| `bun run format`       | Prettier write                  |
+| `bun run format:check` | Prettier check (no writes)      |
 
 ## Verification
 
 The full gate used before every handoff:
 
 ```bash
-npm ci && npm run lint && npm run typecheck && npm test && npm run build
+bun install --frozen-lockfile && bun run lint && bun run typecheck && bun run test && bun run build
 ```
+
+## CI
+
+`.github/workflows/ci.yml` runs on every pull request against `main` and every push to `main`.
+
+CI runs exactly these commands, in this order, each as its own step so a failure is attributable:
+
+```bash
+bun install --frozen-lockfile
+bun run lint
+bun run typecheck
+bun run test
+bun run build
+```
+
+**Local green == CI green.** If all five commands pass locally, CI passes; if CI is red, one of
+those five failed locally too. `--frozen-lockfile` means CI fails loudly on a stale or missing
+`bun.lock` rather than silently resolving new versions — run `bun install` and commit the updated
+lockfile before pushing. The workflow needs no repository secrets, so it also runs on fork PRs.
 
 ## Layout
 
