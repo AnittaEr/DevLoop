@@ -26,6 +26,12 @@
  * the error when it is unset; no value is ever read into this module.
  */
 
+import { sql } from "drizzle-orm";
+import type {
+  AnyPgInsert,
+  PgInsertOnConflictDoUpdateConfig,
+} from "drizzle-orm/pg-core/query-builders/insert";
+
 import type { CanonicalEvent } from "@/core/events/canonical-event";
 import { createCredentialProvider } from "@/core/credentials/factory";
 import type { EnvReader } from "@/core/credentials/env-provider";
@@ -296,12 +302,70 @@ export async function fetchCanonicalEvents(
  * client returned by `getDb()` satisfies it, which `bun run typecheck` pins:
  * `getDb()` is used here as the fallback target, so if the two ever diverge the
  * build turns red rather than the insert failing at run time.
+ *
+ * `onConflictDoUpdate` is part of the seam because the upsert below is not an
+ * optional nicety: without it this type would describe a plain insert, and a
+ * test fake could accept rows while production raised 23505. `set` is typed
+ * against the real Drizzle config, so the enumerated update column list is
+ * checked at compile time against the schema rather than by inspection.
  */
 export interface CanonicalEventWriter {
   insert(table: typeof canonicalEvents): {
-    values(rows: NewCanonicalEventRow[]): PromiseLike<unknown>;
+    values(rows: NewCanonicalEventRow[]): CanonicalEventUpsertBuilder;
   };
 }
+
+/**
+ * The chained half of the insert a persist performs, up to and including the
+ * conflict clause.
+ *
+ * Named separately so {@link CanonicalEventWriter} stays a one-method seam a
+ * fake can implement, and so a fake must supply `onConflictDoUpdate` rather than
+ * silently dropping the upsert and recording rows that production would reject.
+ *
+ * The config is Drizzle's OWN `PgInsertOnConflictDoUpdateConfig`, not an
+ * invented structural copy: `set` legitimately holds either a bound value or an
+ * `excluded.<column>` SQL fragment (an update has no access to the row object),
+ * and `target` holds table columns. Re-declaring those as plain `string`/`Date`
+ * here is what makes a hand-written seam drift from what `getDb()` actually
+ * accepts — and `bun run typecheck` pins that `getDb()` still satisfies this
+ * interface, so the two cannot diverge silently.
+ */
+export interface CanonicalEventUpsertBuilder {
+  onConflictDoUpdate(
+    config: PgInsertOnConflictDoUpdateConfig<AnyPgInsert>,
+  ): PromiseLike<unknown>;
+}
+
+/**
+ * The columns an upsert overwrites on a natural-key conflict.
+ *
+ * EVERY provider-supplied or derived field, enumerated explicitly rather than
+ * derived, for two reasons.
+ *
+ * 1. `id`, `source` and `externalId` are the natural key and MUST NOT appear
+ *    here. `id` in particular is the primary key: rewriting it would orphan
+ *    anything that references the row, and the whole point of the upsert is that
+ *    the existing row is the same entity, updated — not replaced by a new one.
+ * 2. A `set` that is derived from the row (e.g. spreading every column) would
+ *    silently re-assign `id` the moment someone adds a column to the schema,
+ *    which is failure (2) arriving invisibly. Enumerating the list means a new
+ *    column is NOT written until it is deliberately added here, and the type
+ *    error names exactly what was missed.
+ *
+ * `type`, `title`, `url`, `author`, `metadata` and `occurredAt` are the mutable
+ * description of the event: a source may edit a title, correct a timestamp, or
+ * drop an author, and a re-sync must be able to converge on the source's current
+ * view rather than freezing the first sighting forever.
+ */
+const UPSERT_UPDATED_COLUMNS = {
+  type: sql`excluded.type`,
+  title: sql`excluded.title`,
+  url: sql`excluded.url`,
+  author: sql`excluded.author`,
+  metadata: sql`excluded.metadata`,
+  occurredAt: sql`excluded.occurred_at`,
+} as const;
 
 /**
  * Persist canonical events to the `canonical_events` table.
@@ -310,6 +374,23 @@ export interface CanonicalEventWriter {
  * row shape is `db/canonical-event-mapper.ts`'s job, which is the type↔storage
  * boundary and knows every column. No column is named here, so this module
  * cannot drift from the schema or invent a field.
+ *
+ * IDEMPOTENT. This is an UPSERT on the natural key `UNIQUE(source, external_id)`
+ * — `canonical_events_source_external_id_key`, the constraint `db/schema.ts`
+ * documents as existing precisely so this upsert cannot silently double-write.
+ * Re-persisting the same event UPDATES the existing row instead of raising
+ * SQLSTATE 23505, so syncing the same repository twice is a success, not a
+ * failure. This is the single most likely caller behaviour for a sync pipeline.
+ *
+ * WHY THE ARBITER IS THE TWO-COLUMN CONSTRAINT AND NOT `id`. The natural key
+ * is `UNIQUE(source, external_id)`, NOT the primary key `id`, so targeting `id`
+ * would leave the duplicate-key failure in place for every real repeat sync
+ * while looking like an idempotency fix. `id` is derived from `source` +
+ * `externalId` today, so in practice a repeat sync collides on BOTH indexes;
+ * Postgres resolves the conflict against the arbiter named here, and
+ * `db/__tests__/canonical-events-persistence.test.ts` proves the behaviour by
+ * execution in both directions: a changed title updates one row, and the SAME
+ * `externalId` under a DIFFERENT `source` yields two rows.
  *
  * An empty list is a no-op rather than a query: a source that has nothing new
  * must not cost a round trip, and Drizzle rejects an empty `values()`.
@@ -339,7 +420,13 @@ export async function persistCanonicalEvents(
   // default is evaluated on every call, including when a writer is supplied, so
   // `writer = getDb()` would demand DATABASE_URL from a caller that never
   // touches the database at all.
-  await (writer ?? getDb()).insert(canonicalEvents).values(rows);
+  await (writer ?? getDb())
+    .insert(canonicalEvents)
+    .values(rows)
+    .onConflictDoUpdate({
+      target: [canonicalEvents.source, canonicalEvents.externalId],
+      set: UPSERT_UPDATED_COLUMNS,
+    });
   return rows.length;
 }
 
