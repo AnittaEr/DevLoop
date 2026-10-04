@@ -22,9 +22,20 @@ import {
   type TokenProfile,
 } from "@/core/credentials/provider";
 
+/**
+ * The name of the environment variable an operator sets, i.e. the one
+ * `.env.example` documents. NOT `GITHUB_TOKEN`, which is what the plugin's
+ * test fixture used to say: a test-only name that the fixture never reads (it
+ * injects its own reader) and that no operator was ever told about. Carrying it
+ * here produced `token_absent` at runtime for anyone who had followed the
+ * documentation exactly, with every gate green.
+ *
+ * `src/plugins/github/__tests__/token-profile.test.ts` pins this against
+ * `.env.example` itself, so the two cannot drift apart again silently.
+ */
 const PROFILE = {
   prefix: "github_pat_",
-  envVar: "GITHUB_TOKEN",
+  envVar: "GITHUB_FINE_GRAINED_PAT",
 } as const satisfies TokenProfile;
 
 /**
