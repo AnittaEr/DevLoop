@@ -314,5 +314,16 @@ jobs:
       # THE step this job exists for. Deliberately not `bun run test`: that
       # config does not collect `db/**`, and adding the directory to it would
       # make every developer without a database see a red default suite.
+      #
+      # It IS, however, now the only place the upsert proof
+      # (`src/app/sources/__tests__/persist-canonical-events-upsert.test.ts`)
+      # actually executes. That file lives under `src/**`, so the default suite
+      # collects it — but this job is the one with a database, and the `verify`
+      # job has none, so its `describeWithDb` collapsed to `describe.skip` there
+      # and every assertion was reported skipped inside a green run.
+      # `vitest.db.config.ts` names the file explicitly for that reason. Verify a
+      # change to it with a deliberate RED: break one assertion, confirm this job
+      # goes red, restore, confirm green. A green `db round trip` on its own
+      # cannot distinguish "collected and passing" from "collected and skipped".
       - name: DB round-trip tests
         run: bun run test:db

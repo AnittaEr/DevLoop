@@ -4,15 +4,15 @@ Three independent runners. None replaces the others.
 
 ## Commands
 
-| Command               | What it runs                                                                                  |
-| --------------------- | --------------------------------------------------------------------------------------------- |
-| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`.        |
-| `bun run test:db`     | Vitest — the DB round-trip suite under `db/**/__tests__/`. Needs a real Postgres (see below). |
-| `bun run lint`        | ESLint over the repo.                                                                         |
-| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                                  |
-| `bun run build`       | `next build` — production build.                                                              |
-| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium.                                |
-| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.                                      |
+| Command               | What it runs                                                                           |
+| --------------------- | -------------------------------------------------------------------------------------- |
+| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
+| `bun run test:db`     | Vitest — the DB round-trip suite. Needs a real Postgres (see below).                   |
+| `bun run lint`        | ESLint over the repo.                                                                  |
+| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
+| `bun run build`       | `next build` — production build.                                                       |
+| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
+| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.                               |
 
 ## Database round-trip tests
 
@@ -27,8 +27,22 @@ default one. The split is deliberate:
 
 - `vitest.config.ts` collects `["src/**/*.test.{ts,tsx}", "e2e/**/*.test.{ts,tsx}"]`.
   It does **not** collect `db/**`, so `bun run test` never runs the round trip.
-- `vitest.db.config.ts` collects `["db/**/__tests__/**/*.test.ts"]` and is
-  reachable only through `bun run test:db`.
+- `vitest.db.config.ts` collects `["db/**/__tests__/**/*.test.ts"]` plus one
+  explicitly named file, `src/app/sources/__tests__/persist-canonical-events-upsert.test.ts`,
+  and is reachable only through `bun run test:db`.
+
+**Why that one file is named rather than globbed.** `src/**` is collected by the
+default suite, which runs in the `verify` CI job — a job with no database. The
+upsert proof gates its real-database block on `DATABASE_URL` and skips without
+it, so on its own it was collected in that job and reported **skipped**, inside
+a green run. A skipped suite is indistinguishable from a passing one, which is
+the failure this naming prevents. A `src/app/sources/__tests__/**` glob was
+measured and rejected: it also drags in `composition-root.test.ts`, which needs no
+database and deletes `process.env.DATABASE_URL` inside one of its tests.
+
+The trade is stated rather than hidden: the `include` list is now the registry of
+db-backed tests living outside `db/**`, and **a new db-backed test under `src/**`
+must be added to it by hand\*\* or it will ship ungated exactly as this one did.
 
 **The DB suite is not skip-safe, on purpose.** `vitest.db.setup.ts` throws when
 `DATABASE_URL` is unset, so running `bun run test:db` with no database is a hard

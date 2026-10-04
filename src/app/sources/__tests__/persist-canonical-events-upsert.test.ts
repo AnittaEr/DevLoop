@@ -13,12 +13,23 @@
  *
  * WHY IT LIVES IN `src/**` AND NOT IN `db/__tests__/**`. `persistCanonicalEvents`
  * is the composition root's function and its module imports through the `@/`
- * alias, which `vitest.db.config.ts` does not define (that config is DO NOT
- * TOUCH). The repo's existing answer to "needs a real database" is this one:
+ * alias. `src/**` is the only place the repo's default suite collects, so the
+ * repo's existing answer to "needs a real database" is this one:
  * `src/lib/db/__tests__/client.test.ts` gates a real-database describe block on
  * DATABASE_URL and skips otherwise. This file follows that same convention, so
  * `bun run test` executes it whenever DATABASE_URL is set and skips it cleanly
  * when it is not — the same shape, and the same reason, as the existing suite.
+ *
+ * THAT CONVENTION ALONE LEFT THIS FILE UNGATED, and B35 fixed it. `bun run test`
+ * is the only job that collects `src/**`, and the `verify` job that runs it has
+ * NO database — so `describeWithDb` collapsed to `describe.skip` there and all
+ * the tests below were reported SKIPPED in a green CI run, which is
+ * indistinguishable from having passed. `vitest.db.config.ts` now also collects
+ * this file by name, so `bun run test:db` — which the `db round trip` job runs
+ * with DATABASE_URL and applied migrations — actually executes it. The gate
+ * below stays: it is what keeps the default suite green for a developer with no
+ * database, and the two are independent (one decides collection, the other
+ * decides whether a collected file asserts or skips).
  *
  * NOT VACUOUS BY CONSTRUCTION. The first test is a NEGATIVE CONTROL: a plain
  * insert of the same natural key must still fail with 23505. If that ever stops

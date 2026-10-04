@@ -1,5 +1,24 @@
 /// <reference types="vitest" />
+import path from "node:path";
 import { defineConfig } from "vitest/config";
+
+/**
+ * WHY `@` IS RESOLVED HERE. This config previously collected only `db/**`,
+ * whose modules reach everything else by relative path, so it needed no alias.
+ * `src/app/sources/__tests__/persist-canonical-events-upsert.test.ts` reaches
+ * its own subject through `@/core/...` and `@/lib/db/client`, so without the
+ * alias below the file fails to resolve at import time — i.e. it would be
+ * collected and then ERROR, which is not better than not collecting it. The
+ * alias is declared identically to `vitest.config.ts` (`@` -> `./src`), so the
+ * same specifier resolves to the same module in both suites.
+ *
+ * WHY THE SUITE STILL GATES ON `DATABASE_URL` INTERNALLY. The include below is
+ * what makes this file RUN in the `db round trip` job; the `describeWithDb` in
+ * the file is a second, independent guard for developers who run the DEFAULT
+ * `bun run test` with no database. Both are needed and neither subsumes the
+ * other: this include decides whether the file is collected at all, the
+ * internal gate decides whether it asserts or skips once collected.
+ */
 
 /**
  * Config for the DB-backed integration suite.
@@ -23,10 +42,39 @@ export default defineConfig({
     environment: "node",
     globals: true,
     setupFiles: ["./vitest.db.setup.ts"],
-    include: ["db/**/__tests__/**/*.test.ts"],
+    // The upsert proof is collected HERE, not only by the default suite,
+    // because the default suite runs in the `verify` job which has NO database —
+    // so the file's `describeWithDb` collapsed to `describe.skip` there and all
+    // 7 assertions were reported as skipped. A skipped suite is indistinguishable
+    // from a passing one in a green CI run, which is the self-certifying-green
+    // defect this entry exists to close.
+    //
+    // NAMED FILE, NOT A `src/**` GLOB — deliberately. Measured on this branch: a
+    // `src/app/sources/__tests__/**` glob also collects
+    // `composition-root.test.ts`, which needs NO database and DELETES
+    // `process.env.DATABASE_URL` inside one of its tests to prove the lazy client
+    // is not constructed eagerly. Running that file inside a suite whose every
+    // other file depends on that variable is a hazard in exchange for no added
+    // coverage, so the db job keeps exactly the files that need a real database.
+    //
+    // THE COST, STATED PLAINLY: this list is now the single registry of db-backed
+    // tests that live outside `db/**`, and it is a list a human must extend. A
+    // future db-backed test under `src/**` that is not named here reproduces this
+    // exact defect — collected by `vitest.config.ts`, skipped in `verify`, never
+    // executed anywhere. That is the trade this entry makes: an explicit registry
+    // that cannot silently expand, instead of a glob that silently widens the job.
+    include: [
+      "db/**/__tests__/**/*.test.ts",
+      "src/app/sources/__tests__/persist-canonical-events-upsert.test.ts",
+    ],
     // Serial: the suite inserts into one shared local table.
     fileParallelism: false,
     testTimeout: 20_000,
     hookTimeout: 20_000,
+  },
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
   },
 });
