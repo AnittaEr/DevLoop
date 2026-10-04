@@ -66,6 +66,44 @@ jobs:
       - name: Test
         run: bun run test
 
+      # FINDING 3 (B27) — the migration-drift control.
+      #
+      # WHY THIS STEP EXISTS. `canonical_events.type` is constrained by a CHECK
+      # whose allowed values are generated from `CANONICAL_EVENT_TYPES`
+      # (db/schema.ts). "Generated" is only true AT GENERATION TIME: the
+      # committed migration inlines static SQL literals
+      # (db/migrations/0001_parched_talon.sql), so adding a member to
+      # CANONICAL_EVENT_TYPES without running `bun run db:generate` ships a
+      # database whose CHECK rejects the new value at insert time.
+      #
+      # WHY NOTHING ELSE CAUGHT IT. `bun run test` collects `src/**` only
+      # (vitest.config.ts:17), so the db suite is invisible to it; that suite
+      # needs a live Postgres, which this job does not have. Lint and typecheck
+      # cannot see it either — the drift exists only in a generated .sql file.
+      # So until this step, the schema comment's claim that "the constraint
+      # cannot silently drift from the TypeScript union" was an UNENFORCED
+      # assertion that could rot silently.
+      #
+      # `db:generate` is a purely offline operation (drizzle.config.ts reads
+      # schema files and diffs them), so this needs no database service. It runs
+      # AFTER format:check because drizzle-kit rewrites files; this step must
+      # REPORTS a dirty tree, never commit it.
+      - name: Database migrations in sync
+        run: |
+          bun run db:generate
+          # Any diff here means db/schema.ts and db/migrations disagree. The
+          # generated files are NOT restored: leaving them visible makes the
+          # failure debuggable from the log, and the job is ephemeral.
+          if ! git diff --exit-code -- db/migrations; then
+            echo "::error::db/migrations is out of sync with db/schema.ts. Run 'bun run db:generate' and commit the result. A schema change that was not regenerated ships a CHECK constraint whose value list no longer matches CANONICAL_EVENT_TYPES."
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- db/migrations)" ]; then
+            echo "::error::bun run db:generate created NEW untracked files under db/migrations (see the list below). Commit them."
+            git status --porcelain -- db/migrations
+            exit 1
+          fi
+
       - name: Build
         run: bun run build
 

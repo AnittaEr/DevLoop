@@ -1,0 +1,1 @@
+ALTER TABLE "canonical_events" ADD CONSTRAINT "canonical_events_metadata_is_object_check" CHECK (jsonb_typeof("metadata") = 'object');
