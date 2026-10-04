@@ -8,6 +8,8 @@
  * `src/core/credentials/fakes.ts`.
  */
 
+import type { TokenProfile } from "@/core/credentials/provider";
+
 import type {
   HttpTransport,
   TransportRequest,
@@ -17,8 +19,32 @@ import type {
 /** The repository the fixtures describe. */
 export const FIXTURE_REPOSITORY = "acme/widgets";
 
-/** A synthetic, obviously-not-real credential. */
-export const FIXTURE_TOKEN = "github_pat_-not-a-real-fixture-token-1";
+/**
+ * The GitHub token profile, declared HERE rather than in `src/core/**`.
+ *
+ * B19 (`40138c2`) made `profile` a REQUIRED option on the fake credential
+ * provider and removed core's hard-coded GitHub prefix and env-var name, so
+ * every consumer must now state which provider's token shape it is validating
+ * against. The vendor half of that knowledge belongs to the plugin: a default
+ * inside core could only be GitHub's prefix (re-opening the leak B19 closed)
+ * or a neutral one, which would break the real assertion that the token this
+ * plugin puts on the wire starts with `github_pat_`
+ * (`github-plugin.test.ts:154`).
+ *
+ * `envVar` is a NAME, never a value, and is never read here -- these tests
+ * construct no real credential and read no environment.
+ */
+export const GITHUB_PROFILE: TokenProfile = {
+  prefix: "github_pat_",
+  envVar: "GITHUB_TOKEN",
+};
+
+/**
+ * A synthetic, obviously-not-real credential, built from the profile so the
+ * two cannot drift apart: `fakeTokensFor` in `src/core/credentials/fakes.ts`
+ * appends its own hyphenated fixture material to `GITHUB_PROFILE.prefix`.
+ */
+export const FIXTURE_TOKEN = `${GITHUB_PROFILE.prefix}-not-a-real-fixture-token-1`;
 
 /** One canned HTTP response, keyed by the `page` query parameter. */
 export interface FixtureResponse {

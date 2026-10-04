@@ -40,6 +40,7 @@ import type { NativeIssueItem } from "../native-item";
 import type { HttpTransport, TransportResponse } from "../transport";
 import {
   FIXTURE_REPOSITORY,
+  GITHUB_PROFILE,
   FakeHttpTransport,
   fullPage,
   pageBody,
@@ -57,7 +58,7 @@ function pluginWith(
   const transport = new FakeHttpTransport({ byPage });
   const plugin = new GitHubSourcePlugin({
     transport,
-    credentials: createFakeCredentialProvider(),
+    credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
     repository: FIXTURE_REPOSITORY,
     pageSize,
   });
@@ -335,12 +336,12 @@ describe("GitHubSourcePlugin.mapToCanonicalEvents", () => {
     const transport = new FakeHttpTransport({ byPage: {} });
     const here = new GitHubSourcePlugin({
       transport,
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
     const there = new GitHubSourcePlugin({
       transport,
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: "other/place",
     });
     const raw = [fixtureIssue() as unknown as NativeIssueItem];
@@ -465,7 +466,7 @@ describe("GitHubSourcePlugin error handling", () => {
       transport: rejectingTransport(
         new Error(`request failed for token ${secret}`),
       ),
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -916,7 +917,7 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
       transport: syncThrowingTransport(
         new Error(`boom with token ${SYNTHETIC_SECRET}`),
       ),
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -1012,7 +1013,9 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
         () =>
           new GitHubSourcePlugin({
             transport: new FakeHttpTransport({ byPage: {} }),
-            credentials: createFakeCredentialProvider(),
+            credentials: createFakeCredentialProvider({
+              profile: GITHUB_PROFILE,
+            }),
             repository: FIXTURE_REPOSITORY,
             pageSize,
           }),
@@ -1021,7 +1024,9 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
       try {
         new GitHubSourcePlugin({
           transport: new FakeHttpTransport({ byPage: {} }),
-          credentials: createFakeCredentialProvider(),
+          credentials: createFakeCredentialProvider({
+            profile: GITHUB_PROFILE,
+          }),
           repository: FIXTURE_REPOSITORY,
           pageSize,
         });
@@ -1037,7 +1042,9 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
         () =>
           new GitHubSourcePlugin({
             transport: new FakeHttpTransport({ byPage: {} }),
-            credentials: createFakeCredentialProvider(),
+            credentials: createFakeCredentialProvider({
+              profile: GITHUB_PROFILE,
+            }),
             repository: FIXTURE_REPOSITORY,
             pageSize,
           }),
@@ -1052,7 +1059,7 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
     // happened.
     const plugin = new GitHubSourcePlugin({
       transport: new FakeHttpTransport({ byPage: {} }),
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -1101,7 +1108,7 @@ describe("GitHubSourcePlugin: no network in tests", () => {
     });
     const plugin = new GitHubSourcePlugin({
       transport,
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
