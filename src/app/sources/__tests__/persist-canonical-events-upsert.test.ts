@@ -59,11 +59,33 @@ const EVENT: CanonicalEvent = {
   metadata: { note: "first" },
 };
 
-/** A second event sharing `externalId` but under a different source. */
+/**
+ * A second event sharing `externalId` but under a DIFFERENT source.
+ *
+ * `id` is deliberately DISTINCT here. See the two arbiter tests below for why a
+ * shared `id` is not the discriminator it first appears to be: sharing `id`
+ * makes the CORRECT arbiter raise 23505 on the primary key, so that shape
+ * cannot carry a two-row assertion at all.
+ */
 const OTHER_SOURCE_EVENT: CanonicalEvent = {
   ...EVENT,
   id: "evt_t16_upsert_b",
   source: "another-source",
+};
+
+/**
+ * A second event colliding on the PRIMARY KEY but NOT on the natural key: same
+ * `id`, different `source` AND different `externalId`.
+ *
+ * This is the only shape that genuinely discriminates the two arbiters, because
+ * it is the only one where the two indexes disagree about whether a conflict
+ * exists. `UNIQUE(source, external_id)` sees no duplicate here; `id` does.
+ */
+const PRIMARY_KEY_COLLIDING_EVENT: CanonicalEvent = {
+  ...EVENT,
+  source: "another-source",
+  externalId: "ext-t16-upsert-other-key",
+  title: "colliding on the primary key only",
 };
 
 afterAll(async () => {
@@ -179,11 +201,15 @@ describeWithDb(
     });
 
     it("keeps TWO rows for the same externalId under a DIFFERENT source", async () => {
-      // THE CASE THAT DISTINGUISHES THE ARBITER. `id` differs here on purpose: if
-      // the conflict target were the primary key, this second persist would be
-      // absorbed as an update of the first row and the table would hold ONE row.
-      // With the target on (source, external_id) these are two genuinely distinct
-      // entities and both must land.
+      // The natural key is the pair, so the same `externalId` under a different
+      // `source` is a DIFFERENT entity and both must survive a re-sync.
+      //
+      // This asserts the two-column arbiter's real purpose — that the pair, not
+      // either column alone, is the key — and it is NOT by itself proof of which
+      // constraint is targeted: with distinct `id`s there is no collision on
+      // EITHER index, so a plain insert would also produce two rows here. The
+      // next test is the one that discriminates, and this one is the regression
+      // guard that keeps the pair semantics intact if that test is ever removed.
       await persistCanonicalEvents([EVENT]);
       await persistCanonicalEvents([OTHER_SOURCE_EVENT]);
 
@@ -196,6 +222,50 @@ describeWithDb(
         "another-source",
         "fixture-source",
       ]);
+    });
+
+    it("TARGETS THE NATURAL KEY: a primary-key-only collision raises 23505 instead of silently overwriting", async () => {
+      // THIS IS THE TEST THAT PROVES THE ARBITER, AND IT IS THE OPPOSITE OF
+      // WHAT QA ROUND 1 ASKED FOR. Round 1 proposed giving the different-source
+      // event the SAME `id` so that a primary-key target would collapse it to
+      // one row. That shape cannot work: with a shared `id` the CORRECT arbiter
+      // also fails, because `ON CONFLICT (source, external_id)` only absorbs a
+      // collision on the two columns it names and a primary-key collision is
+      // invisible to it. Measured on real Postgres at this head, both arbiters
+      // behave identically for that shape, so it discriminates nothing.
+      //
+      // The discriminating shape is the one where the two indexes DISAGREE: a
+      // row colliding on `id` but NOT on (source, external_id). The correct
+      // arbiter sees no conflict on its own key and therefore lets the primary
+      // key raise 23505 — a loud, correct failure. A primary-key arbiter instead
+      // treats it as an update and SILENTLY OVERWRITES the unrelated row, which
+      // is data loss dressed as an idempotency fix.
+      //
+      // Asserting the THROW is the assertion: it is only reachable with the
+      // natural key as the arbiter. Measured counterpart, same data, arbiter
+      // switched to [canonicalEvents.id]: no error, one row, title silently
+      // replaced by "colliding on the primary key only".
+      await persistCanonicalEvents([EVENT]);
+
+      let caught: unknown;
+      try {
+        await persistCanonicalEvents([PRIMARY_KEY_COLLIDING_EVENT]);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({
+        cause: { code: "23505", constraint_name: "canonical_events_pkey" },
+      });
+
+      // And the colliding event left NO trace: the original row is untouched,
+      // not merged with or overwritten by the row that could not be inserted.
+      const rows = await getDb()
+        .select()
+        .from(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, EVENT.externalId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.title).toBe(EVENT.title);
     });
 
     it("absorbs a batch that mixes an existing event with a new one", async () => {

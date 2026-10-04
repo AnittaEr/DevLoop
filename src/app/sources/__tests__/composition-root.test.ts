@@ -429,7 +429,8 @@ describe("composition root: fetched events persist through the Drizzle client", 
     // THE CARD'S CENTRAL CLAIM. A repeated sync of the same source data is the
     // most likely caller behaviour there is, and it must SUCCEED. Before the
     // upsert the second persist raised SQLSTATE 23505 (proven by execution
-    // against real Postgres in db/__tests__/canonical-events-persistence.test.ts).
+    // against real Postgres in
+    // src/app/sources/__tests__/persist-canonical-events-upsert.test.ts).
     const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
     const writer = new RecordingWriter();
 
