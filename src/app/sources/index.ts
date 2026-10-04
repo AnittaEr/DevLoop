@@ -289,9 +289,10 @@ export async function syncSource(options: SyncOptions): Promise<SyncResult> {
     options.source ?? SOURCE_NAME,
     options.cursor,
   );
-  const persisted = await persistCanonicalEvents(
-    events,
-    options.writer ?? getDb(),
-  );
+  // The writer is passed straight through, NOT defaulted here: `options.writer
+  // ?? getDb()` is an argument expression, so `getDb()` would be evaluated on
+  // every call and demand DATABASE_URL from a caller that has nothing to
+  // persist. The callee resolves it inside its own empty-list guard.
+  const persisted = await persistCanonicalEvents(events, options.writer);
   return { events, persisted };
 }

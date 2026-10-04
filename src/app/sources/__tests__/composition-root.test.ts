@@ -401,6 +401,31 @@ describe("composition root: fetched events persist through the Drizzle client", 
     // Drizzle error.
     expect(writer.batches).toHaveLength(0);
   });
+
+  it("resolves without a database when the page is empty and no writer is given", async () => {
+    // Regression pin for the eager-evaluation defect QA found at head ec258c8:
+    // `options.writer ?? getDb()` is an ARGUMENT expression, so `getDb()` ran
+    // on every syncSource call and threw "DATABASE_URL is not set" even when
+    // there was nothing to persist. This asserts the property through
+    // syncSource rather than leaving it as prose in a comment, with
+    // DATABASE_URL genuinely absent from the environment.
+    const previous = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      const { registry } = registryWith({ "1": { body: "[]" } });
+
+      const result = await syncSource({ registry });
+
+      expect(result.events).toEqual([]);
+      expect(result.persisted).toBe(0);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = previous;
+      }
+    }
+  });
 });
 
 describe("composition root: configuration errors", () => {
