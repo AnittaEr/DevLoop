@@ -19,8 +19,15 @@ import type { CanonicalEvent } from "@/core/events/canonical-event";
 import type { PluginRegistry } from "@/core/plugins/registry";
 import { PluginRegistry as Registry } from "@/core/plugins/registry";
 import type { FetchedPage, PluginDescriptor } from "@/core/plugins/plugin";
-import type { CanonicalEventWriter } from "@/app/sources";
-import { SourceConfigurationError, syncSource } from "@/app/sources";
+import type {
+  CanonicalEventConflictConfig,
+  CanonicalEventWriter,
+} from "@/app/sources";
+import {
+  persistCanonicalEvents,
+  SourceConfigurationError,
+  syncSource,
+} from "@/app/sources";
 import {
   GitHubPluginError,
   GITHUB_PLUGIN_ERROR_REASONS,
@@ -47,21 +54,62 @@ function event(overrides: Partial<CanonicalEvent> = {}): CanonicalEvent {
 }
 
 /**
- * A recording writer. `failWith` makes it reject with a given error, which is
- * how the persistence-failure paths are reached without a database.
+ * The row type the SEAM asks for, derived from the seam itself rather than
+ * re-declared: `values()`'s parameter type, read off
+ * {@link CanonicalEventWriter}. Importing `db/schema`'s row type here instead
+ * would make this test depend on the storage layer's own export list, and a
+ * fake that names its parameter from the contract it is implementing cannot
+ * silently drift from it.
  */
-function recordingWriter(
-  failWith?: unknown,
-): CanonicalEventWriter & { written: unknown[][] } {
-  const written: unknown[][] = [];
+type WriterRow = Parameters<
+  ReturnType<CanonicalEventWriter["insert"]>["values"]
+>[0];
+
+type RecordingWriter = CanonicalEventWriter & {
+  /** One entry per applied insert: the rows that write would have persisted. */
+  readonly written: WriterRow[];
+  /** One entry per applied insert: the conflict clause it was applied with. */
+  readonly conflicts: CanonicalEventConflictConfig[];
+};
+
+/**
+ * A recording writer, satisfying the seam the production upsert widened:
+ * `insert().values(rows)` is no longer the awaited promise, it is the CHAINED
+ * half of an insert and hands back a builder that REQUIRES
+ * `.onConflictDoUpdate(config)`. A fake written for the pre-upsert shape — one
+ * whose `values()` is an `async` function — does not satisfy the current
+ * {@link CanonicalEventWriter}, which is exactly how this suite ended up RED at
+ * `tsc` while T15 and T16 were each GREEN alone.
+ *
+ * So the fake models the real thing: `values()` captures the rows and returns a
+ * {@link CanonicalEventUpsertBuilder}, and the write is recorded when the
+ * conflict clause is applied — the point at which production's query would
+ * actually execute. `failWith` is thrown from THERE, not from `values()`, so a
+ * refused write is never recorded as one.
+ *
+ * The method signatures are the seam's own, spelled out rather than cast: no
+ * `any`, no `as unknown as`, so if the seam changes shape this fake stops
+ * compiling instead of quietly satisfying it.
+ */
+function recordingWriter(failWith?: unknown): RecordingWriter {
+  const written: WriterRow[] = [];
+  const conflicts: CanonicalEventConflictConfig[] = [];
   return {
     written,
+    conflicts,
     insert() {
       return {
-        async values(rows: unknown[]) {
-          if (failWith !== undefined) throw failWith;
-          written.push(rows);
-          return undefined;
+        values(rows: WriterRow) {
+          return {
+            async onConflictDoUpdate(
+              config: CanonicalEventConflictConfig,
+            ): Promise<undefined> {
+              if (failWith !== undefined) throw failWith;
+              written.push(rows);
+              conflicts.push(config);
+              return undefined;
+            },
+          };
         },
       };
     },
@@ -417,11 +465,68 @@ describe("no token value reaches a response or a thrown error", () => {
 });
 
 describe("real syncSource through the handler", () => {
+  it("writes only THROUGH the upsert: no conflict clause, no recorded write", async () => {
+    // The regression guard for the stub itself. `recordingWriter` is a fake, so
+    // nothing but this test proves it still models the CURRENT seam rather than
+    // a shape that happens to typecheck: the fake's write is recorded inside
+    // `onConflictDoUpdate`, and it is the fake's own argument that says the
+    // conflict clause was reached. Delete `onConflictDoUpdate` from the stub —
+    // the mistake this card exists to repair — and `persistCanonicalEvents` has
+    // nothing to call, so this test fails; a `written` array fed from `values()`
+    // would keep passing while proving nothing.
+    const writer = recordingWriter();
+
+    await expect(persistCanonicalEvents([event()], writer)).resolves.toBe(1);
+
+    expect(writer.written).toHaveLength(1);
+    expect(writer.conflicts).toHaveLength(1);
+    // The clause is not a stub detail: production upserts on the natural key and
+    // updates the mutable columns. Reading the column names off the clause the
+    // fake was actually handed means this test fails if the fake is ever fed
+    // something other than the clause the code really executes — and it names
+    // the key by name rather than importing the table, so this route test still
+    // depends on no storage export.
+    const clause = writer.conflicts[0];
+    // `target` is a column OR an array of them, per Drizzle's own config type,
+    // so it is normalised here rather than assuming the array form.
+    const targets = clause?.target ?? [];
+    expect([targets].flat().map((column) => column.name)).toEqual([
+      "source",
+      // The SQL column name, not the TypeScript key: Drizzle's own metadata
+      // `name` is what reaches Postgres, and asserting it catches a clause built
+      // against the wrong column entirely.
+      "external_id",
+    ]);
+    expect(Object.keys(clause?.set ?? {})).not.toContain("id");
+  });
+
+  it("records nothing when the writer refuses, even though the upsert ran", async () => {
+    const hostile = new Error("insert failed");
+    const writer = recordingWriter(hostile);
+
+    await expect(persistCanonicalEvents([event()], writer)).rejects.toThrow(
+      "insert failed",
+    );
+
+    // The write is recorded at the moment the clause is applied, and the
+    // refusal happens in that same call, so a refused upsert leaves no trace.
+    expect(writer.written).toHaveLength(0);
+    expect(writer.conflicts).toHaveLength(0);
+  });
   it("drives the production syncSource with an injected writer", async () => {
     const writer = recordingWriter();
     const { status, body } = await handleSyncRequest({
       registry: registryWith(
-        fakePlugin([event(), event({ id: "b", type: "issue" })]),
+        // Distinct natural keys, deliberately: `persistCanonicalEvents` dedupes
+        // a batch by (source, externalId) before writing, so two events sharing
+        // an `externalId` are ONE row by design. This test is about a two-event
+        // page being written whole, so the keys must differ — a fixture reusing
+        // one key would assert 2 rows for a batch that is 1 row, and would be
+        // testing the dedupe rather than the count.
+        fakePlugin([
+          event(),
+          event({ id: "b", externalId: "acme/demo#2", type: "issue" }),
+        ]),
       ),
       writer,
       sync: realSync,
