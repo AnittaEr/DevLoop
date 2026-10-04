@@ -63,9 +63,25 @@ export default defineConfig({
     // exact defect — collected by `vitest.config.ts`, skipped in `verify`, never
     // executed anywhere. That is the trade this entry makes: an explicit registry
     // that cannot silently expand, instead of a glob that silently widens the job.
+    // EXTENDING B35's REGISTRY, NOT REPLACING IT (B37). B35 (dbbb67a) created
+    // this named-file registry and documented, in this file, that it "is a list
+    // a human must extend" — then the very next db-backed test under `src/**`
+    // reproduced its own defect. `src/lib/db/__tests__/client.test.ts` carries
+    // three `describeWithDb` assertions, one of which ("round-trips a row
+    // through the migrated table") is the ONLY assertion anywhere that the
+    // shipped `db/migrations` actually yields a usable table. Collected only by
+    // `vitest.config.ts`, whose `verify` job has no database, all three reported
+    // as SKIPPED inside a green run.
+    //
+    // THE CLASS IS NOW CLOSED BY A GUARD, NOT BY DISCIPLINE. The hand-maintained
+    // list stays — it is the reason `composition-root.test.ts` is not dragged in
+    // — but `src/__tests__/db-suite-registry.test.ts` fails the DEFAULT suite if
+    // any `*.test.ts` under `src/**` requires a database and is absent from this
+    // list. So this list can now only be wrong loudly.
     include: [
       "db/**/__tests__/**/*.test.ts",
       "src/app/sources/__tests__/persist-canonical-events-upsert.test.ts",
+      "src/lib/db/__tests__/client.test.ts",
     ],
     // Serial: the suite inserts into one shared local table.
     fileParallelism: false,

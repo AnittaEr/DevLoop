@@ -325,5 +325,19 @@ jobs:
       # change to it with a deliberate RED: break one assertion, confirm this job
       # goes red, restore, confirm green. A green `db round trip` on its own
       # cannot distinguish "collected and passing" from "collected and skipped".
+      #
+      # It is ALSO, since B37 (t_8c73ba34), the only place
+      # `src/lib/db/__tests__/client.test.ts` executes for real. That file's three
+      # `describeWithDb` assertions — including "round-trips a row through the
+      # migrated table", the only assertion in the repository that the shipped
+      # `db/migrations` yield a usable table — were collected by
+      # `vitest.config.ts` and reported SKIPPED in `verify`, which has no
+      # database. Same shape as B35's defect one commit earlier, and the same
+      # remedy: name the file in `vitest.db.config.ts`.
+      #
+      # DO NOT EXTEND THIS BY HAND AND TRUST IT. `src/__tests__/db-suite-registry.test.ts`
+      # runs in the DEFAULT `verify` suite and fails if any `*.test.ts` under
+      # `src/**` requires a database and is not named in that config's `include`
+      # list — so forgetting is a red `verify`, not a green lie.
       - name: DB round-trip tests
         run: bun run test:db
