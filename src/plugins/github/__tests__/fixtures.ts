@@ -40,11 +40,26 @@ export const GITHUB_PROFILE: TokenProfile = {
 };
 
 /**
- * A synthetic, obviously-not-real credential, built from the profile so the
- * two cannot drift apart: `fakeTokensFor` in `src/core/credentials/fakes.ts`
- * appends its own hyphenated fixture material to `GITHUB_PROFILE.prefix`.
+ * The synthetic material core appends to a profile's prefix.
+ *
+ * `FIXTURE_MATERIAL` in `src/core/credentials/fakes.ts` is NOT exported (core
+ * must not hand vendor knowledge to callers), so the fixture repeats the string
+ * and `github-plugin.test.ts` ENFORCES the equality by asking a live
+ * `FakeCredentialProvider` for its token. If core ever changes its material or
+ * its concatenation, that test goes red instead of this constant quietly
+ * disagreeing with what the provider actually issues.
  */
-export const FIXTURE_TOKEN = `${GITHUB_PROFILE.prefix}-not-a-real-fixture-token-1`;
+export const FIXTURE_MATERIAL = "not-a-real-fixture-token-1";
+
+/**
+ * The synthetic, obviously-not-real credential this plugin's tests expect the
+ * fake provider to issue: `GITHUB_PROFILE.prefix` and the material joined the
+ * way core joins them — no separator.
+ *
+ * Equality with the live provider's token is a test, not a comment; see
+ * {@link FIXTURE_MATERIAL}.
+ */
+export const FIXTURE_TOKEN = `${GITHUB_PROFILE.prefix}${FIXTURE_MATERIAL}`;
 
 /** One canned HTTP response, keyed by the `page` query parameter. */
 export interface FixtureResponse {
