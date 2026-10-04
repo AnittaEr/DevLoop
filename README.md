@@ -63,9 +63,12 @@ bun run build
 ```
 
 **Local green == CI green.** If all five commands pass locally, CI passes; if CI is red, one of
-those five failed locally too. `--frozen-lockfile` means CI fails loudly on a stale or missing
-`bun.lock` rather than silently resolving new versions — run `bun install` and commit the updated
-lockfile before pushing. The workflow needs no repository secrets, so it also runs on fork PRs.
+those five failed locally too. CI also refuses to start if `bun.lock` is missing from the
+repository, and `--frozen-lockfile` makes it fail loudly on a stale `bun.lock` rather than silently
+resolving new versions — run `bun install` and commit the updated lockfile before pushing. (Both
+halves are needed: `--frozen-lockfile` on its own exits 0 when the lockfile is absent entirely and
+just resolves from the registry.) The workflow needs no repository secrets, so it also runs on fork
+PRs.
 
 ## Layout
 
