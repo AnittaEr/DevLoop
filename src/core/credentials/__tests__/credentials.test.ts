@@ -263,7 +263,12 @@ describe("Zod-backed validation", () => {
         error.reason,
       );
       expect(error.message).toContain(`"env"`);
-      expect(error.message).not.toContain(value.trim().length > 0 ? value : " ");
+      // Only assert containment for values that have ink to leak: an empty or
+      // whitespace-only token has nothing to be found in the message, so
+      // "not.toContain(value)" there would pass vacuously.
+      if (value.trim().length > 0) {
+        expect(error.message).not.toContain(value);
+      }
     }
   });
 
