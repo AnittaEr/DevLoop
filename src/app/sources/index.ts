@@ -388,9 +388,19 @@ const UPSERT_UPDATED_COLUMNS = {
  * while looking like an idempotency fix. `id` is derived from `source` +
  * `externalId` today, so in practice a repeat sync collides on BOTH indexes;
  * Postgres resolves the conflict against the arbiter named here, and
- * `db/__tests__/canonical-events-persistence.test.ts` proves the behaviour by
- * execution in both directions: a changed title updates one row, and the SAME
- * `externalId` under a DIFFERENT `source` yields two rows.
+ * `src/app/sources/__tests__/persist-canonical-events-upsert.test.ts` proves the
+ * behaviour by execution against a real database: a changed title updates one
+ * row; the same `externalId` under a different `source` yields two rows; and a
+ * row colliding on `id` ALONE raises 23505 instead of overwriting an unrelated
+ * event, which is the case a primary-key arbiter would silently absorb.
+ *
+ * WHAT STILL REACHES 23505 AFTER THIS CHANGE. The upsert absorbs duplicates of
+ * the natural key, so a repeat sync of the same repository succeeds. It does
+ * NOT make duplicates impossible: a row whose `id` collides while its
+ * (source, external_id) does not is invisible to `ON CONFLICT`, and the primary
+ * key raises 23505. A caller must therefore still handle 23505 as a genuine,
+ * reachable failure — it means "these are two different events claiming one
+ * primary key", which is a conflict to report, not an idempotent retry.
  *
  * An empty list is a no-op rather than a query: a source that has nothing new
  * must not cost a round trip, and Drizzle rejects an empty `values()`.
