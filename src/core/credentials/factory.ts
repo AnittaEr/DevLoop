@@ -10,6 +10,7 @@
  */
 
 import {
+  CREDENTIAL_SOURCES,
   CredentialError,
   isCredentialSource,
   isTestOnlyCredentialSource,
@@ -46,7 +47,7 @@ export function createCredentialProvider(
   if (!isCredentialSource(source)) {
     throw new CredentialError("unknown_source", {
       source: typeof source === "string" ? source : String(source),
-      reason: `expected one of "env"; the source must be passed explicitly`,
+      reason: `expected one of ${CREDENTIAL_SOURCES.map((s) => `"${s}"`).join(", ")}; the source must be passed explicitly`,
     });
   }
 

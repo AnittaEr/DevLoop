@@ -28,7 +28,17 @@ export type CredentialSource = (typeof CREDENTIAL_SOURCES)[number];
 /** Sources that may only be used from tests. */
 export const TEST_ONLY_CREDENTIAL_SOURCES = ["fake"] as const;
 
-export type TestOnlyCredentialSource = (typeof CREDENTIAL_SOURCES)[number];
+/**
+ * Derived from {@link TEST_ONLY_CREDENTIAL_SOURCES}, NOT from
+ * {@link CREDENTIAL_SOURCES}.
+ *
+ * Deriving it from the full set would collapse to `CredentialSource` itself, and
+ * `isTestOnlyCredentialSource` would then WIDEN a value instead of narrowing it —
+ * the predicate would be a no-op as far as the type system is concerned, and a
+ * caller who guards on it would still be handed a value that might be `env`.
+ */
+export type TestOnlyCredentialSource =
+  (typeof TEST_ONLY_CREDENTIAL_SOURCES)[number];
 
 /** The prefix every GitHub fine-grained personal access token carries. */
 export const GITHUB_TOKEN_PREFIX = "github_pat_";

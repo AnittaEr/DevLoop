@@ -8,8 +8,11 @@
  * source unless the caller passes an explicit opt-in, so a fixture provider can
  * never be selected by configuration, an environment variable, or a default.
  *
- * The values it returns are obviously-synthetic fixtures: they are not
- * well-formed GitHub token shapes and cannot be mistaken for a real credential.
+ * The values it returns are obviously-synthetic fixtures. Note that they ARE
+ * deliberately well-formed in shape (correct prefix, material after it) so that
+ * they exercise the same validation a real token would; what makes them safe is
+ * that the material is hyphenated English prose, so no 20+ character
+ * alphanumeric run exists and they cannot be mistaken for a real credential.
  */
 
 import { CredentialError, validateTokenShape } from "./provider";
@@ -40,15 +43,26 @@ export interface FakeCredentialProviderOptions {
 export class FakeCredentialProvider implements CredentialProvider {
   readonly source = FAKE_SOURCE;
 
-  private readonly tokens: Readonly<Record<string, string>>;
+  // Mutable per instance, but never shared: see the constructor.
+  private readonly tokens: Record<string, string>;
 
   constructor(options: FakeCredentialProviderOptions = {}) {
-    this.tokens = options.tokens ?? FAKE_TOKENS;
+    // Copied, not aliased. `setToken` writes to this map, so holding the shared
+    // exported `FAKE_TOKENS` object (or a caller-supplied one) would let one
+    // provider permanently pollute the fixtures seen by every later provider in
+    // the same worker — an order-dependent leak across test files, surfacing as
+    // an unrelated assertion failure. Every instance owns its own map.
+    this.tokens = { ...(options.tokens ?? FAKE_TOKENS) };
   }
 
-  /** Test helper: register or replace a fixture value. */
+  /**
+   * Test helper: register or replace a fixture value on THIS provider only.
+   *
+   * Writes to this instance's own map, so the exported {@link FAKE_TOKENS} and
+   * any other provider are unaffected.
+   */
   setToken(key: string, value: string): void {
-    (this.tokens as Record<string, string>)[key] = value;
+    this.tokens[key] = value;
   }
 
   async getToken(): Promise<string> {

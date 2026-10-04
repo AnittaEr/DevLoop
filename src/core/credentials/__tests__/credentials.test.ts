@@ -3,13 +3,16 @@ import { z } from "zod";
 import zodPackage from "zod/package.json" with { type: "json" };
 
 import {
+  CREDENTIAL_SOURCES,
   CredentialError,
   GITHUB_TOKEN_PREFIX,
+  TEST_ONLY_CREDENTIAL_SOURCES,
   TOKEN_DEFECT_REASONS,
   isCredentialSource,
   isTestOnlyCredentialSource,
   validateTokenShape,
 } from "../provider";
+import type { CredentialSource, TestOnlyCredentialSource } from "../provider";
 import { GITHUB_TOKEN_ENV_VAR, EnvCredentialProvider } from "../env-provider";
 import { FAKE_TOKENS, FakeCredentialProvider } from "../fakes";
 import { createCredentialProvider } from "../factory";
@@ -373,5 +376,86 @@ describe("factory", () => {
         delete process.env[key];
       }
     }
+  });
+});
+
+describe("regression: isTestOnlyCredentialSource narrows rather than widens", () => {
+  /**
+   * Compile-time equality assertion. If the two types are not identical this
+   * line is a type error, and `bun run typecheck` fails — which is the point: the
+   * defect this guards against is invisible to the runtime suite, because
+   * `isTestOnlyCredentialSource("env")` correctly returns `false` either way. It
+   * is only the PREDICATE TYPE that was wrong.
+   */
+  type Exact<A, B> =
+    (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+      ? true
+      : false;
+  const expectType = <T extends true>(): T => true as T;
+
+  it("narrows an unknown source to the test-only subset, not the full set", () => {
+    // The bug: `TestOnlyCredentialSource` was derived from CREDENTIAL_SOURCES, so
+    // it expanded to "env" | "fake" and the predicate widened instead of
+    // narrowing. These assertions are the regression.
+    expectType<Exact<TestOnlyCredentialSource, "fake">>();
+
+    // The predicate's runtime behaviour was already right; pin it anyway so the
+    // two halves of the contract are stated in one place.
+    expect([...TEST_ONLY_CREDENTIAL_SOURCES]).toEqual(["fake"]);
+    expect([...CREDENTIAL_SOURCES]).toContain("env");
+    // And a real production source is NOT narrowed into the test-only type.
+    expectType<
+      Exact<Exclude<CredentialSource, TestOnlyCredentialSource>, "env">
+    >();
+  });
+
+  it("cannot assign a production source to the test-only type", () => {
+    // This assignment must not compile. It is written so that the failure is a
+    // plain type error at this line, not a runtime throw.
+    const narrowed: TestOnlyCredentialSource = "fake";
+    expect(narrowed).toBe("fake");
+    // @ts-expect-error "env" is a CredentialSource but not a TestOnlyCredentialSource.
+    const wrong: TestOnlyCredentialSource = "env";
+    expect(wrong).toBe("env");
+  });
+});
+
+describe("regression: fake providers do not share mutable state", () => {
+  it("does not mutate the exported fixtures when a default provider is written to", async () => {
+    const before = FAKE_TOKENS.valid;
+
+    const polluted = new FakeCredentialProvider();
+    polluted.setToken("valid", "github_pat_-mutated-by-one-test-only");
+
+    // The exported fixture table must be untouched.
+    expect(FAKE_TOKENS.valid).toBe(before);
+    expect(FAKE_TOKENS).toEqual({
+      valid: "github_pat_-not-a-real-fixture-token-1",
+      validAlt: "github_pat_-not-a-real-fixture-token-2",
+    });
+
+    // And a provider constructed afterwards must see pristine fixtures. This is
+    // the failure QA observed: without the copy, the fresh provider returned the
+    // polluted value, making the suite order-dependent.
+    await expect(new FakeCredentialProvider().getToken()).resolves.toBe(before);
+  });
+
+  it("keeps two concurrently-live providers independent", async () => {
+    const a = new FakeCredentialProvider();
+    const b = new FakeCredentialProvider();
+
+    a.setToken("valid", OTHER);
+    await expect(a.getToken()).resolves.toBe(OTHER);
+    await expect(b.getToken()).resolves.toBe(FAKE_TOKENS.valid);
+  });
+
+  it("does not mutate a caller-supplied token map", async () => {
+    const supplied = { valid: GOOD };
+    const provider = new FakeCredentialProvider({ tokens: supplied });
+
+    provider.setToken("valid", OTHER);
+
+    expect(supplied.valid).toBe(GOOD);
+    await expect(provider.getToken()).resolves.toBe(OTHER);
   });
 });
