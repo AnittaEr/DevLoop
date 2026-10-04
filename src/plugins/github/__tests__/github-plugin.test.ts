@@ -40,6 +40,7 @@ import type { NativeIssueItem } from "../native-item";
 import type { HttpTransport, TransportResponse } from "../transport";
 import {
   FIXTURE_REPOSITORY,
+  FIXTURE_TOKEN,
   GITHUB_PROFILE,
   FakeHttpTransport,
   fullPage,
@@ -1117,5 +1118,19 @@ describe("GitHubSourcePlugin: no network in tests", () => {
 
     expect(events).toHaveLength(2);
     expect(events.map((e) => e.type)).toEqual(["issue", "change_proposal"]);
+  });
+});
+
+describe("fixture token tracks what core actually issues", () => {
+  it("issues exactly the token the fixture declares, with no separator", async () => {
+    // This is what makes FIXTURE_TOKEN an enforced invariant rather than an
+    // asserted one. The fixture has to name core's material and the way core
+    // joins it to the prefix, and neither is exported; so instead of trusting a
+    // comment, ask the real provider. If `fakes.ts` ever changes its material
+    // or its concatenation, THIS test fails — the constant can no longer
+    // quietly disagree with the provider.
+    const provider = createFakeCredentialProvider({ profile: GITHUB_PROFILE });
+
+    await expect(provider.getToken()).resolves.toBe(FIXTURE_TOKEN);
   });
 });
