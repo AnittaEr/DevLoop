@@ -54,28 +54,43 @@ const compat = new FlatCompat({ baseDirectory: __dirname });
  * plugins there. That is why this block is scoped to `src/core/**` and nothing
  * else, and why the ticket's negative control matters.
  *
- * KNOWN RESIDUAL HOLE — AND IT IS NO LONGER THE `../` ONE.
+ * KNOWN RESIDUAL HOLE — AND IT IS NO LONGER EITHER THE `../` ONE OR THE `@/`
+ * ONE.
  *
  * This family list still matches the import SPECIFIER string rather than the
  * resolved path, so it is spelling-dependent: a relative hop count other than
- * the one written here is not matched by it. That hole WAS the one cubic raised
- * on PR #3 (finding 1: `../plugins/*` matches one `../` only, so
+ * the one written here is not matched by it, and neither is a specifier that
+ * reaches a denied path without containing a denied substring. That was the one
+ * cubic raised on PR #3 (finding 1: `../plugins/*` matches one `../` only, so
  * `../../plugins/x` and `../../../plugins/x` escaped lint), and it is now closed
  * by the resolver-aware rule in `eslint-plugin-core-boundary.mjs`, which is
  * registered below and loads AFTER this one so it can share the same scope
- * decision. The two overlap by design: the specifier families here are the
- * cheap, human-readable deny-list for `@/plugins/*`, `src/plugins/*`, the
- * provider SDKs and the one-hop `../` shape, and the resolver rule is the
- * hop-count-independent backstop underneath them. `core-boundary-guard-exists`
- * style tests in `src/core/__tests__/eslint-core-boundary-rule.test.ts` assert
- * both halves, including that the two neutral contracts stay importable.
+ * decision.
  *
- * What is still not covered here, recorded rather than hidden: a specifier that
- * is neither relative nor in a family below (a new path alias, for instance)
- * would need adding to this list; and the rule deliberately does not attempt to
- * decide whether a plugin IMPLEMENTATION under `src/plugins/` is well-behaved,
- * only that `src/core/**` cannot reach it. The Vitest guard scans resolved paths
- * over the whole core tree and remains the independent third layer.
+ * The `@/` alias was the same defect wearing a different spelling, and it was
+ * worse than a lint gap because it defeated every defence at once: with
+ * `@/*` -> `./src/*` in tsconfig, `@/core/../plugins/acme/impl` resolves
+ * cleanly to `src/plugins/acme/impl`, so `tsc` accepted it; this list found no
+ * `plugins/` substring to match (it follows `../`, not a quote or a slash); the
+ * Vitest scanner likewise found nothing; and the B14 resolver half skipped it
+ * because it only resolved RELATIVE specifiers. The resolver now maps the alias
+ * to its target directory and runs the same normalised comparison, so the alias
+ * escape is denied for the same reason as every hop count rather than by a new
+ * glob. The two halves still overlap by design: the families here are the
+ * cheap, human-readable deny-list for the obvious spellings, the provider SDKs
+ * and the one-hop `../` shape, and the resolver rule is the
+ * hop-count- AND spelling-independent backstop underneath them.
+ * `core-boundary/no-plugin-boundary-escape` cases in
+ * `src/core/__tests__/eslint-core-boundary-rule.test.ts` assert both halves,
+ * including that the neutral contracts stay importable.
+ *
+ * What is still not covered here, recorded rather than hidden: the rule
+ * deliberately does not attempt to decide whether a plugin IMPLEMENTATION under
+ * `src/plugins/` is well-behaved, only that `src/core/**` cannot reach it; and
+ * a NEW path alias added to `tsconfig.json` must be added to `PATH_ALIASES` in
+ * the plugin module — a test asserts the two agree, so this cannot be forgotten
+ * silently. The Vitest guard scans resolved paths over the whole core tree and
+ * remains the independent third layer.
  */
 const CORE_PLUGIN_BOUNDARY_PATTERNS = [
   {

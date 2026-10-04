@@ -50,6 +50,20 @@
  * rule was scoped: `src/app/**` is the composition root and is supposed to
  * import core and wire concrete plugins there.
  *
+ * WHAT THE ALIAS HALF ADDS, AND WHY IT IS NOT A DENY-LIST ENTRY.
+ *
+ * The rule resolves the `../` spelling by matching the DESTINATION. The `@/`
+ * alias needed the same treatment: `tsconfig.json` maps `@/*` to `./src/*`, so
+ * `@/core/../plugins/acme/impl` names `src/plugins/acme/impl` while containing
+ * no glob-matchable substring. Every defence in this repo accepted that
+ * spelling — this rule returned `null` for it (it only resolved RELATIVE
+ * specifiers), `no-restricted-imports` matched the string, the Vitest scanner
+ * needed `plugins/` to follow a quote or a slash, and `tsc` resolved it
+ * happily. Mapping the alias to a directory and then running the SAME
+ * `path.resolve` + denied-roots comparison makes the escape fail for a reason
+ * (where does it land?) rather than for a reason (what does it look like?), so
+ * the next spelling cannot re-open it.
+ *
  * This module exports the flat-config plugin object and the rule so that
  * `src/core/__tests__/eslint-core-boundary-rule.test.ts` can exercise the rule
  * directly; the guard's behaviour is asserted by tests, not by reading it.
@@ -62,6 +76,40 @@ import { fileURLToPath } from "node:url";
 const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SRC_DIR = path.join(ROOT_DIR, "src");
 const CORE_DIR = path.join(SRC_DIR, "core");
+
+/**
+ * The tsconfig `paths` aliases, as prefix -> absolute target directory.
+ *
+ * WHY AN `@/` SPECIFIER WAS PREVIOUSLY UNRESOLVABLE, AND WHAT THAT COST.
+ *
+ * This rule originally returned `null` for every non-relative specifier, so
+ * `@/...` fell out of the resolver entirely and was left to the specifier
+ * deny-list in `eslint.config.mjs`. That list matches the SPECIFIER STRING,
+ * and the alias makes a specifier that names a denied path without containing
+ * a denied substring: `@/core/../plugins/acme/impl` reaches
+ * `src/plugins/acme/impl` but the substring `plugins/` follows `../` rather
+ * than a quote or a slash, so no glob in the list matches it. The shape was
+ * accepted by this rule, by `no-restricted-imports`, by the Vitest scanner and
+ * by `tsc` — the plugin boundary (hard rule 1) was enforced by nothing at all
+ * on that spelling. Normalising the alias HERE means the escape is caught by
+ * the same resolution-based comparison as every `../` hop count, so the next
+ * spelling (`@/core/./../plugins`, `@/providers/...`, a repo-rooted
+ * `src/plugins/...`) is caught for the same reason rather than by a new glob.
+ *
+ * The key is the alias PREFIX and the value its target DIRECTORY, so one entry
+ * covers every specifier under that alias. These are declared here rather than
+ * read from `tsconfig.json` at lint time so the rule stays dependency-free and
+ * performs no I/O; a test asserts this table still matches
+ * `tsconfig.json`'s `compilerOptions.paths`, so adding an alias there without
+ * adding it here turns the suite RED instead of silently opening a new hole.
+ */
+const PATH_ALIASES = new Map([
+  ["@/", SRC_DIR],
+  // `src/plugins/acme/impl` is repo-root-relative rather than alias-relative,
+  // but it names the same destination and is denied by the same comparison,
+  // so it is normalised here too instead of being enumerated in a glob.
+  ["src/", SRC_DIR],
+]);
 
 /**
  * Directories a `src/core/**` file may not resolve an import into.
@@ -98,16 +146,51 @@ function isInside(dir, target) {
 }
 
 /**
- * Resolve a relative module specifier from `filename` to a normalised,
- * extension-less absolute path, or `null` for a non-relative specifier.
+ * Normalise one alias-prefixed specifier to a repo-relative path, or `null`.
  *
- * Exported for the test, which asserts the hop-collapse property directly.
+ * `@/x` becomes `<SRC_DIR>/x` and `src/x` becomes the same, which is then
+ * collapsed by `path.resolve`/`path.normalize` exactly like a `../` hop. The
+ * crucial property is that this happens BEFORE the denied-roots comparison, so
+ * the destination is what decides, not the spelling.
+ *
+ * `path.resolve` on the mapped value is what makes `../` inside the alias
+ * harmless-but-correct: `@/core/../plugins/acme/impl` maps to
+ * `<SRC_DIR>/core/../plugins/acme/impl`, and resolving normalises that to
+ * `<SRC_DIR>/plugins/acme/impl` — the plugin implementation namespace, denied.
+ *
+ * Returns `null` for a bare package specifier (`zod`, `node:fs`,
+ * `@octokit/rest`): those are not repo paths and are out of this rule's reach.
+ * Note the asymmetry with `@/`, which is deliberately NOT a package specifier —
+ * it is this repo's own path alias, and a bare `@scope/name` is.
+ */
+function resolveAliasSpecifier(specifier) {
+  for (const [prefix, targetDir] of PATH_ALIASES) {
+    if (!specifier.startsWith(prefix)) continue;
+    return path
+      .resolve(targetDir, specifier.slice(prefix.length))
+      .replace(SOURCE_SUFFIX, "");
+  }
+  return null;
+}
+
+/**
+ * Resolve a module specifier to a normalised, extension-less absolute path, or
+ * `null` when it names neither a relative path nor a known alias.
+ *
+ * Exported for the test, which asserts the hop-collapse and alias-collapse
+ * properties directly. The name keeps `Relative` in it deliberately: the
+ * `returns null for a non-relative specifier` case in the test file is renamed
+ * in the same commit so it cannot keep asserting the old, now-false claim that
+ * an alias specifier is unresolvable.
  */
 export function resolveRelativeSpecifier(filename, specifier) {
-  if (typeof specifier !== "string" || !specifier.startsWith(".")) return null;
-  return path
-    .resolve(path.dirname(filename), specifier)
-    .replace(SOURCE_SUFFIX, "");
+  if (typeof specifier !== "string") return null;
+  if (specifier.startsWith(".")) {
+    return path
+      .resolve(path.dirname(filename), specifier)
+      .replace(SOURCE_SUFFIX, "");
+  }
+  return resolveAliasSpecifier(specifier);
 }
 
 /** Repo-relative, forward-slashed form of an absolute path, for messages. */

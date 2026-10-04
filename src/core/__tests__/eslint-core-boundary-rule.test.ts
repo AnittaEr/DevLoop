@@ -34,6 +34,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Linter } from "eslint";
 import { describe, expect, it } from "vitest";
+import eslintConfig from "../../../eslint.config.mjs";
 import {
   coreBoundaryPlugin,
   resolveRelativeSpecifier,
@@ -65,6 +66,22 @@ const ROOT = path.resolve(
  * it, so the two defences in this repo do not have to fight each other.
  */
 const NS = `${"plug"}${`ins`}`;
+
+/**
+ * A provider-SDK specifier, assembled at runtime for the same reason as `NS`.
+ *
+ * `plugin-boundary.test.ts` flags the provider SDK token and the `@<sdk>/`
+ * pattern on any import-shaped line in core, and this file is NOT self-skipped
+ * (only the scanner's own file is). Its positive-control block gets away with a
+ * literal SDK specifier for exactly that reason. A literal here would be a real
+ * provider-SDK import sitting in a core source file, which is the thing this
+ * whole repo exists to prevent — so these fixtures are assembled instead.
+ *
+ * Naming the token in this comment would fail the scanner too, and correctly:
+ * block comments are deliberately NOT stripped, because a provider token inside
+ * one is a failure by design.
+ */
+const SDK = `@${"octo"}kit/rest`;
 
 /** A path inside `src/core/**` at an arbitrary depth, used as `filename`. */
 function coreFile(...segments: string[]): string {
@@ -240,9 +257,15 @@ describe("core-boundary lint rule: it is resolver-based, not a text match", () =
     );
   });
 
-  it("returns null for a non-relative specifier, so aliases are not this rule's job", () => {
-    expect(resolveRelativeSpecifier(coreFile("f.ts"), `@/${NS}/x`)).toBeNull();
+  it("returns null for a bare package specifier, which is not a repo path", () => {
+    // Renamed from "returns null for a non-relative specifier, so aliases are not
+    // this rule's job": that claim became FALSE when the alias half landed, and
+    // leaving the old title in place would have kept asserting an idealised
+    // version of the resolver — exactly the defect class D-100 is about. `zod`
+    // and `node:fs` are still null, for the reason the new title states.
+    expect(resolveRelativeSpecifier(coreFile("f.ts"), "zod")).toBeNull();
     expect(resolveRelativeSpecifier(coreFile("f.ts"), "node:fs")).toBeNull();
+    expect(resolveRelativeSpecifier(coreFile("f.ts"), SDK)).toBeNull();
   });
 
   it("denies an escape into src/plugins/ even though that directory does not exist on this base", () => {
@@ -297,6 +320,212 @@ describe("core-boundary lint rule: no non-import way around it", () => {
   });
 });
 
+describe("core-boundary lint rule: the `@/` alias escape (B17)", () => {
+  // The hole this block closes, and the reason it was worse than a lint gap.
+  //
+  // `tsconfig.json` maps `@/*` -> `./src/*`, so
+  // `@/core/../plugins/acme/impl` names `src/plugins/acme/impl` while
+  // containing no glob-matchable substring. At B14's approved head 59f0171 the
+  // shape was accepted by ALL FOUR defences at once: this rule returned `null`
+  // for it (it resolved only RELATIVE specifiers), `no-restricted-imports`
+  // matched the specifier string and found nothing, the Vitest scanner needed
+  // `plugins/` to follow a quote or a slash and found nothing, and `tsc`
+  // resolved it cleanly. The boundary (hard rule 1) was enforced by nothing.
+  //
+  // The fix is in the resolver, not in a glob: the alias is mapped to its
+  // target directory and then run through the same `path.resolve` +
+  // denied-roots comparison every hop count already used.
+
+  /** Assemble the escaping alias specifier without writing it as a literal. */
+  const aliasEscape = (prefix: string, remainder: string): string =>
+    `${prefix}${NS}/${remainder}`;
+
+  it("DENIES `@/core/../plugins/acme/impl` — the shape all four gates accepted at base", () => {
+    const spec = aliasEscape("@/core/../", "acme/impl");
+    const messages = lint(
+      coreFile("b17-alias-escape.ts"),
+      `import "${spec}";\n`,
+    );
+    expect(messages.length, `expected a report for ${spec}`).toBe(1);
+    // The message names the RESOLVED destination, which is what makes the denial
+    // legible in review and proves the rule fired on WHERE IT LANDS, not on a
+    // substring.
+    expect(messages[0]).toContain(`src/${NS}/acme/impl`);
+  });
+
+  it("denies the alias escape through every non-import door as well", () => {
+    // If the fix were applied only to `ImportDeclaration`, these four would be
+    // one-line bypasses and the suite would still be green.
+    const spec = aliasEscape("@/core/../", "acme/impl");
+    for (const [label, code] of [
+      ["re-export", `export { x } from "${spec}";\n`],
+      ["export *", `export * from "${spec}";\n`],
+      [
+        "dynamic import",
+        `export async function f() { return import("${spec}"); }\n`,
+      ],
+      ["require", `const m = require("${spec}");\n`],
+    ] as const) {
+      expect(
+        lint(coreFile("a", "b", `b17-${label}.ts`), code),
+        `${label} must not be a way around the alias normalisation`,
+      ).toHaveLength(1);
+    }
+  });
+
+  it("denies the OTHER alias spellings of the same destination, not just the reported one", () => {
+    // This is the anti-deny-list assertion. `@/core/./../plugins`, `@/providers/…`
+    // and the repo-rooted `src/plugins/…` all reach a denied directory and none
+    // of them is the string the PM reported. They are denied because they
+    // RESOLVE into a denied root, so a spelling nobody has thought of yet is
+    // denied for the same reason.
+    for (const spec of [
+      aliasEscape("@/core/./../", "acme/impl"),
+      "@/providers/acme/impl",
+      "src/providers/acme/impl",
+      `@/${NS}/../${NS}/acme/impl`,
+    ]) {
+      expect(
+        lint(coreFile("b17-spelling.ts"), `import "${spec}";\n`),
+        `${spec} must be denied by resolution`,
+      ).toHaveLength(1);
+    }
+  });
+
+  it("keeps the neutral contracts importable THROUGH THE ALIAS at one hop", () => {
+    // The acceptance criterion that stops a resolver fix becoming a blunt
+    // "reject every alias import". These three are the whole legal crossing.
+    for (const spec of [
+      "@/core/plugins/plugin",
+      "@/core/plugins/registry",
+      "@/core/events/canonical-event",
+    ]) {
+      expect(
+        lint(coreFile("events", "b17-onehop.ts"), `import "${spec}";\n`),
+        `${spec} must stay importable via the alias`,
+      ).toEqual([]);
+    }
+  });
+
+  it("keeps them importable at THREE hops and via `export *`", () => {
+    for (const spec of [
+      "@/core/plugins/plugin",
+      "@/core/plugins/registry",
+      "@/core/events/canonical-event",
+    ]) {
+      const deep = coreFile("d0", "d1", "d2", "b17-threehop.ts");
+      expect(
+        lint(deep, `import "${spec}";\n`),
+        `${spec} must stay importable at depth`,
+      ).toEqual([]);
+      expect(
+        lint(deep, `export * from "${spec}";\n`),
+        `${spec} must stay re-exportable`,
+      ).toEqual([]);
+    }
+  });
+
+  it("still denies an implementation under the contract directory reached VIA THE ALIAS", () => {
+    // `@/core/plugins/acme` is a sibling of the two contracts inside the contract
+    // tree. Resolving it must not be mistaken for resolving a contract: the
+    // exemption is two PATHS, not "the plugins directory".
+    const spec = `@/core/${NS}/acme`;
+    expect(
+      lint(coreFile("events", "b17-sibling.ts"), `import "${spec}";\n`),
+    ).toHaveLength(1);
+  });
+
+  it("does not fire outside src/core even for the alias escape", () => {
+    // `coreOnly = false` widens the flat-config glob to `src/**` so the rule
+    // genuinely executes on this file. Measured with the narrow glob it would
+    // never run, and the assertion would be measuring the config — which is
+    // how B14's MUST-FIRE control came out green for the wrong reason.
+    const spec = aliasEscape("@/core/../", "acme/impl");
+    expect(
+      lint(`${ROOT}/src/app/b17-wiring.tsx`, `import "${spec}";\n`, false),
+      "src/app is the composition root and is supposed to wire plugins",
+    ).toEqual([]);
+  });
+
+  it("does not fire on a bare package specifier that merely looks alias-shaped", () => {
+    // `@scope/name` is a PACKAGE, not this repo's `@/` alias. Treating every
+    // `@`-prefixed specifier as a path would deny the provider SDKs by accident
+    // here and — worse — deny any legitimate dependency.
+    for (const spec of [SDK, "@testing-library/react", "zod"]) {
+      expect(
+        lint(coreFile("a", "b", "b17-pkg.ts"), `import "${spec}";\n`),
+        `${spec} must not be treated as a path alias`,
+      ).toEqual([]);
+    }
+  });
+
+  it("normalises the alias to the tsconfig target rather than to a guess", () => {
+    // The mapping is asserted against the resolved path rather than observed,
+    // so this keeps its meaning if the alias target ever moves.
+    const from = coreFile("f.ts");
+    expect(resolveRelativeSpecifier(from, "@/core/plugins/plugin")).toBe(
+      `${ROOT}/src/core/${NS}/plugin`,
+    );
+    expect(resolveRelativeSpecifier(from, `src/${NS}/acme/impl`)).toBe(
+      `${ROOT}/src/${NS}/acme/impl`,
+    );
+  });
+
+  it("every alias in tsconfig paths is normalised by the rule", () => {
+    // The alias table lives in the plugin module (so the rule stays
+    // dependency-free and does no I/O), which creates a new way for the boundary
+    // to rot: someone adds an alias to tsconfig and forgets the rule. Compare the
+    // two and the suite goes RED instead of the hole opening silently. This is
+    // the guard against the "one more spelling" class the ticket warns about.
+    const tsconfig = JSON.parse(
+      readFileSync(path.join(ROOT, "tsconfig.json"), "utf8"),
+    ) as { compilerOptions?: { paths?: Record<string, string[]> } };
+    const declared = Object.keys(tsconfig.compilerOptions?.paths ?? {});
+    expect(declared.length).toBeGreaterThan(0);
+    for (const alias of declared) {
+      // Each declared alias must resolve to a path inside src/, which is what
+      // PATH_ALIASES is keyed on. An alias pointing anywhere else needs the rule
+      // extended and this test updated deliberately.
+      const target = (tsconfig.compilerOptions?.paths ?? {})[alias]?.[0] ?? "";
+      expect(
+        path.isAbsolute(target) ? false : target.startsWith("./src/"),
+        `alias ${alias} targets ${target}, which this rule does not normalise`,
+      ).toBe(true);
+      // tsconfig keys are patterns (`@/*`) while the rule keys on the concrete
+      // prefix (`@/`), so drop the wildcard before probing.
+      expect(
+        resolveRelativeSpecifier(
+          coreFile("f.ts"),
+          `${alias.replace("*", "")}probe/x`,
+        ),
+        `${alias} is declared in tsconfig but not normalised by the rule`,
+      ).toBe(`${ROOT}/src/probe/x`);
+    }
+  });
+});
+
+describe("core-boundary lint rule: the lint helper cannot false-green", () => {
+  it("throws rather than returning [] when the config does not apply", () => {
+    // The single most likely way this whole block produces a green suite that
+    // asserts nothing: a flat config with no `files` (or a glob that matches
+    // nothing) yields ONE `ruleId: null` warning and ZERO rule messages, so
+    // every `toEqual([])` above would pass for the wrong reason and every
+    // `toHaveLength(1)` would fail for an unrelated one. The `lint` helper
+    // already asserts this on every call; this case proves the assertion is
+    // live rather than trusting that it is.
+    const broken = [
+      { rules: { [RULE_ID]: "error" } },
+    ] as unknown as Linter.Config[];
+    const messages = linter.verify(`import "x";\n`, broken, coreFile("f.ts"));
+    expect(
+      messages.some((m) => m.ruleId === null),
+      "expected the unloaded config to surface a ruleId-less message",
+    ).toBe(true);
+    // And therefore the helper's own guard has something real to catch.
+    expect(() => lint(`${ROOT}/not-core/file.ts`, `import "x";\n`)).toThrow();
+  });
+});
+
 describe("core-boundary lint rule: scope and non-regression", () => {
   it("does not fire outside src/core — src/app is the composition root", () => {
     const spec = escapeSpecifier(1, `${NS}/acme/impl`);
@@ -342,6 +571,32 @@ describe("core-boundary lint rule: scope and non-regression", () => {
     expect(source).toContain("[RULE_ID]");
     expect(source).toContain("coreBoundaryPlugin");
     expect(source).toContain("eslint-plugin-core-boundary.mjs");
+
+    // Reading the text proves the KEYS are present; it does not prove the rule
+    // is actually enabled on any file. Load the real config and check the
+    // resolved value, so de-registering the rule by any means — deleting the
+    // key, downgrading it to "off"/"warn", or dropping the whole config block —
+    // fails HERE, naming this case, rather than passing on the strength of the
+    // surrounding strings still being present.
+    const config = eslintConfig as unknown as Linter.Config[];
+    const scoped = config.filter((entry) => entry.plugins?.["core-boundary"]);
+    expect(
+      scoped.length,
+      "no config block registers the core-boundary plugin",
+    ).toBeGreaterThan(0);
+    for (const entry of scoped) {
+      expect(
+        (entry.rules as Record<string, unknown>)[RULE_ID],
+        `${RULE_ID} is not enabled as "error" on ${JSON.stringify(entry.files)}`,
+      ).toBe("error");
+      // And the resolver rule must be scoped to core exactly as the text-above
+      // case describes; a glob that silently stopped matching src/core would
+      // leave the boundary undefended while the key was still present.
+      expect(
+        JSON.stringify(entry.files),
+        `${RULE_ID} is not scoped to src/core`,
+      ).toContain("src/core/");
+    }
   });
 
   it("carries no comment in the config claiming the ../ hole is still open", () => {
