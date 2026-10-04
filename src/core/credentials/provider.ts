@@ -329,8 +329,9 @@ function reasonFromZod(
  * as an error `cause`.
  *
  * `source` is normalised by {@link toSafeCredentialSource} inside the error
- * constructor, so passing an arbitrary string here is already safe — the type
- * says `CredentialSource` to steer callers, not to enforce safety at runtime.
+ * constructor, so passing an arbitrary string here is already safe — the
+ * {@link CredentialErrorSource} type steers callers toward the closed set, but
+ * safety does not depend on it holding at runtime.
  */
 export function validateTokenShape(
   raw: unknown,
