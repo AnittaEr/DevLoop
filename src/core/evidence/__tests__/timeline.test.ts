@@ -150,7 +150,39 @@ describe("event validation", () => {
 });
 
 describe("chronological ordering", () => {
-  it("orders ascending by occurredAt regardless of input order", () => {
+  it("sorts a single stream ascending regardless of input order", () => {
+    // Deliberately calls the exported sorter DIRECTLY. The only assertion that
+    // can see the sorter's behaviour on its own is one that does not go through
+    // period grouping first: grouping orders periods by the CALLER's period
+    // order, so a test that only flattens periods across several of them stays
+    // green when the sorter is mutated to a no-op.
+    //
+    // Non-vacuity control, measured: with `sortChronologically` mutated to
+    // `return [...events]` this case failed and the grouping-level cases did
+    // not, which is what motivated it.
+    const sorted = sortChronologically([
+      januaryReview,
+      januaryIssue,
+      januaryRelease,
+      februaryComment,
+    ]);
+    expect(sorted.map((event) => event.occurredAt)).toEqual([
+      AT.januaryMid, // januaryIssue
+      AT.januaryMid, // januaryRelease
+      AT.januaryLate, // januaryReview
+      AT.februaryFirst,
+    ]);
+  });
+
+  it("orders a single period's events ascending even when they arrive reversed", () => {
+    const result = timeline([januaryReview, januaryIssue], [JANUARY]);
+    expect(ids(result.periods[0]?.events ?? [])).toEqual([
+      januaryIssue.id,
+      januaryReview.id,
+    ]);
+  });
+
+  it("orders events ascending by occurredAt across periods", () => {
     const shuffled = [
       marchProposal,
       januaryIssue,
