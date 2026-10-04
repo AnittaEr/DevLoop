@@ -204,11 +204,17 @@ jobs:
   # T14 — the missing runner for the DB round-trip suite.
   #
   # WHY THIS JOB EXISTS. `db/__tests__/canonical-events-persistence.test.ts`
-  # (401 lines) is collected ONLY by `vitest.db.config.ts`
+  # is collected ONLY by `vitest.db.config.ts`
   # (`include: ["db/**/__tests__/**/*.test.ts"]`), which `bun run test` never
   # loads — `vitest.config.ts:17` matches `src/**` and `e2e/**` only. Until this
   # job, that suite was written, reviewed, merged and executed by NOTHING: a
   # green `verify` check proved nothing at all about persistence.
+  #
+  # No line count is quoted here on purpose. A hard-coded figure in an explanatory
+  # comment goes stale the moment the suite grows, and a stale figure is worse
+  # than none: the comment below the first version of this job claimed "401
+  # lines" while the file was already 518, which is a claim no assertion backs.
+  # If you want the size, measure it (`wc -l`) rather than reading it here.
   #
   # WHY A SEPARATE JOB, NOT MORE STEPS IN `verify`. Three reasons, in order of
   # weight: (1) a red round trip must be a NAMED check, so the PR checks list
@@ -236,8 +242,12 @@ jobs:
       # it with a real host, and do not move it into a repository secret: a
       # secret here would be strictly worse (fork PRs could not run the job, and
       # it would be a real credential in a place a real credential belongs).
-      # `sslmode=disable` matches the local dev string in .env.example; the
-      # service has no TLS and the `postgres` driver would otherwise negotiate.
+      # `sslmode=disable` is stated explicitly because the service has no TLS and
+      # an explicit setting removes the question; it does NOT match a flag in
+      # `.env.example`, which carries no `sslmode` (that file is
+      # `postgresql://USER:PASSWORD@localhost:5432/devloop` and nothing more).
+      # An earlier version of this comment claimed the two matched, which was
+      # false — a maintainer reading it would look for a flag that is not there.
       DATABASE_URL: postgresql://devloop:devloop@127.0.0.1:5432/devloop?sslmode=disable
     services:
       postgres:

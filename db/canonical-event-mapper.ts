@@ -40,6 +40,7 @@ import type {
   CanonicalEvent,
   JsonObject,
 } from "../src/core/events/canonical-event";
+import { isIso8601DateTime } from "../src/core/evidence/timeline";
 import type { CanonicalEventRow } from "./schema";
 
 /**
@@ -126,6 +127,38 @@ function parseOccurredAt(occurredAt: string): Date {
   }
 
   const parsed = new Date(occurredAt);
+
+  // CALENDAR VALIDITY, and it is checked SEPARATELY from `new Date()` because
+  // `new Date()` does not reject an impossible date — it ROLLS IT OVER.
+  // MEASURED: `new Date("2026-02-30T12:31:07Z")` is 2 March 2026, not NaN, so
+  // the NaN guard below can never fire for a rolled calendar date. Before this
+  // check, that value passed the shape regex, passed the fraction check, and was
+  // persisted as `occurred_at = 2026-03-02T12:31:07.000Z` — precisely the
+  // "silently wrong row" this module's own header says it exists to prevent, and
+  // it would be filed against the wrong period while looking perfectly valid.
+  //
+  // `isIso8601DateTime` is the DOMAIN's validator for this exact question: it
+  // range-checks the day against that month's real length with leap years
+  // handled, rejects a leap second, and rejects an out-of-range offset. It is
+  // used rather than re-derived because a second calendar rule here is how two
+  // rules drift apart silently — the two layers disagreeing about which strings
+  // are valid instants is the defect that made this necessary.
+  //
+  // On the import: `db/**` is the persistence layer and the canonical timestamp
+  // contract lives in `src/core/**`, so reaching up to the domain validator is
+  // the correct direction and trips no boundary guard (the `db/**` guard
+  // forbids `src/plugins/**`, `node_modules/**` and provider SDKs — not core).
+  // The rule arguably belongs beside `CanonicalEvent` itself rather than in the
+  // evidence-timeline module it currently lives in; moving it is a `src/core/**`
+  // change, outside this branch's scope, and is raised as follow-up instead.
+  if (!isIso8601DateTime(occurredAt)) {
+    throw new TypeError(
+      `CanonicalEvent.occurredAt is not a real calendar instant ` +
+        `(an impossible date such as 2026-02-30 would be silently rolled over ` +
+        `to a different day): ${JSON.stringify(occurredAt)}`,
+    );
+  }
+
   if (Number.isNaN(parsed.getTime())) {
     throw new TypeError(
       `CanonicalEvent.occurredAt is not a valid date: ${JSON.stringify(occurredAt)}`,
