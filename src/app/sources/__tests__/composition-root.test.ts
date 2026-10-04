@@ -747,17 +747,43 @@ describe("composition root: a writer refusal is reported, not thrown", () => {
     const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
     const events = await fetchCanonicalEvents(registry);
     // A writer whose failure is a genuine, unclassified fault.
+    //
+    // The stub is BOTH a rejected thenable AND an upsert builder, because
+    // `CanonicalEventWriter.values`' return type is not fixed across the whole
+    // project: the idempotent-upsert work (T16) widens `insert` to hand back a
+    // `CanonicalEventUpsertBuilder`, so `values()` stops being the awaited
+    // promise and becomes the chained half. A stub written for one of those two
+    // shapes does not typecheck against the other -- which is how this suite
+    // ended up RED at `tsc` while both commits were individually GREEN. Throwing
+    // from every entry point means the assertion holds either way, so the test
+    // exercises the behaviour rather than one version of the seam:
+    // an error from inside the writer, of a type this module does not classify.
     const brokenWriter: CanonicalEventWriter = {
       insert: () => ({
-        values: async () => {
-          throw new RangeError("connection pool exhausted");
+        values: () => {
+          const fail = async (): Promise<never> => {
+            throw new RangeError("connection pool exhausted");
+          };
+          return {
+            then: <T1, T2>(
+              onFulfilled?: ((value: never) => T1 | PromiseLike<T1>) | null,
+              onRejected?: ((reason: unknown) => T2 | PromiseLike<T2>) | null,
+            ): Promise<T1 | T2> => fail().then(onFulfilled, onRejected),
+            onConflictDoUpdate: fail,
+          };
         },
       }),
     };
 
-    await expect(persistCanonicalEvents(events, brokenWriter)).rejects.toThrow(
-      RangeError,
+    const thrown = await persistCanonicalEvents(events, brokenWriter).then(
+      () => undefined,
+      (error: unknown) => error,
     );
+
+    expect(thrown).toBeInstanceOf(RangeError);
+    // Explicitly NOT classified: a refusal would be an answer about the events,
+    // and these events are perfectly writable.
+    expect(thrown).not.toBeInstanceOf(SyncPersistenceError);
   });
 });
 
