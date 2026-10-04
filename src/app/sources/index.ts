@@ -108,21 +108,50 @@ export type SyncFailureCode =
   (typeof SYNC_FAILURE_CODES)[keyof typeof SYNC_FAILURE_CODES];
 
 /**
+ * How much of the batch a refusal names.
+ *
+ * TWO SCOPES, AND THE DISTINCTION IS NOT COSMETIC. `persistCanonicalEvents`
+ * maps and deduplicates the whole page and then executes ONE statement, so a
+ * refusal raised by the DATABASE arrives with no offending row attached to it —
+ * Postgres names the row it was inserting, not the one the constraint came from
+ * among several. Inventing an index there would be a fabricated answer, so a
+ * page-scope refusal says plainly that no single event is identified.
+ */
+export const SYNC_FAILURE_SCOPES = {
+  /** One event is named; `index`, `eventId` and `externalId` are present. */
+  event: "event",
+  /** The batch was refused as a whole; no single event is identified. */
+  page: "page",
+} as const;
+
+export type SyncFailureScope =
+  (typeof SYNC_FAILURE_SCOPES)[keyof typeof SYNC_FAILURE_SCOPES];
+
+/**
  * A classified, reported sync failure.
  *
  * `detail` is the writer's rejection message carried VERBATIM, and it names the
  * offending value. That is the point of the guard: the caller learns not merely
  * that a sync failed but WHY an event was refused, without this module
  * paraphrasing a rule the persistence layer owns.
+ *
+ * The three identifying fields are OPTIONAL, and `scope` is what says whether
+ * they are there. They were required when the only possible refusal was a
+ * per-event mapper rejection, which does name its event; a database-raised
+ * refusal does not, so making them required would force a caller-facing lie
+ * rather than a type error. `scope: "event"` still guarantees all three, and
+ * that is asserted by construction at the throw site.
  */
 export interface SyncFailure {
   readonly code: SyncFailureCode;
+  /** Whether one event is named or the whole batch was refused. */
+  readonly scope: SyncFailureScope;
   /** Position of the refused event in the fetched page, 0-based. */
-  readonly index: number;
+  readonly index?: number;
   /** Canonical id of the refused event, so it can be found and re-fetched. */
-  readonly eventId: string;
+  readonly eventId?: string;
   /** Provider-scoped id of the refused event, the same value under a swap. */
-  readonly externalId: string;
+  readonly externalId?: string;
   /** The writer's own rejection message, unaltered. */
   readonly detail: string;
 }
@@ -143,8 +172,9 @@ export class SyncPersistenceError extends Error {
 
   constructor(failure: SyncFailure) {
     super(
-      `event ${JSON.stringify(failure.eventId)} at position ${failure.index} ` +
-        `was refused by the canonical_events writer (${failure.code}): ` +
+      `event ${JSON.stringify(failure.eventId ?? null)} at position ` +
+        `${failure.index ?? null} was refused by the canonical_events writer ` +
+        `(${failure.code}): ` +
         failure.detail,
     );
     this.failure = failure;
@@ -584,6 +614,7 @@ function mapRows(events: readonly CanonicalEvent[]): CanonicalEventRow[] {
       if (!(error instanceof TypeError)) throw error;
       throw new SyncPersistenceError({
         code: SYNC_FAILURE_CODES.eventNotPersistable,
+        scope: SYNC_FAILURE_SCOPES.event,
         index,
         eventId: event.id,
         externalId: event.externalId,
@@ -657,6 +688,46 @@ function dedupeByNaturalKey(
   return [...kept.values()];
 }
 
+/**
+ * Postgres check-violation SQLSTATE, in its numeric form.
+ *
+ * 23514 is the whole of class 23 (`integrity_constraint_violation`) that this
+ * table uses for CHECK constraints — see `canonical_events_type_check` and
+ * `canonical_events_metadata_is_object_check`. The numeric form carries no text
+ * in it, so nothing a driver or an attacker controls can reach a response
+ * through a comparison against it.
+ */
+const CHECK_VIOLATION = "23514";
+
+/**
+ * Detect a check-constraint violation by walking the cause chain for a
+ * SQLSTATE `code`, never for message text.
+ *
+ * The shape is deliberately identical to `isUniqueViolation` in the sync route,
+ * for the same reason and with the same two properties: the discriminator is the
+ * five-character numeric SQLSTATE, so no attacker-influenced driver text is ever
+ * parsed, and the walk is depth-bounded so a cyclic cause chain cannot hang the
+ * sync. Drizzle wraps driver failures, so the code lives on `cause` one or more
+ * levels down.
+ *
+ * WHY A NUMERIC SQLSTATE AND NOT THE CONSTRAINT NAME. Naming the constraint
+ * would classify better but cannot be done safely: the constraint name reaches
+ * us inside the driver's own message, and this module's contract is that no
+ * driver text is parsed. Two check constraints exist on this table today
+ * (`type` and `metadata`) and both mean exactly one thing here — the batch is
+ * not persistable — so the coarser classifier gives the same correct answer for
+ * both, and gives it for any check constraint added later without a code change.
+ */
+function isCheckViolation(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) return false;
+    if ((current as { code?: unknown }).code === CHECK_VIOLATION) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 export interface SyncOptions {
   readonly registry: PluginRegistry;
   /** Registered plugin name. Defaults to the GitHub plugin's own name. */
@@ -694,6 +765,36 @@ export interface SyncResult {
  * which event or why. Everything else about the sync still throws: a transport
  * or credential failure has no classification to report and is genuinely
  * exceptional.
+ *
+ * WHAT "THE WRITER REFUSED" COVERS, AND WHY THE CATCH IS NOT `instanceof`-ONLY.
+ * `mapRows` raises a `SyncPersistenceError` for a per-event rejection, but the
+ * mapper cannot see everything the database enforces: `metadata` is a
+ * compile-time claim with no runtime shape check, and the type allow-list is
+ * enforced by a CHECK constraint the mapper never sees. A non-object `metadata`
+ * and an out-of-list `type` therefore reach Postgres, which refuses the whole
+ * statement with SQLSTATE 23514 — and a raw driver error escaping this catch is
+ * exactly what produced the two-answers-one-batch defect. Measured against a
+ * real Postgres through this function, before the fix:
+ *
+ *   metadata = [1,2,3] -> thrown out of syncSource -> route 500 internal_error
+ *   metadata = null    -> returned as a failure   -> route 422
+ *
+ * The same refused batch, two answers, and the 500 one is a lie about a data
+ * problem. So a driver-thrown 23514 is converted into the SAME classified
+ * refusal here, by SQLSTATE and never by message text (see
+ * {@link isCheckViolation}).
+ *
+ * SCOPE, STATED RATHER THAN GUESSED. A database-raised refusal carries no
+ * offending row: the batch is one statement, so Postgres names the row it was
+ * inserting, not which of several rows tripped a constraint. Inventing an
+ * index or an event id there would be a fabricated answer, so the page-scope
+ * refusal names no event and says so through `scope`. A caller that needs to
+ * know WHICH event was refused re-fetches the page and validates it
+ * client-side; the route deliberately reports neither.
+ *
+ * The all-or-nothing property is preserved and load-bearing: a CHECK refusal
+ * aborts the whole statement, so `persisted: 0` is literally true rather than a
+ * rounded-down count.
  */
 export async function syncSource(options: SyncOptions): Promise<SyncResult> {
   const events = await fetchCanonicalEvents(
@@ -709,7 +810,66 @@ export async function syncSource(options: SyncOptions): Promise<SyncResult> {
     const persisted = await persistCanonicalEvents(events, options.writer);
     return { events, persisted };
   } catch (error) {
-    if (!(error instanceof SyncPersistenceError)) throw error;
-    return { events, persisted: 0, failure: error.failure };
+    if (error instanceof SyncPersistenceError) {
+      return { events, persisted: 0, failure: error.failure };
+    }
+    if (isCheckViolation(error)) {
+      return { events, persisted: 0, failure: checkViolationFailure(error) };
+    }
+    throw error;
   }
+}
+
+/**
+ * The persistence layer's own reason, taken from the DEEPEST link of the cause
+ * chain rather than the outermost.
+ *
+ * WHY DEPTH MATTERS, AND IT IS NOT COSMETIC. Drizzle's own failure is the
+ * outermost link and its message is `"Failed query: insert into
+ * \"canonical_events\" ..."` — true, and useless: it names no constraint and no
+ * offending value, so the caller would learn only that some insert failed. The
+ * driver's own message is the link that says WHICH rule fired. `mapRows` already
+ * keeps the writer's own reason for a mapper rejection; taking the outermost
+ * link here would make the database-raised path carry strictly LESS than the
+ * mapped one, which is backwards.
+ *
+ * The text is still carried VERBATIM — it is selected, never parsed or
+ * re-rendered, and no classification anywhere depends on its content. If no
+ * link in the chain has a string message, the outermost one's stringification
+ * is used rather than an empty detail, so the field is never blank.
+ */
+function driverMessage(error: unknown): string {
+  let deepest = error;
+  let current: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) break;
+    if (current instanceof Error) deepest = current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return deepest instanceof Error ? deepest.message : String(deepest);
+}
+
+/**
+ * Classify a driver-thrown check violation into the same
+ * {@link SyncFailure} the mapper produces.
+ *
+ * `detail` is the persistence layer's own reason carried VERBATIM, on exactly
+ * the same terms as a mapper rejection: it names the rule that refused the
+ * batch, which is what makes the refusal actionable to whoever has to fix the
+ * data. It is NOT rendered by the route — the sync handler selects the
+ * classification into fixed text and drops the detail, so this never reaches a
+ * response. That contract is asserted by `handler.test.ts` against a canary,
+ * not left to this comment.
+ *
+ * The code is the ONE existing `SyncFailureCode`: a new outcome was available
+ * and was deliberately not taken, because "the batch is not persistable" is the
+ * same statement whichever layer refused it, and two codes for it would let the
+ * route grow a second, differently-statused answer for the same fact.
+ */
+function checkViolationFailure(error: unknown): SyncFailure {
+  return {
+    code: SYNC_FAILURE_CODES.eventNotPersistable,
+    scope: SYNC_FAILURE_SCOPES.page,
+    detail: driverMessage(error),
+  };
 }

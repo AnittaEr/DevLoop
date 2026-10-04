@@ -41,6 +41,7 @@ import {
   persistCanonicalEvents,
   SourceConfigurationError,
   SYNC_FAILURE_CODES,
+  SYNC_FAILURE_SCOPES,
   syncSource,
 } from "@/app/sources";
 import {
@@ -316,6 +317,236 @@ describeWithDb(
         .where(eq(canonicalEvents.externalId, DB_EVENT.externalId));
       expect(rows).toHaveLength(1);
       expect(rows[0]!.title).toBe(DB_EVENT.title);
+
+      await getDb()
+        .delete(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, colliding.externalId));
+    });
+  },
+);
+
+describeWithDb(
+  "a CHECK violation refused by the DATABASE is 422, not an opaque 500 (real database)",
+  () => {
+    /**
+     * The event shape every probe here shares.
+     *
+     * `type: "issue"` is a member of `canonical_events_type_check`'s allow-list
+     * — `issue`, `change_proposal`, `issue_comment`, `change_review`, `release`,
+     * `mention`. This matters more than it looks: a probe using a type OUTSIDE
+     * that list would have its CONTROL fail for the wrong reason, and a red
+     * control proves nothing about the thing under test. (Named here by value
+     * rather than by the vocabulary a provider's native items would suggest,
+     * because `plugin-boundary.test.ts` fails any native provider term appearing
+     * outside `src/plugins/**` — and it is right to.)
+     */
+    const PROBE_EVENT: CanonicalEvent = {
+      id: "code_hosting:acme/check#1",
+      source: "code_hosting",
+      externalId: "acme/check#1",
+      type: "issue",
+      title: "check violation probe",
+      occurredAt: "2026-10-04T10:00:00.000Z",
+      metadata: {},
+    };
+
+    async function clearProbeRow(): Promise<void> {
+      await getDb()
+        .delete(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, PROBE_EVENT.externalId));
+    }
+
+    async function rowCount(): Promise<number> {
+      const rows = await getDb()
+        .select()
+        .from(canonicalEvents)
+        .where(eq(canonicalEvents.externalId, PROBE_EVENT.externalId));
+      return rows.length;
+    }
+
+    afterEach(clearProbeRow);
+
+    afterAll(async () => {
+      if (connectionString) await closeDb();
+    });
+
+    /**
+     * Drive the WHOLE real path — route -> real syncSource -> real
+     * persistCanonicalEvents -> real Postgres — with one event's `metadata`
+     * shaped so the database refuses it.
+     *
+     * No fake writer. That is the whole point of this block: a fake writer
+     * cannot falsify this defect, because a fake that throws what the test wants
+     * to see would agree with a correct implementation AND with a broken one.
+     * Only a real Postgres raising the real SQLSTATE can tell those apart.
+     */
+    async function probeWith(metadata: unknown) {
+      return handleSyncRequest({
+        registry: registryWith(
+          fakePlugin([{ ...PROBE_EVENT, metadata } as CanonicalEvent]),
+        ),
+      });
+    }
+
+    it("gives ONE answer to 'the writer refused this batch': 422 for a database-refused non-object metadata", async () => {
+      // THE DEFECT. `metadata` is a compile-time claim with no runtime shape
+      // check, so an ARRAY reaches Postgres, which refuses the whole statement
+      // with SQLSTATE 23514. Before the fix that driver error escaped
+      // `syncSource`'s catch entirely and this route answered:
+      //
+      //   status = 500  outcome = "internal_error"  ok = false
+      //
+      // while `metadata: null` — the same refused batch, refused by the mapper
+      // one layer earlier — answered 422. Two answers for one fact, and the 500
+      // one told the caller the route was broken when the truth was that its
+      // content was not persistable.
+      const { status, body } = await probeWith([1, 2, 3]);
+
+      expect(status).toBe(422);
+      expect(status).not.toBe(500);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.eventNotPersistable);
+      expect(body.ok).toBe(false);
+      // Nothing was written, and the batch really is all-or-nothing: the
+      // CHECK aborts the statement, so this is literally zero rows, not a
+      // rounded-down count.
+      expect(body.persisted).toBe(0);
+      expect(body.fetched).toBe(0);
+      expect(await rowCount()).toBe(0);
+      expect(body.message).toMatch(/refused/i);
+    });
+
+    it("answers 422 for the mapper-refused JSON null too, so both refusals AGREE", async () => {
+      // The other half of the two-answers defect. JSON null satisfies NOT NULL
+      // (it is the jsonb VALUE `null`, not SQL NULL) and satisfies nothing
+      // `JsonObject` promises, so the mapper catches it and this was ALREADY a
+      // 422 at `b6028b1`. It is asserted here as a pairing, not as a regression:
+      // the defect was precisely that these two identical-in-kind refusals gave
+      // different answers, and this test is what makes a future divergence
+      // between them loud.
+      const { status, body } = await probeWith(null);
+
+      expect(status).toBe(422);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.eventNotPersistable);
+      expect(body.ok).toBe(false);
+      expect(body.persisted).toBe(0);
+      expect(await rowCount()).toBe(0);
+    });
+
+    it("answers 422 for a bad `type` too: a CHECK refusal is 422 whichever constraint fired", async () => {
+      // A DIFFERENT constraint on the same table. Before the fix this was also
+      // a 500, which proves the defect was not metadata-specific and that the
+      // fix cannot be a `metadata`-specific special case either.
+      const { status, body } = await handleSyncRequest({
+        registry: registryWith(
+          fakePlugin([
+            {
+              ...PROBE_EVENT,
+              // Deliberately outside `CanonicalEventType`: the point of the probe
+              // is a value the TYPE SYSTEM rejects and the DATABASE refuses, so
+              // it cannot be spelled without a cast. The cast is confined to
+              // this one fixture, and the `not_a_real_type` literal is what the
+              // CHECK constraint's allow-list is being measured against.
+              type: "not_a_real_type",
+            } as unknown as CanonicalEvent,
+          ]),
+        ),
+      });
+
+      expect(status).toBe(422);
+      expect(status).not.toBe(500);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.eventNotPersistable);
+      expect(body.ok).toBe(false);
+      expect(await rowCount()).toBe(0);
+    });
+
+    it("does NOT leak the driver's message or the offending value into the response", async () => {
+      // c6 at the REAL seam. `SyncFailure.detail` is now populated from the
+      // driver on this path, so the route's promise not to render it is a live
+      // question rather than a formality. The driver's message names the
+      // constraint AND, in its DETAIL line, quotes the offending row — so the
+      // value under test is the one a leak would carry.
+      //
+      // The canary is embedded in the payload itself, so it exists in the exact
+      // form that would be echoed if the handler rendered `detail`.
+      const canary = "W-CHECK-CANARY-9f3a";
+      const { status, body } = await probeWith([canary, 1, 2]);
+
+      expect(status).toBe(422);
+      const serialised = JSON.stringify(body);
+      expect(serialised).not.toContain(canary);
+      // Nor the driver text that names the constraint, nor the row echo.
+      expect(serialised).not.toContain("canonical_events");
+      expect(serialised).not.toContain("violates check constraint");
+      expect(serialised).not.toContain("Failed query");
+      expect(body).not.toHaveProperty("failure");
+      expect(body).not.toHaveProperty("detail");
+    });
+
+    it("CONTROL: object metadata still goes 200 / synced with the row written", async () => {
+      // The control that makes every assertion above mean something. If this
+      // went red the probe itself would be wrong — e.g. a `type` outside the
+      // CHECK's allow-list, so the "refusal" was the fixture's fault and not the
+      // database's. Run against the real database, so it also proves the fix
+      // did not break the happy path through the same code.
+      const { status, body } = await probeWith({ note: "an object" });
+
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.synced);
+      expect(body.persisted).toBe(1);
+      expect(await rowCount()).toBe(1);
+    });
+
+    it("CONTROL: the check is keyed on the refusal, NOT on persisted === 0", async () => {
+      // The second control, and the one the previous defect's fix could most
+      // easily have broken. `persisted: 0` is ALSO what a genuinely empty page
+      // returns, so a check written on that value would report an empty sync as
+      // a 422 refusal. Driven through the REAL writer, because an injected fake
+      // is where that mistake would hide.
+      const { status, body } = await handleSyncRequest({
+        registry: registryWith(fakePlugin([])),
+      });
+
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.empty);
+      expect(body.persisted).toBe(0);
+    });
+
+    it("CONTROL: a genuine repeat still converges, and a primary-key-only collision is still 409", async () => {
+      // The third control: the new classification must not have swallowed
+      // `already_present`, which is the sibling `23505` path and the only other
+      // database-raised refusal this route classifies. Both halves, through the
+      // real database.
+      const first = await handleSyncRequest({
+        registry: registryWith(fakePlugin([PROBE_EVENT])),
+      });
+      expect(first.status).toBe(200);
+      expect(first.body.persisted).toBe(1);
+
+      // A repeat converges rather than failing.
+      const second = await handleSyncRequest({
+        registry: registryWith(
+          fakePlugin([{ ...PROBE_EVENT, title: "second title" }]),
+        ),
+      });
+      expect(second.status).toBe(200);
+      expect(second.body.outcome).toBe(SYNC_OUTCOMES.synced);
+      expect(second.body.persisted).toBe(1);
+      expect(await rowCount()).toBe(1);
+
+      // A collision on PRIMARY KEY alone, invisible to the natural-key upsert,
+      // is still reported as a conflict and not as a refusal.
+      const colliding: CanonicalEvent = {
+        ...PROBE_EVENT,
+        externalId: "acme/check#2",
+        title: "collides on the primary key only",
+      };
+      const third = await handleSyncRequest({
+        registry: registryWith(fakePlugin([colliding])),
+      });
+      expect(third.status).toBe(409);
+      expect(third.body.outcome).toBe(SYNC_OUTCOMES.alreadyPresent);
 
       await getDb()
         .delete(canonicalEvents)
@@ -664,6 +895,11 @@ describe("a refused batch is never reported as a success", () => {
   /**
    * A `sync` that behaves exactly as `syncSource` behaves on refusal: events
    * fetched, nothing written, and the classification attached.
+   *
+   * `scope` is stated because `SyncFailure` REQUIRES it. That is not ceremony:
+   * it is the reason a producer of a refusal must say whether it is naming one
+   * event or refusing the whole batch, which is the distinction a
+   * database-raised refusal (which names no event) needs to make.
    */
   function refusingSync() {
     return async () => ({
@@ -671,6 +907,7 @@ describe("a refused batch is never reported as a success", () => {
       persisted: 0,
       failure: {
         code: SYNC_FAILURE_CODES.eventNotPersistable,
+        scope: SYNC_FAILURE_SCOPES.event,
         index: 0,
         eventId: event().id,
         externalId: event().externalId,
