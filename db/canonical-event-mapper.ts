@@ -34,6 +34,13 @@
  * type, but `occurredAt` is a core scalar with no such escape hatch: a
  * half-supported timestamp here would be a data-loss bug reported much later.
  * Both rejections are cheap and loud at the boundary where they belong.
+ *
+ * WHAT THE WRITER REFUSES TO EMIT (T18). `metadata` additionally carries a small
+ * reserved namespace of its own — see {@link RESERVED_METADATA_KEYS} — which the
+ * writer refuses at the top level, for the same reason: a value it cannot store
+ * faithfully is rejected loudly at the boundary rather than silently mangled.
+ * The two guards are independent and compose; the `metadata` check runs first, so
+ * a reserved key is rejected before `occurredAt` is even parsed.
  */
 
 import type {
@@ -67,6 +74,33 @@ const FRACTION = /\.(\d+)/;
 const REPRESENTABLE_FRACTION_DIGITS = 3;
 
 /**
+ * Top-level `metadata` key the writer refuses to emit, reserved by the
+ * remediation path in `db/migrations/0002_loud_johnny_blaze.sql`: that migration
+ * wraps the original value of a pre-migration row whose `metadata` was not a
+ * JSON object under exactly this key, so a row carrying it at the top level is
+ * by definition a *remediated* row and not plugin-authored data.
+ *
+ * SCOPE IS THE TOP LEVEL ONLY, DELIBERATELY. A nested occurrence
+ * (`metadata.nested._devloop_legacy_non_object`) cannot be confused with the
+ * remediation shape, because the remediation rewrites the WHOLE column to
+ * `{"_devloop_legacy_non_object": <original>}` — a nested key is always inside
+ * the wrapped value. Sibling keys that merely *start with* the reserved name
+ * (`_devloop_legacy_non_object_nested`) are equally unrelated, and
+ * `metadata` exists precisely so a plugin can carry anything shape-specific
+ * without widening the core type; reserving a prefix or recursing into the
+ * value would destroy legitimate plugin data to prevent a collision that cannot
+ * occur. The guard therefore tests own top-level keys only.
+ *
+ * Rejected rather than stripped or renamed: this is a reserved namespace, and a
+ * silent strip would discard a plugin's real key just as surely as storing it
+ * would, while a rename would leave the caller believing its data was written.
+ * A loud throw at the boundary is the only outcome that is never a lie.
+ */
+export const RESERVED_METADATA_KEYS: readonly string[] = [
+  "_devloop_legacy_non_object",
+];
+
+/**
  * Converts a `CanonicalEvent` into its insertable row shape.
  *
  * Returns the SELECT row shape rather than `NewCanonicalEventRow`. It is a
@@ -78,8 +112,12 @@ const REPRESENTABLE_FRACTION_DIGITS = 3;
  * @throws TypeError if `occurredAt` is not a parseable ISO-8601 value, omits its
  * UTC offset, or carries sub-millisecond precision — see the module comment for
  * why each of those is a rejection rather than a silent normalisation.
+ * @throws TypeError if `metadata` carries a reserved top-level key — see
+ * {@link RESERVED_METADATA_KEYS} for why this is a rejection rather than a
+ * normalisation, and for why the scope is the top level only.
  */
 export function toCanonicalEventRow(event: CanonicalEvent): CanonicalEventRow {
+  assertNoReservedMetadataKeys(event.metadata);
   const occurredAt = parseOccurredAt(event.occurredAt);
 
   return {
@@ -96,6 +134,35 @@ export function toCanonicalEventRow(event: CanonicalEvent): CanonicalEventRow {
     // the row (and so the value is provably JSON-safe before it reaches jsonb).
     metadata: structuredClone(event.metadata) as JsonObject,
   };
+}
+
+/**
+ * Throws if `metadata` carries any reserved key at its own top level.
+ *
+ * Own top-level keys only, matching the scope documented on
+ * {@link RESERVED_METADATA_KEYS}. `Object.keys` rather than `in` because it
+ * yields own enumerable properties only: an `in` check would also see a
+ * prototype-chain hit (e.g. an `Object.prototype` poisoning attack that adds
+ * the reserved name) and make an unrelated event look reserved, and would see
+ * a non-enumerable own property that JSON would never carry to the column.
+ */
+function assertNoReservedMetadataKeys(metadata: JsonObject): void {
+  for (const key of Object.keys(metadata)) {
+    if (!RESERVED_METADATA_KEYS.includes(key)) {
+      continue;
+    }
+    throw new TypeError(
+      `CanonicalEvent.metadata carries the reserved top-level key ` +
+        `${JSON.stringify(key)}, which the writer refuses to emit. ` +
+        `db/migrations/0002_loud_johnny_blaze.sql uses that key to mark a ` +
+        `pre-migration row whose metadata was not a JSON object, so a row ` +
+        `carrying it cannot be told apart from a remediated one — and ` +
+        `"reverse the remediation" would then corrupt the plugin's own data. ` +
+        `Only the TOP-LEVEL key is reserved: a nested occurrence, or a ` +
+        `sibling key that merely starts with the same name, is accepted ` +
+        `unchanged. Rename the key to proceed.`,
+    );
+  }
 }
 
 /**
