@@ -405,6 +405,23 @@ const UPSERT_UPDATED_COLUMNS = {
  * An empty list is a no-op rather than a query: a source that has nothing new
  * must not cost a round trip, and Drizzle rejects an empty `values()`.
  *
+ * WHY THE BATCH IS DEDUPLICATED BEFORE `.values()`. `ON CONFLICT DO UPDATE`
+ * absorbs a duplicate that ALREADY EXISTS in the table. It cannot absorb two
+ * duplicates of the SAME key WITHIN ONE STATEMENT: Postgres refuses to update
+ * the same conflict row twice in a single command and raises SQLSTATE 21000
+ * (`cardinality_violation`), which aborts the whole statement. The batch is
+ * therefore not partially lost, it is ENTIRELY lost — measured against a real
+ * Postgres at this head, a batch containing a repeated `(source, external_id)`
+ * raised 21000 and left zero rows behind while a control batch through the same
+ * writer succeeded, so the table was provably writable. That failure is silent
+ * at the level the only production caller sees: `syncSource`'s caller in T15's
+ * route handler cannot distinguish "this batch collided with itself" from "this
+ * source had nothing new", both of which look like nothing persisted.
+ *
+ * So the duplicate is removed from the batch rather than left for Postgres to
+ * reject. See {@link dedupeByNaturalKey} for which of two conflicting payloads
+ * survives.
+ *
  * THE MAP IS GUARDED, and this is the fix for a layer disagreement. The domain's
  * `isIso8601DateTime` accepts any fractional-digit count — deliberately, because
  * a sub-millisecond instant is still orderable, and narrowing it to what a
@@ -425,7 +442,12 @@ export async function persistCanonicalEvents(
   writer?: CanonicalEventWriter,
 ): Promise<number> {
   if (events.length === 0) return 0;
-  const rows = mapRows(events);
+  // Mapping happens FIRST and deduplication SECOND, deliberately. Mapping first
+  // keeps `SyncFailure.index` a true position in the page the caller fetched;
+  // deduplicating first would renumber every event after the first duplicate,
+  // so a refusal would point at the wrong item. The dedupe still happens before
+  // `.values()`, which is where the cardinality violation is raised.
+  const rows = dedupeByNaturalKey(mapRows(events));
   // Resolved INSIDE the guard rather than as a default parameter value: a
   // default is evaluated on every call, including when a writer is supplied, so
   // `writer = getDb()` would demand DATABASE_URL from a caller that never
@@ -472,6 +494,69 @@ function mapRows(events: readonly CanonicalEvent[]): CanonicalEventRow[] {
     }
   }
   return rows;
+}
+
+/**
+ * Collapse rows sharing the natural key `UNIQUE(source, external_id)`, keeping
+ * the LAST occurrence of each key.
+ *
+ * WHY THE DEDUPE IS NECESSARY. `ON CONFLICT DO UPDATE` resolves a conflict
+ * against a row that ALREADY EXISTS in the table. Two rows in ONE statement
+ * that both target the SAME conflict row is a different thing: Postgres raises
+ * SQLSTATE 21000 (`cardinality_violation`, "cannot update row more than once")
+ * and the statement aborts, so the WHOLE batch is written zero rows rather than
+ * one — the failure mode this function exists to remove. Measured on a real
+ * Postgres: a batch with one repeated natural key raised 21000 and left no rows
+ * behind, while a control batch through the same writer succeeded. `syncSource`
+ * reports both as `persisted: 0`, which is why the loss was silent.
+ *
+ * WHICH EVENT WINS: LAST OCCURRENCE WINS, stated explicitly rather than left
+ * emergent. If the batch names `(source, externalId)` more than once, the LAST
+ * such row in input order is kept and every earlier one is dropped. The reason
+ * last-wins: this function's whole purpose is to converge on the source's
+ * CURRENT view of an event — the upsert's own rule is that a repeat sync
+ * UPDATES the mutable columns (see {@link UPSERT_UPDATED_COLUMNS}) — and within
+ * one fetched page a later sighting of the same event is at least as fresh as an
+ * earlier one, exactly as a later sync overwrites an earlier sync. A page is
+ * ordered by the source, so "later in the batch" is the source's own ordering,
+ * not an accident of iteration.
+ *
+ * DETERMINISM. The rule is positional and total: for every input position there
+ * is exactly one decision (keep if no later row shares its key), so the result
+ * does not depend on object identity, property enumeration order, or Map
+ * insertion/re-insertion order. Each key is seen once in `kept`, and a later
+ * occurrence REPLACES the earlier one, so the surviving row is the last one by
+ * construction. `Map` never reorders an existing key when its value is
+ * replaced, and the key is the JSON-encoded PAIR rather than a delimiter-joined
+ * string, so no two distinct natural keys can be forged into one.
+ *
+ * THE KEY IS THE PAIR `(source, externalId)`, NOT EITHER COLUMN ALONE. `source`
+ * participates in the key because it is part of the constraint the upsert
+ * targets: the same `externalId` under two sources is two DIFFERENT events and
+ * both must survive. `id` deliberately does NOT participate: a primary-key
+ * collision that the natural key does not share is a genuine conflict for the
+ * database to raise (23505), and absorbing it here would hide two different
+ * events claiming one primary key. Deduplication must not weaken that path, and
+ * `__tests__/persist-canonical-events-upsert.test.ts` pins both halves.
+ */
+function dedupeByNaturalKey(
+  rows: readonly CanonicalEventRow[],
+): CanonicalEventRow[] {
+  const kept = new Map<string, CanonicalEventRow>();
+  for (const row of rows) {
+    // `JSON.stringify` of the pair, not a delimiter join: a delimiter can appear
+    // inside either value, so `("a|b", "c")` and `("a", "b|c")` would forge one
+    // key out of two distinct natural keys and silently drop an event. The JSON
+    // array is unambiguous for every string, so no key is ever forged.
+    kept.set(JSON.stringify([row.source, row.externalId]), row);
+  }
+  // Map iteration order is insertion order, and `set` on an EXISTING key
+  // replaces the value without moving the key, so this yields one row per
+  // natural key in the position of that key's FIRST occurrence in the batch,
+  // holding that key's LAST occurrence. Row order is irrelevant to the outcome
+  // (keys are independent) but keeping it stable makes a failure reproducible
+  // instead of dependent on a Map's internals.
+  return [...kept.values()];
 }
 
 export interface SyncOptions {

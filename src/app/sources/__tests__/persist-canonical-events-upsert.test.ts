@@ -38,7 +38,7 @@
  * upsert resolves them. It is asserted by execution on every run.
  */
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import type { CanonicalEvent } from "@/core/events/canonical-event";
@@ -308,6 +308,205 @@ describeWithDb(
     });
   },
 );
+
+describeWithDb("a batch that names the same natural key twice", () => {
+  /**
+   * B33: the 21000 whole-batch loss, pinned by execution against a real
+   * Postgres.
+   *
+   * WHY THIS BLOCK EXISTS SEPARATELY FROM T16's. T16 pinned the conflict ARBITER
+   * — which constraint `ON CONFLICT` targets — for rows that already exist in the
+   * table. Neither of its tests covers a batch that collides with ITSELF: two
+   * rows in ONE statement naming the same `(source, external_id)`. That is not
+   * resolvable by the arbiter at all. Postgres refuses to update the same
+   * conflict row twice in a single command, raises SQLSTATE 21000
+   * (`cardinality_violation`), and aborts the STATEMENT — so the loss is the
+   * whole batch, not one row.
+   *
+   * The RED this block replaces was measured, not assumed: a control batch with
+   * no duplicate persisted (return 1) through the same writer against the same
+   * database, and the batch with the duplicate then raised 21000 and left zero
+   * rows for that key, with the control row the only row in the table. So the
+   * table was provably writable; the batch was discarded whole.
+   */
+
+  /** Distinct key from T16's `EVENT` so the two blocks cannot interfere. */
+  const DUP: CanonicalEvent = {
+    id: "evt_b33_dup",
+    source: "b33-source",
+    externalId: "ext-b33-dup",
+    type: "issue",
+    title: "title one",
+    occurredAt: "2026-01-02T03:04:05.000Z",
+    metadata: { note: "one" },
+  };
+
+  afterEach(async () => {
+    await getDb()
+      .delete(canonicalEvents)
+      .where(eq(canonicalEvents.externalId, DUP.externalId));
+  });
+
+  it("does not throw, writes exactly ONE row, and that row carries the LAST occurrence's title", async () => {
+    // (a) IT DOES NOT THROW. The assertion is implicit — reaching the
+    // `expect` below at all means the call returned rather than rejecting with
+    // 21000 — and it is stated here because that is the defect: before the
+    // dedupe this line raised `cardinality_violation`.
+    const written = await persistCanonicalEvents([
+      { ...DUP, title: "title one" },
+      { ...DUP, title: "title two" },
+      { ...DUP, title: "title three" },
+    ]);
+
+    // The RETURN VALUE also changes, deliberately: it is the row count actually
+    // written, so a collapsed batch reports 1 rather than the 3 handed in.
+    // Asserting `3` here would be asserting the bug.
+    expect(written).toBe(1);
+
+    // (b) EXACTLY ONE ROW EXISTS AFTERWARDS.
+    const rows = await getDb()
+      .select()
+      .from(canonicalEvents)
+      .where(eq(canonicalEvents.externalId, DUP.externalId));
+    expect(rows).toHaveLength(1);
+
+    // (c) IT CARRIES THE WINNER'S TITLE. The stated rule is LAST OCCURRENCE
+    // WINS, so with three sightings holding three different titles the survivor
+    // is the third. `title three` — not `title one` (first-wins), not "any of
+    // them" (which is what a membership assertion like the concurrent-writers
+    // test uses, and which would pass for ANY implementation at all).
+    expect(rows[0]!.title).toBe("title three");
+  });
+
+  it("keeps the LAST occurrence, not the first, when only two differ", async () => {
+    // The two-event shape the card names, isolated from the three-event case so
+    // the winner assertion cannot be satisfied by an off-by-one that happens to
+    // land on the right index of a longer list.
+    const written = await persistCanonicalEvents([
+      { ...DUP, title: "earlier title" },
+      { ...DUP, title: "later title" },
+    ]);
+
+    expect(written).toBe(1);
+    const [row] = await getDb()
+      .select()
+      .from(canonicalEvents)
+      .where(eq(canonicalEvents.externalId, DUP.externalId));
+    expect(row!.title).toBe("later title");
+  });
+
+  it("does not lose the OTHER events in a batch that also contains a duplicate", async () => {
+    // The severity claim, asserted: the defect cost the ENTIRE batch, not the
+    // one duplicated key. So the two unique keys alongside the duplicate must
+    // survive. Before the dedupe this batch raised 21000 and wrote NOTHING —
+    // three rows in, zero rows out, silently reported to the caller as
+    // "nothing persisted".
+    const other: CanonicalEvent = {
+      ...DUP,
+      id: "evt_b33_other",
+      externalId: "ext-b33-other",
+      title: "other title",
+    };
+    const third: CanonicalEvent = {
+      ...DUP,
+      id: "evt_b33_third",
+      externalId: "ext-b33-third",
+      title: "third title",
+    };
+
+    const written = await persistCanonicalEvents([
+      { ...DUP, title: "duplicate one" },
+      other,
+      { ...DUP, title: "duplicate two" },
+      third,
+    ]);
+
+    expect(written).toBe(3);
+    const rows = await getDb()
+      .select()
+      .from(canonicalEvents)
+      .where(
+        sql`external_id IN ('ext-b33-dup', 'ext-b33-other', 'ext-b33-third')`,
+      );
+    expect(rows).toHaveLength(3);
+    const byKey = new Map(rows.map((row) => [row.externalId, row.title]));
+    expect(byKey.get("ext-b33-dup")).toBe("duplicate two");
+    expect(byKey.get("ext-b33-other")).toBe("other title");
+    expect(byKey.get("ext-b33-third")).toBe("third title");
+
+    await getDb()
+      .delete(canonicalEvents)
+      .where(sql`external_id IN ('ext-b33-other', 'ext-b33-third')`);
+  });
+
+  it("is keyed on the PAIR: one batch, same externalId under TWO sources, still writes TWO rows", async () => {
+    // THE DEDUPE MUST NOT BE OVER-BROAD. Deduplicating on `externalId` alone
+    // would satisfy every test above — it would also collapse two genuinely
+    // DIFFERENT events from two different sources into one, which is the
+    // 23505-era mistake reappearing at the batch level: silent loss of a real
+    // event. `UNIQUE(source, external_id)` is a pair, so the pair is the key.
+    const one: CanonicalEvent = { ...DUP, source: "b33-source-one" };
+    const two: CanonicalEvent = {
+      ...DUP,
+      id: "evt_b33_dup_two_sources",
+      source: "b33-source-two",
+    };
+
+    const written = await persistCanonicalEvents([one, two]);
+
+    expect(written).toBe(2);
+    const rows = await getDb()
+      .select()
+      .from(canonicalEvents)
+      .where(eq(canonicalEvents.externalId, DUP.externalId));
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.source).sort()).toEqual([
+      "b33-source-one",
+      "b33-source-two",
+    ]);
+
+    await getDb()
+      .delete(canonicalEvents)
+      .where(eq(canonicalEvents.externalId, DUP.externalId));
+  });
+
+  it("is NOT keyed on `id`: a primary-key-only collision in one batch still raises 23505", async () => {
+    // THE NON-REGRESSION GUARD (card criterion 5). If the dedupe included `id`
+    // in its key, this batch would be collapsed and the conflict ABSORBED —
+    // two different events claiming one primary key would stop surfacing, which
+    // is data loss disguised as a fix. `id` is deliberately not part of the
+    // dedupe key, so this shape is untouched by it.
+    //
+    // The two events share `id` but differ on BOTH natural-key columns, so
+    // `UNIQUE(source, external_id)` sees no duplicate and the primary key must
+    // still raise.
+    const colliding: CanonicalEvent = {
+      ...DUP,
+      source: "b33-source-colliding",
+      externalId: "ext-b33-colliding",
+      title: "colliding on the primary key only",
+    };
+
+    let caught: unknown;
+    try {
+      await persistCanonicalEvents([DUP, colliding]);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      cause: { code: "23505", constraint_name: "canonical_events_pkey" },
+    });
+
+    // And the whole batch was correctly refused: a primary-key conflict is a
+    // loud failure, not something the dedupe should paper over.
+    const rows = await getDb()
+      .select()
+      .from(canonicalEvents)
+      .where(eq(canonicalEvents.externalId, DUP.externalId));
+    expect(rows).toHaveLength(0);
+  });
+});
 
 describeWithDb("two concurrent syncs of the same natural key", () => {
   /**
