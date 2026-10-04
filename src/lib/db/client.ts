@@ -68,9 +68,35 @@ export async function checkDatabaseConnection(): Promise<DatabaseConnectionCheck
     );
     return { ok: true, result: Number(rows[0]?.one ?? 0) };
   } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
+    return { ok: false, error: describeError(error) };
   }
+}
+
+/**
+ * Renders a caught error for humans, including the underlying cause.
+ *
+ * Drizzle wraps the driver failure, so `error.message` alone is frequently just
+ * "Failed query: SELECT 1::int AS one" — the actual reason (ECONNREFUSED,
+ * password authentication failed, unknown database) only lives on
+ * `error.cause`. Without appending the cause, `db:check` cannot tell the
+ * developer what actually went wrong.
+ */
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: unknown }).cause;
+  const causeText =
+    cause instanceof Error
+      ? [cause.message, codeOf(cause)].filter(Boolean).join(" (")
+      : cause === undefined
+        ? ""
+        : String(cause);
+  if (!causeText) return error.message;
+  const detail = causeText.endsWith(")") ? causeText : `${causeText})`;
+  return `${error.message} — caused by: ${detail}`;
+}
+
+/** Node system errors (ECONNREFUSED, ENOTFOUND, ...) carry a `code`. */
+function codeOf(error: Error): string {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : "";
 }

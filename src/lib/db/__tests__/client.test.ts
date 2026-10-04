@@ -1,10 +1,15 @@
 /**
  * Connection-check tests.
  *
- * IMPORTANT (T5): the database-backed describe block SKIPS when DATABASE_URL is
+ * The database-backed describe block SKIPS when DATABASE_URL is
  * unset. T2's CI workflow runs `bun run test` with no secrets and no database,
  * so a hard failure here would turn CI permanently red for a reason unrelated to
  * the code. Skipping is the correct behaviour, not a weakened test.
+ *
+ * No test in this file early-returns before its assertions: every `it` runs at
+ * least one real `expect`. T5a removed the `if (!connectionString) return;`
+ * guard that let the singleton test report PASSED with zero assertions in the
+ * DATABASE_URL-unset configuration.
  *
  * The skip decision is captured at module load; the tests below that mutate
  * DATABASE_URL call closeDb() so the lazy client re-reads the env.
@@ -18,6 +23,25 @@ import { checkDatabaseConnection, closeDb, getDb } from "../client";
 
 const connectionString = process.env.DATABASE_URL;
 const describeWithDb = connectionString ? describe : describe.skip;
+
+/**
+ * A syntactically valid but unlistening Postgres URL, derived from DATABASE_URL
+ * when present so no host, port or credential is hardcoded in the repo. Port 1 is
+ * reserved and never listening.
+ *
+ * Used wherever a test needs a real connection string in the DATABASE_URL-unset
+ * configuration: drizzle() connects lazily, so asserting on the client object
+ * never touches the network.
+ */
+function unreachableUrl(): string {
+  const url = new URL(connectionString ?? "postgresql://localhost/devloop");
+  url.hostname = "127.0.0.1";
+  url.port = "1";
+  url.username = "";
+  url.password = "";
+  url.pathname = "/nonexistent";
+  return url.toString();
+}
 
 async function withDatabaseUrl(
   value: string | undefined,
@@ -46,11 +70,18 @@ describe("getDb", () => {
   });
 
   it("returns the same instance on repeated calls (lazy singleton)", async () => {
-    // Guarded on DATABASE_URL because getDb() reads it. drizzle() does not
-    // connect eagerly, so this asserts caching only, never a live connection.
-    if (!connectionString) return;
-    await withDatabaseUrl(connectionString, async () => {
+    // Runs unconditionally. drizzle() connects lazily, so a syntactically valid
+    // but unlistening URL is enough to observe caching identity — no server is
+    // contacted. When DATABASE_URL is set we use it as-is; when it is unset we
+    // use unreachableUrl(), which keeps this a real assertion in CI where no
+    // DATABASE_URL exists. T5a: this previously early-returned here, so CI
+    // reported the test passed with zero assertions executed.
+    await withDatabaseUrl(connectionString ?? unreachableUrl(), async () => {
       expect(getDb()).toBe(getDb());
+      // Distinct call sites must yield the identical cached object, and calling
+      // again after construction must not throw (laziness stays intact).
+      expect(getDb()).toBe(getDb());
+      expect(getDb()).not.toBe(undefined);
     });
   });
 });
@@ -59,18 +90,16 @@ describe("checkDatabaseConnection", () => {
   it("returns ok:false instead of throwing when the database is unreachable", async () => {
     // Port 1 is reserved and never listening. Derived from DATABASE_URL so no
     // host, port or credential is hardcoded in the repo.
-    const unreachable = new URL(
-      connectionString ?? "postgresql://localhost/devloop",
-    );
-    unreachable.hostname = "127.0.0.1";
-    unreachable.port = "1";
-    unreachable.username = "";
-    unreachable.password = "";
-    unreachable.pathname = "/nonexistent";
-    await withDatabaseUrl(unreachable.toString(), async () => {
+    await withDatabaseUrl(unreachableUrl(), async () => {
       const result = await checkDatabaseConnection();
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.error).toBeTypeOf("string");
+      // T5a: the driver failure is wrapped by Drizzle, so a bare error.message
+      // would read only "Failed query: SELECT 1::int AS one". The reported
+      // string must therefore carry the underlying cause for db:check to be
+      // actionable when the local Postgres is simply not running.
+      if (result.ok) throw new Error("unreachable: expected ok:false");
+      expect(result.error).toContain("caused by:");
+      expect(result.error).toMatch(/ECONNREFUSED|connect /i);
     });
   });
 });
