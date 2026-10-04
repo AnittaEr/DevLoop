@@ -2,6 +2,10 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FlatCompat } from "@eslint/eslintrc";
 import { coreBoundaryPlugin, RULE_ID } from "./eslint-plugin-core-boundary.mjs";
+import {
+  noJsonAssertPlugin,
+  RULE_ID as JSON_ASSERT_RULE_ID,
+} from "./eslint-plugin-no-json-assert.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -148,6 +152,55 @@ const eslintConfig = [
       // removing the specifier list cannot silently take the resolver with it:
       // the two fail for different reasons and are deleted by different edits.
       [RULE_ID]: "error",
+    },
+  },
+  {
+    // R145: an assertion to a JSON type on a jsonb-bound value erases the only
+    // check that the value is JSON-safe, and `tsc` does not notice — measured on
+    // this tree, not assumed: dropping ` as JsonObject` from
+    // `db/canonical-event-mapper.ts:39` leaves `bun run typecheck` at exit 0,
+    // and so does replacing the value with `"nonsense" as unknown as
+    // JsonObject`. See `eslint-plugin-no-json-assert.mjs` for why this is an
+    // AST rule rather than a text search, and why the read-path cast on line 63
+    // is deliberately NOT denied (`{}` is not assignable to `JsonObject`, so
+    // `tsc` already refuses to remove it).
+    //
+    // PRE-EXISTING VIOLATIONS AT THE BASE `e780063`, measured with
+    //   grep -rnE "as (JsonObject|Json|JsonValue|PgJsonb)\b" db src e2e \
+    //     --include='*.ts' --include='*.tsx'
+    // which returned exactly two hits, both in `db/canonical-event-mapper.ts`
+    // and BOTH PRE-EXISTING this rule. Per the ticket they are NOT silently
+    // fixed — the mapper is DO NOT TOUCH because batch 12 (PR #13) owns it — so
+    // each is allowlisted individually below, by file:line.
+    //
+    // `db/canonical-event-mapper.ts:39` — the WRITE path. This is the R145
+    // defect itself: `structuredClone(event.metadata) as JsonObject` is an
+    // assertion nothing checks. Allowlisted only because the file is owned by
+    // an in-flight integration; removing the cast there is a one-line change
+    // that this card must not make.
+    //
+    // `db/canonical-event-mapper.ts:63` — the READ path. Genuinely redundant
+    // rather than unchecked: tsc already rejects its removal (TS2322). The rule
+    // does not fire on it at all (see the plugin module), so this entry exists
+    // only to keep the allowlist honest about both lines the base carries.
+    //
+    // `unusedAllowlistEntries` is deliberately NOT enabled. It would flag any
+    // entry that matches nothing, but the line-63 entry cannot ever be "used"
+    // (the rule never reports it), so enabling it would fail lint permanently
+    // over a permanently-unmatched entry. Stale entries are handled by the
+    // rule's own `staleAllowlistEntry` message instead.
+    files: ["db/**/*.{ts,tsx}", "src/**/*.{ts,tsx}"],
+    plugins: { "no-json-assert": noJsonAssertPlugin },
+    rules: {
+      [JSON_ASSERT_RULE_ID]: [
+        "error",
+        {
+          allow: [
+            "db/canonical-event-mapper.ts:39",
+            "db/canonical-event-mapper.ts:63",
+          ],
+        },
+      ],
     },
   },
 ];
