@@ -31,24 +31,30 @@ export type JsonValue =
 export type JsonObject = { [key: string]: JsonValue };
 
 /**
- * The kinds of event DevLoop ingests. These are domain concepts (a unit of
- * work, a comment on one, a change proposal, ...), not API resource names --
- * they are chosen so they read the same for every source DevLoop will support.
+ * The kinds of event DevLoop ingests, named for the ROLE each one plays in
+ * DevLoop rather than for any source's API resource. A member must name the
+ * ROLE in DevLoop's own language, so that every supported source's equivalent
+ * of it maps onto the same name without the name lying about where it came
+ * from. `issue` is kept as-is because it is native terminology for more than
+ * one source, so it is not a provider name.
+ *
+ * Source-specific detail that does not fit these roles belongs in
+ * `CanonicalEvent["metadata"]`, never in this union.
  */
 export type CanonicalEventType =
   | "issue"
-  | "pull_request"
+  | "change_proposal"
   | "issue_comment"
-  | "pull_request_review"
+  | "change_review"
   | "release"
   | "mention";
 
 /** Every `CanonicalEventType` value, for runtime validation and iteration. */
 export const CANONICAL_EVENT_TYPES: readonly CanonicalEventType[] = [
   "issue",
-  "pull_request",
+  "change_proposal",
   "issue_comment",
-  "pull_request_review",
+  "change_review",
   "release",
   "mention",
 ];
