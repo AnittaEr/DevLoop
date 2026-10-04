@@ -13,9 +13,11 @@ concurrency:
 
 jobs:
   verify:
-    name: lint, typecheck, test, build
+    name: format, lint, typecheck, test, build, e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Raised from 15: the e2e step adds an apt-get system-dependency install
+    # and a ~170 MB Chromium download on top of the six existing gates.
+    timeout-minutes: 25
     env:
       # Vitest/Next must behave as they do on a headless runner, and no TTY may be
       # required. No repository secrets are used by this workflow, so it passes on
@@ -65,3 +67,37 @@ jobs:
 
       - name: Build
         run: bun run build
+
+      # ── e2e ──────────────────────────────────────────────────────────────────
+      # Everything below runs the Playwright suite for real. It is a separate
+      # step group (not folded into Build) so that when it goes red, the log
+      # says e2e failed rather than "build failed".
+      #
+      # `--with-deps` is deliberate and NOT optional. A GitHub runner has no
+      # Chromium and none of the shared libraries Chromium dlopen()s at startup
+      # (libnss3, libatk-1.0, libgbm, libasound2, the X11/i18n/gtk family). The
+      # plain `playwright install chromium` only downloads the browser; the first
+      # launch then dies with "error while loading shared libraries". On
+      # ubuntu-latest the deps install is the single most common reason this
+      # step fails, so it is provisioned up front rather than discovered.
+      # `playwright install --with-deps` == install browser + `playwright
+      # install-deps`, i.e. an apt-get run of Playwright's own pinned package
+      # list; it is not the same thing as Playwright's docker image.
+      - name: Install Chromium and its system dependencies
+        run: bunx playwright install --with-deps chromium
+
+      # `bun run e2e` = `playwright test`. playwright.config.ts already pins
+      # everything a headless runner needs, so this is a plain invocation:
+      #   - CI:true is set at job level, so retries=2, forbidOnly, line reporter
+      #     and reuseExistingServer:false all take effect.
+      #   - webServer.command is `bun run start` (next start), which serves the
+      #     .next/ output produced by the Build step above — hence e2e must run
+      #     AFTER build, never before it. Playwright polls http://127.0.0.1:3000
+      #     and only starts the server itself because reuseExistingServer is
+      #     false under CI.
+      #   - The chromium project uses the bundled channel-less Chrome build and
+      #     runs headless by default, identical to local behaviour.
+      # No secrets: the specs are local-only and the server needs no database or
+      # credential provider.
+      - name: E2E (Playwright)
+        run: bun run e2e
