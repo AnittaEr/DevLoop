@@ -45,9 +45,11 @@ import type { CanonicalEventRow } from "./schema";
 /**
  * An ISO-8601 date-time that carries an explicit UTC offset.
  *
- * Anchored to `T` + a time, then either `Z` or a signed `±HH:MM` (or `±HHMM`).
- * Fractional seconds are optional here and checked for representability
- * separately, because `Date` truncates below milliseconds.
+ * Anchored to `T` + a time, then either `Z` or a signed `±HH:MM`. The colon in
+ * the offset is REQUIRED: the basic-format `±HHMM` spelling that ISO-8601 also
+ * permits is deliberately not accepted. Fractional seconds are optional here
+ * and checked for representability separately, because `Date` truncates below
+ * milliseconds.
  *
  * This is a deliberately narrow shape, not a full ISO-8601 parser: the core
  * domain types `occurredAt` as "ISO-8601 timestamp", and the storage layer's job
