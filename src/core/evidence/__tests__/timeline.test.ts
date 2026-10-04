@@ -290,6 +290,21 @@ describe("half-open period membership", () => {
     expect(result.periods[0]?.total).toBe(2);
     expect(result.periods[1]?.total).toBe(2);
     expect(result.includedEvents).toBe(4);
+    // Regression guard: `excludedEvents` is counted on its own pass, so the
+    // per-period double-count cannot drive it negative (it was -2 here).
+    expect(result.excludedEvents).toBe(0);
+  });
+
+  it("keeps excludedEvents a count of distinct events when periods overlap and a third event matches none", () => {
+    const wide = { name: "wide", from: AT.januaryFirst, to: AT.marchLate };
+    const staleEvent = makeEvent(AT.beforeJanuary, "issue");
+    const result = timeline(
+      [januaryIssue, januaryReview, staleEvent],
+      [JANUARY, wide],
+    );
+    expect(result.includedEvents).toBe(4);
+    // `staleEvent` is outside both periods and is counted exactly once.
+    expect(result.excludedEvents).toBe(1);
   });
 });
 

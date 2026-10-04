@@ -408,9 +408,19 @@ export interface EvidenceTimeline {
    * A period with no events is ABSENT rather than present with zero counts.
    */
   readonly periods: readonly PeriodSummary[];
-  /** Events that landed in at least one period. */
+  /**
+   * Events that landed in at least one period, summed PER PERIOD. An event
+   * matching two overlapping periods is therefore counted twice here; that is
+   * the caller's choice, not de-duplicated silently.
+   */
   readonly includedEvents: number;
-  /** Valid events whose `occurredAt` fell outside every requested period. */
+  /**
+   * DISTINCT valid events whose `occurredAt` fell outside every requested
+   * period, counted on their own pass. Never negative, and unrelated to the
+   * per-period sum above: when two periods overlap,
+   * `includedEvents + excludedEvents` may exceed `events.length` and
+   * `excludedEvents` alone does not restore that invariant.
+   */
   readonly excludedEvents: number;
   /**
    * Events rejected by {@link validateTimelineEvent}. A malformed provider row
@@ -496,6 +506,17 @@ export function buildEvidenceTimeline(
     });
   }
 
+  // Count DISTINCT accepted events that matched no period bucket. This is a
+  // separate pass on purpose: `includedEvents` below accumulates PER PERIOD, so
+  // deriving `excludedEvents` by subtracting it from the distinct accepted
+  // count mixes two units and goes negative when two periods overlap.
+  const excludedEvents = chronological.filter(
+    (event) =>
+      !bounds.some((bound) =>
+        coversInstant(Date.parse(event.occurredAt), bound.from, bound.to),
+      ),
+  ).length;
+
   const summaries: PeriodSummary[] = [];
   let includedEvents = 0;
 
@@ -529,7 +550,7 @@ export function buildEvidenceTimeline(
     value: {
       periods: summaries,
       includedEvents,
-      excludedEvents: accepted.length - includedEvents,
+      excludedEvents,
       skippedEvents,
       skippedByReason,
     },
