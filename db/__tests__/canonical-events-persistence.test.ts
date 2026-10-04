@@ -347,6 +347,25 @@ describe("the mapper rejects timestamps it cannot persist faithfully (B27 f4/f5)
     ).toThrow(/explicit UTC offset/);
   });
 
+  it("rejects the colon-less ±HHMM offset spelling", () => {
+    // ISO-8601 permits the basic format `+0200`, and the writer rejects it: the
+    // offset must be one of the two shapes the error message names. Pinned here
+    // because it is a narrowing we chose deliberately, not an accident — and a
+    // comment claiming a form is accepted (or rejected) is worth nothing unless
+    // a test holds the code to it.
+    expect(() =>
+      toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T14:31:07+0200" }),
+    ).toThrow(/explicit UTC offset/);
+    // The extended form of the same instant is accepted, so this pins the
+    // spelling and not the offset itself.
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T14:31:07+02:00",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T12:31:07.000Z");
+  });
+
   it("rejects sub-millisecond precision instead of truncating it", () => {
     expect(() =>
       toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T12:31:07.0001Z" }),
