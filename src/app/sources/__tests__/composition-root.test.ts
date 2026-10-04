@@ -44,7 +44,11 @@ import {
   pageBody,
 } from "@/plugins/github/__tests__/fixtures";
 
-import type { CanonicalEventWriter, SyncResult } from "../index";
+import type {
+  CanonicalEventUpsertBuilder,
+  CanonicalEventWriter,
+  SyncResult,
+} from "../index";
 import {
   REPOSITORY_ENV_VAR,
   SOURCE_NAME,
@@ -92,11 +96,22 @@ const THREE_ITEMS = pageBody([
  * Structured exactly to {@link CanonicalEventWriter}, so a change to that
  * interface breaks this file at compile time rather than silently accepting a
  * target that persists nothing.
+ *
+ * It RECORDS the conflict clause rather than ignoring it, because the upsert is
+ * the behaviour under test: a fake that dropped `onConflictDoUpdate` would let
+ * `persistCanonicalEvents` return successfully while production raised 23505,
+ * which is exactly the gap this writer now closes. `conflicts` holds the config
+ * each persist asked for, so a test can assert the arbiter is the two-column
+ * natural key and that `id` is absent from the update set.
  */
 class RecordingWriter implements CanonicalEventWriter {
   private readonly batches_: {
     table: unknown;
     rows: Record<string, unknown>[];
+  }[] = [];
+  private readonly conflicts_: {
+    target: unknown;
+    set: Record<string, unknown>;
   }[] = [];
 
   /** Every insert that was attempted, whether or not rows were supplied. */
@@ -105,6 +120,14 @@ class RecordingWriter implements CanonicalEventWriter {
     readonly rows: ReadonlyArray<Record<string, unknown>>;
   }> {
     return this.batches_;
+  }
+
+  /** Every conflict clause handed to `onConflictDoUpdate`, in call order. */
+  get conflicts(): ReadonlyArray<{
+    readonly target: unknown;
+    readonly set: Record<string, unknown>;
+  }> {
+    return this.conflicts_;
   }
 
   get totalRows(): number {
@@ -117,17 +140,27 @@ class RecordingWriter implements CanonicalEventWriter {
   }
 
   insert(table: unknown): {
-    values(rows: Record<string, unknown>[]): PromiseLike<unknown>;
+    values(rows: Record<string, unknown>[]): CanonicalEventUpsertBuilder;
   } {
     const batch = { table, rows: [] as Record<string, unknown>[] };
     // Pushed on `insert`, not on `values`, so a target that is handed a table
     // and never written to still shows up as an attempted insert.
     this.batches_.push(batch);
+    const conflicts = this.conflicts_;
     return {
-      values: async (rows: Record<string, unknown>[]) => {
-        batch.rows.push(...rows);
-        return undefined;
-      },
+      values: (rows: Record<string, unknown>[]) => ({
+        onConflictDoUpdate: async (config: {
+          target: unknown;
+          set: Record<string, unknown>;
+        }) => {
+          conflicts.push({
+            target: config.target,
+            set: config.set,
+          });
+          batch.rows.push(...rows);
+          return undefined;
+        },
+      }),
     };
   }
 }
@@ -390,6 +423,80 @@ describe("composition root: fetched events persist through the Drizzle client", 
 
     expect(once.map((e) => e.id)).toEqual(twice.map((e) => e.id));
     expect(new Set(once.map((e) => e.id)).size).toBe(once.length);
+  });
+
+  it("persists the same events twice without error, as an upsert", async () => {
+    // THE CARD'S CENTRAL CLAIM. A repeated sync of the same source data is the
+    // most likely caller behaviour there is, and it must SUCCEED. Before the
+    // upsert the second persist raised SQLSTATE 23505 (proven by execution
+    // against real Postgres in db/__tests__/canonical-events-persistence.test.ts).
+    const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
+    const writer = new RecordingWriter();
+
+    const first = await syncSource({ registry, writer });
+    const second = await syncSource({ registry, writer });
+
+    // Neither call throws — asserted by the calls above completing at all.
+    expect(first.persisted).toBe(2);
+    expect(second.persisted).toBe(2);
+
+    // And the upsert clause was used on BOTH calls, not a plain insert: a plain
+    // insert is the exact shape that 235s, so this is what makes "no error"
+    // mean "upserted" rather than "the assertion never ran".
+    expect(writer.conflicts).toHaveLength(2);
+    expect(writer.conflicts[0]).toEqual(writer.conflicts[1]);
+  });
+
+  it("targets the natural key (source, externalId) as the conflict arbiter", () => {
+    // The specific failure this card exists to close: an arbiter of `id` would
+    // leave 23505 in place for every real repeat sync while LOOKING like an
+    // idempotency fix. Asserted against the recorded clause, and the column
+    // NAMES are read out of the Drizzle column objects rather than compared by
+    // identity, so a re-export or a cloned table object cannot pass by accident.
+    const writer = new RecordingWriter();
+
+    // No registry here: this asserts the SHAPE of the conflict clause the persist
+    // builds, which is independent of where the events came from. The companion
+    // test above drives the same clause through a real `syncSource`.
+    return persistCanonicalEvents(
+      [
+        {
+          id: "evt_1",
+          source: "code_hosting",
+          externalId: "ext_1",
+          type: "issue",
+          title: "t",
+          occurredAt: "2026-01-02T03:04:05.000Z",
+          metadata: {},
+        },
+      ],
+      writer,
+    ).then(() => {
+      const conflict = writer.conflicts[0];
+      expect(conflict).toBeDefined();
+
+      const target = conflict!.target as { name: string }[];
+      expect(target.map((column) => column.name)).toEqual([
+        "source",
+        "external_id",
+      ]);
+
+      // Explicitly NOT the primary key.
+      expect(target.map((column) => column.name)).not.toContain("id");
+
+      // The update set is the enumerated mutable columns. `id`, `source` and
+      // `externalId` are the key and MUST NOT be rewritten: `id` is the primary
+      // key, and reassigning it would orphan anything referencing the row.
+      expect(Object.keys(conflict!.set).sort()).toEqual([
+        "author",
+        "metadata",
+        "occurredAt",
+        "title",
+        "type",
+        "url",
+      ]);
+      expect(Object.keys(conflict!.set)).not.toContain("id");
+    });
   });
 
   it("writes nothing, and does not touch the database, for an empty page", async () => {
