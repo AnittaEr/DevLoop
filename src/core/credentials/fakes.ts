@@ -15,7 +15,11 @@
  * alphanumeric run exists and they cannot be mistaken for a real credential.
  */
 
-import { CredentialError, validateTokenShape } from "./provider";
+import {
+  CredentialError,
+  TOKEN_SOURCE_REASONS,
+  validateTokenShape,
+} from "./provider";
 import type { CredentialProvider } from "./provider";
 
 /** Discriminant for this provider. */
@@ -70,7 +74,7 @@ export class FakeCredentialProvider implements CredentialProvider {
     if (value === undefined) {
       throw new CredentialError("token_absent", {
         source: this.source,
-        reason: 'no fixture registered under the key "valid"',
+        reason: TOKEN_SOURCE_REASONS.fixtureMissing,
       });
     }
     return validateTokenShape(value, this.source);

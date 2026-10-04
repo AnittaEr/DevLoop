@@ -43,6 +43,16 @@ export type TestOnlyCredentialSource =
 /** The prefix every GitHub fine-grained personal access token carries. */
 export const GITHUB_TOKEN_PREFIX = "github_pat_";
 
+/**
+ * The single documented environment variable holding the token. Name only — never a value.
+ *
+ * Declared here rather than in `env-provider` because {@link TOKEN_SOURCE_REASONS} needs it and
+ * `env-provider` already imports this module: leaving it there would make the reason table
+ * depend on a module that depends on it. `env-provider` re-exports it, so existing importers
+ * of `../env-provider` are unaffected.
+ */
+export const GITHUB_TOKEN_ENV_VAR = "GITHUB_FINE_GRAINED_PAT";
+
 /** Stable, non-secret error codes. Never put a token in one of these. */
 export const CREDENTIAL_ERROR_CODES = [
   /** The provider produced no value at all (or only whitespace). */
@@ -57,32 +67,74 @@ export const CREDENTIAL_ERROR_CODES = [
 
 export type CredentialErrorCode = (typeof CREDENTIAL_ERROR_CODES)[number];
 
+/**
+ * The set of source labels that may legally appear on a {@link CredentialError}.
+ *
+ * It is {@link CREDENTIAL_SOURCES} plus the fixed label {@link UNKNOWN_CREDENTIAL_SOURCE}. That
+ * last member is the whole point: a caller that passes something unrecognised where a source
+ * belongs gets `unknown`, never its own text back. Without a non-source member, a caller
+ * would have no correct value to pass for "not a source", and the temptation would be to pass
+ * the offending value.
+ */
+export const UNKNOWN_CREDENTIAL_SOURCE = "unknown" as const;
+
+export const CREDENTIAL_ERROR_SOURCES = [
+  ...CREDENTIAL_SOURCES,
+  UNKNOWN_CREDENTIAL_SOURCE,
+] as const;
+
+/** A source label that is safe to store on, and interpolate into, an error. */
+export type CredentialErrorSource = (typeof CREDENTIAL_ERROR_SOURCES)[number];
+
+/**
+ * Collapse an arbitrary value to a {@link CredentialErrorSource}.
+ *
+ * A recognised {@link CredentialSource} passes through unchanged. Anything else — including
+ * a token-shaped string — becomes {@link UNKNOWN_CREDENTIAL_SOURCE}. This is the single choke
+ * point that makes "no field can carry the secret" true of `source` rather than aspirational.
+ */
+export function toSafeCredentialSource(value: unknown): CredentialErrorSource {
+  if (isCredentialSource(value)) return value;
+  if (value === UNKNOWN_CREDENTIAL_SOURCE) return UNKNOWN_CREDENTIAL_SOURCE;
+  return UNKNOWN_CREDENTIAL_SOURCE;
+}
+
 export interface CredentialErrorDetails {
-  /** Which source failed, e.g. `env` or `fake`. */
-  readonly source: string;
+  /** Which source failed. Constrained to {@link CredentialErrorSource} on the error. */
+  readonly source: CredentialErrorSource;
   /** Shape of the offending value, never the value itself. */
-  readonly reason: string;
+  readonly reason: CredentialFailureReason;
 }
 
 /**
  * Typed error thrown by every credential provider and by the factory.
  *
- * `message` is derived from `code`, `source` and `reason` only. There is
- * deliberately no field that can carry the secret.
+ * `message` is derived from `code`, `source` and `reason` only, and BOTH of
+ * those are constrained — by type and, redundantly, at runtime — so that no
+ * caller-supplied text can be interpolated into the message or stored on the
+ * error. There is deliberately no field that can carry the secret.
+ *
+ * The typed shape is preserved (`code`/`source`/`reason` stay enumerable and
+ * assertable) precisely so that a caller still has a non-secret field to branch
+ * on and a test still has something to assert on; the constraint is on *which
+ * values* those fields may hold, not on whether they exist.
  */
 export class CredentialError extends Error {
   override readonly name = "CredentialError";
   readonly code: CredentialErrorCode;
-  readonly source: string;
-  readonly reason: string;
+  readonly source: CredentialErrorSource;
+  readonly reason: CredentialFailureReason;
 
   constructor(code: CredentialErrorCode, details: CredentialErrorDetails) {
-    super(
-      `[${code}] credential source "${details.source}" failed: ${details.reason}`,
-    );
+    // Normalised BEFORE interpolation. Both helpers collapse any input that is
+    // not an allowlisted member to a fixed label, so a caller that passes a
+    // token where a source or a reason belongs cannot reach the message.
+    const source = toSafeCredentialSource(details.source);
+    const reason = toSafeFailureReason(details.reason);
+    super(`[${code}] credential source "${source}" failed: ${reason}`);
     this.code = code;
-    this.source = details.source;
-    this.reason = details.reason;
+    this.source = source;
+    this.reason = reason;
     // Keeps `instanceof` working when the class is down-levelled.
     Object.setPrototypeOf(this, CredentialError.prototype);
   }
@@ -136,6 +188,62 @@ export const TOKEN_DEFECT_REASONS = {
 
 type TokenDefectReason =
   (typeof TOKEN_DEFECT_REASONS)[keyof typeof TOKEN_DEFECT_REASONS];
+
+/**
+ * Reasons for a credential attempt failing for a reason OTHER than token shape:
+ * the value was never produced, or the source is not permitted.
+ *
+ * Separate from {@link TOKEN_DEFECT_REASONS} because it is selected by a different kind of
+ * decision — a stable error *code* rather than a Zod issue — and because mixing the two tables
+ * would make it unclear which reasons are reachable from which throw site. As with the defect
+ * table, a throw site selects a member; it never assembles a string.
+ *
+ * `envVarUnset` names the environment VARIABLE, which is public documentation, never a value.
+ */
+export const TOKEN_SOURCE_REASONS = {
+  envVarUnset: `environment variable ${GITHUB_TOKEN_ENV_VAR} is not set`,
+  fixtureMissing: 'no fixture registered under the key "valid"',
+  testSourceForbidden:
+    "test-only credential sources require an explicit allowTestSources opt-in",
+  unknownSource: `expected one of ${CREDENTIAL_SOURCES.map((s) => `"${s}"`).join(", ")}; the source must be passed explicitly`,
+  noImplementation: "source has no registered implementation",
+} as const;
+
+export type TokenSourceReason =
+  (typeof TOKEN_SOURCE_REASONS)[keyof typeof TOKEN_SOURCE_REASONS];
+
+/**
+ * Every reason a {@link CredentialError} may carry, as FIXED strings.
+ *
+ * This is the allowlist the error constructor enforces against. It is a membership test over
+ * this array, so a value that merely *looks* like a reason is still rejected.
+ */
+export const CREDENTIAL_FAILURE_REASONS = [
+  ...Object.values(TOKEN_DEFECT_REASONS),
+  ...Object.values(TOKEN_SOURCE_REASONS),
+] as const;
+
+/** A failure reason that is safe to store on, and interpolate into, an error. */
+export type CredentialFailureReason =
+  (typeof CREDENTIAL_FAILURE_REASONS)[number];
+
+const SAFE_REASON_SET: ReadonlySet<string> = new Set<string>(
+  CREDENTIAL_FAILURE_REASONS,
+);
+
+/**
+ * Collapse an arbitrary value to a {@link CredentialFailureReason}.
+ *
+ * An allowlisted member passes through byte for byte. Anything else becomes the generic
+ * {@link TOKEN_DEFECT_REASONS.unknown} reason. This is the choke point that makes the error's
+ * "no field can carry the secret" claim true of `reason` as well as of `source`.
+ */
+export function toSafeFailureReason(value: unknown): CredentialFailureReason {
+  if (typeof value === "string" && SAFE_REASON_SET.has(value)) {
+    return value as CredentialFailureReason;
+  }
+  return TOKEN_DEFECT_REASONS.unknown;
+}
 
 /**
  * Presence check: is there a token at all?
@@ -219,8 +327,15 @@ function reasonFromZod(
  * leaves only as one of the fixed {@link TOKEN_DEFECT_REASONS} strings. It is
  * not echoed into the error, not used as a Zod issue message, and not attached
  * as an error `cause`.
+ *
+ * `source` is normalised by {@link toSafeCredentialSource} inside the error
+ * constructor, so passing an arbitrary string here is already safe — the type
+ * says `CredentialSource` to steer callers, not to enforce safety at runtime.
  */
-export function validateTokenShape(raw: unknown, source: string): string {
+export function validateTokenShape(
+  raw: unknown,
+  source: CredentialErrorSource,
+): string {
   if (typeof raw !== "string") {
     // Checked up front so the schema's own error type never has to describe a
     // non-string, and so `token_absent` is unambiguous.

@@ -7,11 +7,18 @@
  * tests can mutate `process.env` freely.
  */
 
-import { CredentialError, validateTokenShape } from "./provider";
+import {
+  CredentialError,
+  GITHUB_TOKEN_ENV_VAR,
+  TOKEN_SOURCE_REASONS,
+  validateTokenShape,
+} from "./provider";
 import type { CredentialProvider } from "./provider";
 
-/** The single documented environment variable. Name only — never a value. */
-export const GITHUB_TOKEN_ENV_VAR = "GITHUB_FINE_GRAINED_PAT";
+// Re-exported so existing importers of `../env-provider` keep working: the
+// constant now lives in `provider` because the reason allowlist needs it, and
+// `env-provider` imports `provider`, so declaring it here would be circular.
+export { GITHUB_TOKEN_ENV_VAR };
 
 /**
  * Minimal shape of the environment reader. Injecting it keeps the provider
@@ -45,7 +52,7 @@ export class EnvCredentialProvider implements CredentialProvider {
       // a secret; a token value could never appear here because there is none.
       throw new CredentialError("token_absent", {
         source: this.source,
-        reason: `environment variable ${GITHUB_TOKEN_ENV_VAR} is not set`,
+        reason: TOKEN_SOURCE_REASONS.envVarUnset,
       });
     }
 

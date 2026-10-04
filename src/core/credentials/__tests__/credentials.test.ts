@@ -3,16 +3,26 @@ import { z } from "zod";
 import zodPackage from "zod/package.json" with { type: "json" };
 
 import {
+  CREDENTIAL_ERROR_SOURCES,
+  CREDENTIAL_FAILURE_REASONS,
   CREDENTIAL_SOURCES,
   CredentialError,
   GITHUB_TOKEN_PREFIX,
   TEST_ONLY_CREDENTIAL_SOURCES,
   TOKEN_DEFECT_REASONS,
+  UNKNOWN_CREDENTIAL_SOURCE,
   isCredentialSource,
   isTestOnlyCredentialSource,
+  toSafeCredentialSource,
+  toSafeFailureReason,
   validateTokenShape,
 } from "../provider";
-import type { CredentialSource, TestOnlyCredentialSource } from "../provider";
+import type {
+  CredentialErrorSource,
+  CredentialFailureReason,
+  CredentialSource,
+  TestOnlyCredentialSource,
+} from "../provider";
 import { GITHUB_TOKEN_ENV_VAR, EnvCredentialProvider } from "../env-provider";
 import { FAKE_TOKENS, FakeCredentialProvider } from "../fakes";
 import { createCredentialProvider } from "../factory";
@@ -273,11 +283,25 @@ describe("Zod-backed validation", () => {
   });
 
   it("names the failing source, not just the code", () => {
-    for (const source of ["env", "fake", "some-other-source"]) {
+    // Known sources pass through byte for byte, so the error stays specific
+    // enough to act on.
+    for (const source of ["env", "fake"] as const) {
       const error = capture(() => validateTokenShape("bad-value", source));
       expect(error.source).toBe(source);
       expect(error.message).toContain(source);
     }
+  });
+
+  it("collapses an unrecognised source to the fixed 'unknown' label", () => {
+    // A caller with something that is not a source still gets a usable error,
+    // and does not get its own text echoed back.
+    const error = capture(() =>
+      validateTokenShape("bad-value", UNKNOWN_CREDENTIAL_SOURCE),
+    );
+    expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
+    expect(error.message).toContain(UNKNOWN_CREDENTIAL_SOURCE);
+    // Explicitly NOT the value that was passed.
+    expect(error.source).not.toBe("some-other-source");
   });
 
   it("distinguishes absent from malformed on the same whitespace input", () => {
@@ -462,5 +486,215 @@ describe("regression: fake providers do not share mutable state", () => {
 
     expect(supplied.valid).toBe(GOOD);
     await expect(provider.getToken()).resolves.toBe(OTHER);
+  });
+});
+
+/**
+ * Negative control for the secret-hygiene defect found in review.
+ *
+ * The defect: `CredentialError` interpolated unrestricted caller text into
+ * `message`, and `createCredentialProvider` reached it with `String(source)`. A
+ * caller that passed a token where a source belongs put the token in both
+ * `error.source` and `error.message`, so it reached logs and any serialised
+ * error payload — while the doc comment claimed no field could carry it.
+ *
+ * The fix constrains `source` and `reason` to allowlisted values with a fixed
+ * safe label. These tests are the control: revert the fix and every assertion
+ * below that says a token must NOT appear FAILS. A suite that passes either way
+ * is vacuous and the fix is not real.
+ */
+describe("regression: a token passed as `source` never reaches the error", () => {
+  /**
+   * Shaped like a real fine-grained PAT — correct prefix, long alphanumeric
+   * material — so the assertion is about the fix, not about a value that would
+   * fail a token-shape test for unrelated reasons.
+   */
+  const TOKEN_AS_SOURCE = `github_pat_11ABCDEFG0abcdefghijkl_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij`;
+
+  /** Every string a consumer could plausibly read, log, or ship off an error. */
+  function serialisedSurface(error: CredentialError): string {
+    return [
+      error.message,
+      error.reason,
+      error.name,
+      error.code,
+      error.source,
+      error.stack ?? "",
+      JSON.stringify(error),
+      JSON.stringify({
+        code: error.code,
+        source: error.source,
+        reason: error.reason,
+      }),
+      // `Object.entries` catches any field added later that these named
+      // properties would miss — the leak had two routes, and a third should not
+      // need a new test.
+      JSON.stringify(Object.entries(error)),
+    ].join("\n");
+  }
+
+  it("does not leak a token-shaped string passed as `source` to the constructor", () => {
+    const error = new CredentialError("unknown_source", {
+      // Deliberately bypassing the type: a JS caller, or a caller who widened
+      // the argument, can do exactly this. That is the threat being controlled.
+      source: TOKEN_AS_SOURCE as CredentialErrorSource,
+      reason: TOKEN_DEFECT_REASONS.unknown,
+    });
+
+    // The load-bearing assertions, in both fields the PM named.
+    expect(error.message).not.toContain(TOKEN_AS_SOURCE);
+    expect(error.source).not.toContain(TOKEN_AS_SOURCE);
+    // And nothing else on the object either.
+    expect(serialisedSurface(error)).not.toContain(TOKEN_AS_SOURCE);
+    // It must still be a usable, typed error.
+    expect(error.code).toBe("unknown_source");
+    expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
+  });
+
+  it("does not leak a token-shaped string passed as `reason` to the constructor", () => {
+    const error = new CredentialError("token_malformed", {
+      source: "env",
+      reason: TOKEN_AS_SOURCE as CredentialFailureReason,
+    });
+
+    expect(error.message).not.toContain(TOKEN_AS_SOURCE);
+    expect(error.reason).not.toContain(TOKEN_AS_SOURCE);
+    expect(serialisedSurface(error)).not.toContain(TOKEN_AS_SOURCE);
+    // The reason degrades to a fixed string rather than disappearing.
+    expect(CREDENTIAL_FAILURE_REASONS).toContain(error.reason);
+  });
+
+  it("does not leak a token-shaped string passed as the factory's source", () => {
+    // The second route: `String(source)` used to carry the value into the error.
+    const error = capture(() => createCredentialProvider(TOKEN_AS_SOURCE));
+
+    expect(error.message).not.toContain(TOKEN_AS_SOURCE);
+    expect(error.source).not.toContain(TOKEN_AS_SOURCE);
+    expect(serialisedSurface(error)).not.toContain(TOKEN_AS_SOURCE);
+    expect(error.code).toBe("unknown_source");
+    expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
+  });
+
+  it("does not leak a token-shaped string thrown by validateTokenShape", () => {
+    const error = capture(() =>
+      validateTokenShape("bad-value", TOKEN_AS_SOURCE as CredentialErrorSource),
+    );
+    expect(serialisedSurface(error)).not.toContain(TOKEN_AS_SOURCE);
+    expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
+  });
+
+  it("still refuses to build a provider for a token-shaped source", () => {
+    // The control must not pass by simply accepting the value: the call still
+    // has to fail, or the assertions above would be vacuous.
+    expect(() => createCredentialProvider(TOKEN_AS_SOURCE)).toThrowError(
+      CredentialError,
+    );
+  });
+});
+
+describe("regression: source and reason are constrained to allowlists", () => {
+  it("collapses every non-source value to the fixed unknown label", () => {
+    const rejected: unknown[] = [
+      "vault",
+      "",
+      "   ",
+      "ENV",
+      "env ", // almost-correct is still wrong; no trimming games
+      TOKEN_DEFECT_REASONS.empty,
+      42,
+      0,
+      true,
+      null,
+      undefined,
+      {},
+      [],
+      Symbol("tok"),
+      () => "env",
+      new Error("env"),
+      Object.assign(Object.create(null), { toString: () => "env" }),
+    ];
+
+    for (const value of rejected) {
+      expect(toSafeCredentialSource(value)).toBe(UNKNOWN_CREDENTIAL_SOURCE);
+    }
+  });
+
+  it("passes known sources through unchanged", () => {
+    expect(toSafeCredentialSource("env")).toBe("env");
+    expect(toSafeCredentialSource("fake")).toBe("fake");
+    expect(toSafeCredentialSource(UNKNOWN_CREDENTIAL_SOURCE)).toBe(
+      UNKNOWN_CREDENTIAL_SOURCE,
+    );
+  });
+
+  it("collapses every non-allowlisted reason to the fixed fallback", () => {
+    const fallback = TOKEN_DEFECT_REASONS.unknown;
+    const rejected: unknown[] = [
+      "something went wrong",
+      TOKEN_DEFECT_REASONS.empty + " (with the token appended)",
+      "token is empty ",
+      42,
+      null,
+      undefined,
+      {},
+      [],
+      Symbol("reason"),
+    ];
+
+    for (const value of rejected) {
+      expect(toSafeFailureReason(value)).toBe(fallback);
+    }
+  });
+
+  it("passes allowlisted reasons through unchanged", () => {
+    for (const reason of CREDENTIAL_FAILURE_REASONS) {
+      expect(toSafeFailureReason(reason)).toBe(reason);
+    }
+  });
+
+  it("every source and reason the error can carry is a member of its allowlist", () => {
+    // The invariant, stated once: nothing reaches the error from outside these
+    // two closed sets. If a future change widens either, this fails.
+    for (const source of CREDENTIAL_ERROR_SOURCES) {
+      expect(toSafeCredentialSource(source)).toBe(source);
+    }
+    expect(CREDENTIAL_ERROR_SOURCES).toEqual([
+      ...CREDENTIAL_SOURCES,
+      UNKNOWN_CREDENTIAL_SOURCE,
+    ]);
+
+    const error = capture(() => validateTokenShape("bad-value", "env"));
+    expect(CREDENTIAL_ERROR_SOURCES).toContain(error.source);
+    expect(CREDENTIAL_FAILURE_REASONS).toContain(error.reason);
+  });
+});
+
+/**
+ * A token-shaped string handed to the factory must never be echoed, for ANY
+ * input type — including the ones `String()` handles oddly. Kept separate from
+ * the block above because it is the factory's own contract, and it is also the
+ * place a well-meaning future `String(source)` would come back.
+ */
+describe("regression: the factory never stringifies the rejected source", () => {
+  it("returns a typed error, not a TypeError, for exotic inputs", () => {
+    const inputs: unknown[] = [
+      undefined,
+      null,
+      0,
+      {},
+      [],
+      Symbol("tok"),
+      42n,
+      () => "env",
+    ];
+
+    for (const input of inputs) {
+      const error = capture(() => createCredentialProvider(input));
+      expect(error.code).toBe("unknown_source");
+      expect(error.source).toBe(UNKNOWN_CREDENTIAL_SOURCE);
+      // No branch may fall back to interpolating the input.
+      expect(error.message).not.toContain("Symbol");
+      expect(error.message).not.toContain("[object Object]");
+    }
   });
 });
