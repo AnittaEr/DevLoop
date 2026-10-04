@@ -28,7 +28,7 @@
 
 import { sql } from "drizzle-orm";
 import type {
-  AnyPgInsert,
+  PgInsert,
   PgInsertOnConflictDoUpdateConfig,
 } from "drizzle-orm/pg-core/query-builders/insert";
 
@@ -306,14 +306,90 @@ export async function fetchCanonicalEvents(
  * `onConflictDoUpdate` is part of the seam because the upsert below is not an
  * optional nicety: without it this type would describe a plain insert, and a
  * test fake could accept rows while production raised 23505. `set` is typed
- * against the real Drizzle config, so the enumerated update column list is
- * checked at compile time against the schema rather than by inspection.
+ * against the real Drizzle config bound to the real table, so the update column
+ * list is checked at compile time against `canonical_events` rather than by
+ * inspection — see {@link UpsertSetClause} for the annotation that carries the
+ * check, since the `set` position alone does not.
  */
 export interface CanonicalEventWriter {
   insert(table: typeof canonicalEvents): {
     values(rows: NewCanonicalEventRow[]): CanonicalEventUpsertBuilder;
   };
 }
+
+/**
+ * The insert this module actually performs, named so the seam below can be typed
+ * against the REAL table instead of Drizzle's deliberately unconstrained
+ * `AnyPgInsert` alias.
+ *
+ * `AnyPgInsert` is `PgInsertBase<any, any, any, any, any, any>`, so a config
+ * generic over it resolves `set` to `PgUpdateSetSource<any>` — a string-keyed map
+ * that accepts any column name at all. Pinning the table here is what makes the
+ * conflict clause name real columns.
+ */
+type CanonicalEventInsert = PgInsert<typeof canonicalEvents>;
+
+/**
+ * Drizzle's own conflict config, bound to the real insert. So `set` resolves to
+ * `PgUpdateSetSource<typeof canonicalEvents>`: keys are `canonical_events`
+ * columns and values are that column's data type, `SQL` or `PgColumn`.
+ */
+export type CanonicalEventConflictConfig =
+  PgInsertOnConflictDoUpdateConfig<CanonicalEventInsert>;
+
+/** Every column name `canonical_events` can carry, per Drizzle's own `set` type. */
+type CanonicalEventColumn = keyof CanonicalEventConflictConfig["set"] & string;
+
+/**
+ * The natural key, which an update on a natural-key conflict MUST NOT rewrite.
+ *
+ * `id` is the PRIMARY key: reassigning it orphans anything referencing the row,
+ * and the upsert's whole meaning is that the existing row is the same entity,
+ * updated — not replaced by a new one. `source` and `externalId` are the rest of
+ * `UNIQUE(source, external_id)`; rewriting either moves the row out from under
+ * its own conflict target.
+ */
+type NaturalKeyColumn = "id" | "source" | "externalId";
+
+/**
+ * The columns an upsert on a natural-key conflict is allowed to update.
+ *
+ * DERIVED FROM THE SCHEMA, then narrowed: `Exclude` over the real column names
+ * rather than a hand-copied list, so a column added to `db/schema.ts` becomes
+ * updatable automatically (and stays unwritten until deliberately added to
+ * {@link UPSERT_UPDATED_COLUMNS}) while a column REMOVED from the schema turns
+ * the list here into a compile error instead of a silent runtime failure.
+ */
+type UpdatableColumn = Exclude<CanonicalEventColumn, NaturalKeyColumn>;
+
+/**
+ * The shape {@link UPSERT_UPDATED_COLUMNS} must have.
+ *
+ * All-optional, matching Drizzle's own `set`: an update need not touch every
+ * column. Every key optional AND every key excluded from the natural key, so
+ * BOTH failure modes the list's docstring warns about are compile errors.
+ *
+ * This is what makes the guarantee real. `set` cannot enforce it on its own:
+ * TypeScript's excess-property check applies only to a FRESH object literal, and
+ * the call site passes an already-evaluated `const`, so a misspelled key in that
+ * `const` would reach Drizzle unchecked. The annotation on the constant is where
+ * the check actually lands.
+ *
+ * NOTE THE SPLIT IN WHAT EACH LAYER CATCHES, because it is not symmetric. This
+ * type is Drizzle's `set` MINUS the natural key, so it rejects `id`, `source` and
+ * `externalId`. It does not need to be Drizzle's own `set` for that — but it also
+ * must not be narrowed ANY further, because Drizzle's `set` is what rejects a
+ * misspelled column in the first place, and that is the part
+ * {@link CanonicalEventConflictConfig} supplies. Neither type alone is the
+ * guarantee; this one is where the natural key is excluded and the seam is where
+ * the column names are checked, and the constant is annotated with BOTH.
+ *
+ * Exported so the type-level regression test can assert the natural-key
+ * exclusions directly instead of inferring them from the constant's value.
+ */
+export type UpsertSetClause = {
+  readonly [K in UpdatableColumn]?: CanonicalEventConflictConfig["set"][K];
+};
 
 /**
  * The chained half of the insert a persist performs, up to and including the
@@ -330,10 +406,23 @@ export interface CanonicalEventWriter {
  * here is what makes a hand-written seam drift from what `getDb()` actually
  * accepts — and `bun run typecheck` pins that `getDb()` still satisfies this
  * interface, so the two cannot diverge silently.
+ *
+ * THE TYPE PARAMETER IS THE REAL TABLE, NOT `AnyPgInsert`, so `set` is keyed by
+ * `canonical_events`'s actual columns and a misspelled one is a compile error
+ * here as well as at the constant. Note what this does NOT do on its own: `id`,
+ * `source` and `externalId` ARE legal `set` keys to Drizzle, so the natural-key
+ * exclusion lives in {@link UpsertSetClause} and not in this seam. What this costs
+ * the fake-implementation use case: nothing. A fake never has to mention the
+ * schema, because TypeScript checks METHOD PARAMETERS bivariantly — a fake
+ * declaring `onConflictDoUpdate(config: { target: unknown; set: Record<string,
+ * unknown> })` still satisfies this interface, which is exactly how
+ * `__tests__/composition-root.test.ts`'s `RecordingWriter` is written. The
+ * constraint binds the PRODUCTION call site, which is where the misspelling
+ * would be, and leaves the recording fake free to accept anything.
  */
 export interface CanonicalEventUpsertBuilder {
   onConflictDoUpdate(
-    config: PgInsertOnConflictDoUpdateConfig<AnyPgInsert>,
+    config: CanonicalEventConflictConfig,
   ): PromiseLike<unknown>;
 }
 
@@ -357,15 +446,24 @@ export interface CanonicalEventUpsertBuilder {
  * description of the event: a source may edit a title, correct a timestamp, or
  * drop an author, and a re-sync must be able to converge on the source's current
  * view rather than freezing the first sighting forever.
+ *
+ * BOTH PROMISES ABOVE ARE NOW ENFORCED BY THE `: UpsertSetClause` ANNOTATION,
+ * which was added with these claims already in place and the type not delivering
+ * them. The annotation is Drizzle's `set` (bound to the real table, which is what
+ * rejects a misspelling like `occurred_at` — the SQL name, not the Drizzle
+ * property) MINUS the natural key (which is what rejects naming `id`). The
+ * annotation is load-bearing: removing it and restoring the bare `as const`
+ * reproduces a `typecheck` that passes at exit 0 with both mistakes present, and
+ * `__tests__/upsert-set-clause.types.ts` re-proves that by `tsc`.
  */
-const UPSERT_UPDATED_COLUMNS = {
+const UPSERT_UPDATED_COLUMNS: UpsertSetClause = {
   type: sql`excluded.type`,
   title: sql`excluded.title`,
   url: sql`excluded.url`,
   author: sql`excluded.author`,
   metadata: sql`excluded.metadata`,
   occurredAt: sql`excluded.occurred_at`,
-} as const;
+};
 
 /**
  * Persist canonical events to the `canonical_events` table.
