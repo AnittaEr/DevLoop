@@ -6,6 +6,14 @@
  * so a hard failure here would turn CI permanently red for a reason unrelated to
  * the code. Skipping is the correct behaviour, not a weakened test.
  *
+ * IT IS NOT ONLY EVER SKIPPED (B37, t_8c73ba34). This file is named explicitly in
+ * `vitest.db.config.ts`'s include list, so `bun run test:db` collects it too, and
+ * the `db round trip` CI job runs it against a real Postgres with the migrations
+ * applied. In THAT job all three assertions below execute for real rather than
+ * reporting skipped — measured 13 -> 19 tests in `bun run test:db`, the 6 new
+ * ones being this file's. The skip above is the database-less configuration
+ * only.
+ *
  * No test in this file early-returns before its assertions: every `it` runs at
  * least one real `expect`. T5a removed the `if (!connectionString) return;`
  * guard that let the singleton test report PASSED with zero assertions in the

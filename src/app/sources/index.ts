@@ -26,12 +26,21 @@
  * the error when it is unset; no value is ever read into this module.
  */
 
+import { sql } from "drizzle-orm";
+import type {
+  PgInsert,
+  PgInsertOnConflictDoUpdateConfig,
+} from "drizzle-orm/pg-core/query-builders/insert";
+
 import type { CanonicalEvent } from "@/core/events/canonical-event";
 import { createCredentialProvider } from "@/core/credentials/factory";
 import type { EnvReader } from "@/core/credentials/env-provider";
 import type { RegisteredPlugin } from "@/core/plugins/plugin";
 import { PluginRegistry } from "@/core/plugins/registry";
-import type { NewCanonicalEventRow } from "../../../db/schema";
+import type {
+  CanonicalEventRow,
+  NewCanonicalEventRow,
+} from "../../../db/schema";
 import { canonicalEvents } from "../../../db/schema";
 import { toCanonicalEventRow } from "../../../db/canonical-event-mapper";
 import { getDb } from "@/lib/db/client";
@@ -77,6 +86,101 @@ export const SOURCE_CONFIGURATION_REASONS = {
 
 export type SourceConfigurationReason =
   (typeof SOURCE_CONFIGURATION_REASONS)[keyof typeof SOURCE_CONFIGURATION_REASONS];
+
+/**
+ * Codes for a {@link SyncFailure}. A closed set, for the same reason
+ * {@link SOURCE_CONFIGURATION_REASONS} is one: a failure site selects a member,
+ * it never assembles a code from anything at runtime.
+ *
+ * Deliberately ONE code for every mapper rejection rather than one per reason.
+ * The writer already distinguishes its own rejections by message, and this
+ * module does not re-derive that taxonomy — a second classification of the same
+ * throw sites is precisely how two layers drift apart, which is the disagreement
+ * this guard exists to surface. {@link SyncFailure.detail} carries the writer's
+ * own message verbatim instead.
+ */
+export const SYNC_FAILURE_CODES = {
+  /** The writer refused at least one event; nothing was written. */
+  eventNotPersistable: "event_not_persistable",
+} as const;
+
+export type SyncFailureCode =
+  (typeof SYNC_FAILURE_CODES)[keyof typeof SYNC_FAILURE_CODES];
+
+/**
+ * How much of the batch a refusal names.
+ *
+ * TWO SCOPES, AND THE DISTINCTION IS NOT COSMETIC. `persistCanonicalEvents`
+ * maps and deduplicates the whole page and then executes ONE statement, so a
+ * refusal raised by the DATABASE arrives with no offending row attached to it —
+ * Postgres names the row it was inserting, not the one the constraint came from
+ * among several. Inventing an index there would be a fabricated answer, so a
+ * page-scope refusal says plainly that no single event is identified.
+ */
+export const SYNC_FAILURE_SCOPES = {
+  /** One event is named; `index`, `eventId` and `externalId` are present. */
+  event: "event",
+  /** The batch was refused as a whole; no single event is identified. */
+  page: "page",
+} as const;
+
+export type SyncFailureScope =
+  (typeof SYNC_FAILURE_SCOPES)[keyof typeof SYNC_FAILURE_SCOPES];
+
+/**
+ * A classified, reported sync failure.
+ *
+ * `detail` is the writer's rejection message carried VERBATIM, and it names the
+ * offending value. That is the point of the guard: the caller learns not merely
+ * that a sync failed but WHY an event was refused, without this module
+ * paraphrasing a rule the persistence layer owns.
+ *
+ * The three identifying fields are OPTIONAL, and `scope` is what says whether
+ * they are there. They were required when the only possible refusal was a
+ * per-event mapper rejection, which does name its event; a database-raised
+ * refusal does not, so making them required would force a caller-facing lie
+ * rather than a type error. `scope: "event"` still guarantees all three, and
+ * that is asserted by construction at the throw site.
+ */
+export interface SyncFailure {
+  readonly code: SyncFailureCode;
+  /** Whether one event is named or the whole batch was refused. */
+  readonly scope: SyncFailureScope;
+  /** Position of the refused event in the fetched page, 0-based. */
+  readonly index?: number;
+  /** Canonical id of the refused event, so it can be found and re-fetched. */
+  readonly eventId?: string;
+  /** Provider-scoped id of the refused event, the same value under a swap. */
+  readonly externalId?: string;
+  /** The writer's own rejection message, unaltered. */
+  readonly detail: string;
+}
+
+/**
+ * Raised when the writer refuses an event, carrying the same information a
+ * returned {@link SyncFailure} does.
+ *
+ * `persistCanonicalEvents` throws it so a direct caller cannot silently lose a
+ * write; `syncSource` catches it and reports it as a {@link SyncFailure} on the
+ * result, so the user-facing loop answers with a typed outcome instead of an
+ * exception escaping a route handler as an opaque 500.
+ */
+export class SyncPersistenceError extends Error {
+  override readonly name = "SyncPersistenceError";
+
+  readonly failure: SyncFailure;
+
+  constructor(failure: SyncFailure) {
+    super(
+      `event ${JSON.stringify(failure.eventId ?? null)} at position ` +
+        `${failure.index ?? null} was refused by the canonical_events writer ` +
+        `(${failure.code}): ` +
+        failure.detail,
+    );
+    this.failure = failure;
+    Object.setPrototypeOf(this, SyncPersistenceError.prototype);
+  }
+}
 
 export interface SourceRegistryOptions {
   /** `owner/name` of the repository to read. Required. */
@@ -228,12 +332,168 @@ export async function fetchCanonicalEvents(
  * client returned by `getDb()` satisfies it, which `bun run typecheck` pins:
  * `getDb()` is used here as the fallback target, so if the two ever diverge the
  * build turns red rather than the insert failing at run time.
+ *
+ * `onConflictDoUpdate` is part of the seam because the upsert below is not an
+ * optional nicety: without it this type would describe a plain insert, and a
+ * test fake could accept rows while production raised 23505. `set` is typed
+ * against the real Drizzle config bound to the real table, so the update column
+ * list is checked at compile time against `canonical_events` rather than by
+ * inspection — see {@link UpsertSetClause} for the annotation that carries the
+ * check, since the `set` position alone does not.
  */
 export interface CanonicalEventWriter {
   insert(table: typeof canonicalEvents): {
-    values(rows: NewCanonicalEventRow[]): PromiseLike<unknown>;
+    values(rows: NewCanonicalEventRow[]): CanonicalEventUpsertBuilder;
   };
 }
+
+/**
+ * The insert this module actually performs, named so the seam below can be typed
+ * against the REAL table instead of Drizzle's deliberately unconstrained
+ * `AnyPgInsert` alias.
+ *
+ * `AnyPgInsert` is `PgInsertBase<any, any, any, any, any, any>`, so a config
+ * generic over it resolves `set` to `PgUpdateSetSource<any>` — a string-keyed map
+ * that accepts any column name at all. Pinning the table here is what makes the
+ * conflict clause name real columns.
+ */
+type CanonicalEventInsert = PgInsert<typeof canonicalEvents>;
+
+/**
+ * Drizzle's own conflict config, bound to the real insert. So `set` resolves to
+ * `PgUpdateSetSource<typeof canonicalEvents>`: keys are `canonical_events`
+ * columns and values are that column's data type, `SQL` or `PgColumn`.
+ */
+export type CanonicalEventConflictConfig =
+  PgInsertOnConflictDoUpdateConfig<CanonicalEventInsert>;
+
+/** Every column name `canonical_events` can carry, per Drizzle's own `set` type. */
+type CanonicalEventColumn = keyof CanonicalEventConflictConfig["set"] & string;
+
+/**
+ * The natural key, which an update on a natural-key conflict MUST NOT rewrite.
+ *
+ * `id` is the PRIMARY key: reassigning it orphans anything referencing the row,
+ * and the upsert's whole meaning is that the existing row is the same entity,
+ * updated — not replaced by a new one. `source` and `externalId` are the rest of
+ * `UNIQUE(source, external_id)`; rewriting either moves the row out from under
+ * its own conflict target.
+ */
+type NaturalKeyColumn = "id" | "source" | "externalId";
+
+/**
+ * The columns an upsert on a natural-key conflict is allowed to update.
+ *
+ * DERIVED FROM THE SCHEMA, then narrowed: `Exclude` over the real column names
+ * rather than a hand-copied list, so a column added to `db/schema.ts` becomes
+ * updatable automatically (and stays unwritten until deliberately added to
+ * {@link UPSERT_UPDATED_COLUMNS}) while a column REMOVED from the schema turns
+ * the list here into a compile error instead of a silent runtime failure.
+ */
+type UpdatableColumn = Exclude<CanonicalEventColumn, NaturalKeyColumn>;
+
+/**
+ * The shape {@link UPSERT_UPDATED_COLUMNS} must have.
+ *
+ * All-optional, matching Drizzle's own `set`: an update need not touch every
+ * column. Every key optional AND every key excluded from the natural key, so
+ * BOTH failure modes the list's docstring warns about are compile errors.
+ *
+ * This is what makes the guarantee real. `set` cannot enforce it on its own:
+ * TypeScript's excess-property check applies only to a FRESH object literal, and
+ * the call site passes an already-evaluated `const`, so a misspelled key in that
+ * `const` would reach Drizzle unchecked. The annotation on the constant is where
+ * the check actually lands.
+ *
+ * NOTE THE SPLIT IN WHAT EACH LAYER CATCHES, because it is not symmetric. This
+ * type is Drizzle's `set` MINUS the natural key, so it rejects `id`, `source` and
+ * `externalId`. It does not need to be Drizzle's own `set` for that — but it also
+ * must not be narrowed ANY further, because Drizzle's `set` is what rejects a
+ * misspelled column in the first place, and that is the part
+ * {@link CanonicalEventConflictConfig} supplies. Neither type alone is the
+ * guarantee; this one is where the natural key is excluded and the seam is where
+ * the column names are checked, and the constant is annotated with BOTH.
+ *
+ * Exported so the type-level regression test can assert the natural-key
+ * exclusions directly instead of inferring them from the constant's value.
+ */
+export type UpsertSetClause = {
+  readonly [K in UpdatableColumn]?: CanonicalEventConflictConfig["set"][K];
+};
+
+/**
+ * The chained half of the insert a persist performs, up to and including the
+ * conflict clause.
+ *
+ * Named separately so {@link CanonicalEventWriter} stays a one-method seam a
+ * fake can implement, and so a fake must supply `onConflictDoUpdate` rather than
+ * silently dropping the upsert and recording rows that production would reject.
+ *
+ * The config is Drizzle's OWN `PgInsertOnConflictDoUpdateConfig`, not an
+ * invented structural copy: `set` legitimately holds either a bound value or an
+ * `excluded.<column>` SQL fragment (an update has no access to the row object),
+ * and `target` holds table columns. Re-declaring those as plain `string`/`Date`
+ * here is what makes a hand-written seam drift from what `getDb()` actually
+ * accepts — and `bun run typecheck` pins that `getDb()` still satisfies this
+ * interface, so the two cannot diverge silently.
+ *
+ * THE TYPE PARAMETER IS THE REAL TABLE, NOT `AnyPgInsert`, so `set` is keyed by
+ * `canonical_events`'s actual columns and a misspelled one is a compile error
+ * here as well as at the constant. Note what this does NOT do on its own: `id`,
+ * `source` and `externalId` ARE legal `set` keys to Drizzle, so the natural-key
+ * exclusion lives in {@link UpsertSetClause} and not in this seam. What this costs
+ * the fake-implementation use case: nothing. A fake never has to mention the
+ * schema, because TypeScript checks METHOD PARAMETERS bivariantly — a fake
+ * declaring `onConflictDoUpdate(config: { target: unknown; set: Record<string,
+ * unknown> })` still satisfies this interface, which is exactly how
+ * `__tests__/composition-root.test.ts`'s `RecordingWriter` is written. The
+ * constraint binds the PRODUCTION call site, which is where the misspelling
+ * would be, and leaves the recording fake free to accept anything.
+ */
+export interface CanonicalEventUpsertBuilder {
+  onConflictDoUpdate(
+    config: CanonicalEventConflictConfig,
+  ): PromiseLike<unknown>;
+}
+
+/**
+ * The columns an upsert overwrites on a natural-key conflict.
+ *
+ * EVERY provider-supplied or derived field, enumerated explicitly rather than
+ * derived, for two reasons.
+ *
+ * 1. `id`, `source` and `externalId` are the natural key and MUST NOT appear
+ *    here. `id` in particular is the primary key: rewriting it would orphan
+ *    anything that references the row, and the whole point of the upsert is that
+ *    the existing row is the same entity, updated — not replaced by a new one.
+ * 2. A `set` that is derived from the row (e.g. spreading every column) would
+ *    silently re-assign `id` the moment someone adds a column to the schema,
+ *    which is failure (2) arriving invisibly. Enumerating the list means a new
+ *    column is NOT written until it is deliberately added here, and the type
+ *    error names exactly what was missed.
+ *
+ * `type`, `title`, `url`, `author`, `metadata` and `occurredAt` are the mutable
+ * description of the event: a source may edit a title, correct a timestamp, or
+ * drop an author, and a re-sync must be able to converge on the source's current
+ * view rather than freezing the first sighting forever.
+ *
+ * BOTH PROMISES ABOVE ARE NOW ENFORCED BY THE `: UpsertSetClause` ANNOTATION,
+ * which was added with these claims already in place and the type not delivering
+ * them. The annotation is Drizzle's `set` (bound to the real table, which is what
+ * rejects a misspelling like `occurred_at` — the SQL name, not the Drizzle
+ * property) MINUS the natural key (which is what rejects naming `id`). The
+ * annotation is load-bearing: removing it and restoring the bare `as const`
+ * reproduces a `typecheck` that passes at exit 0 with both mistakes present, and
+ * `__tests__/upsert-set-clause.types.ts` re-proves that by `tsc`.
+ */
+const UPSERT_UPDATED_COLUMNS: UpsertSetClause = {
+  type: sql`excluded.type`,
+  title: sql`excluded.title`,
+  url: sql`excluded.url`,
+  author: sql`excluded.author`,
+  metadata: sql`excluded.metadata`,
+  occurredAt: sql`excluded.occurred_at`,
+};
 
 /**
  * Persist canonical events to the `canonical_events` table.
@@ -243,23 +503,229 @@ export interface CanonicalEventWriter {
  * boundary and knows every column. No column is named here, so this module
  * cannot drift from the schema or invent a field.
  *
+ * IDEMPOTENT. This is an UPSERT on the natural key `UNIQUE(source, external_id)`
+ * — `canonical_events_source_external_id_key`, the constraint `db/schema.ts`
+ * documents as existing precisely so this upsert cannot silently double-write.
+ * Re-persisting the same event UPDATES the existing row instead of raising
+ * SQLSTATE 23505, so syncing the same repository twice is a success, not a
+ * failure. This is the single most likely caller behaviour for a sync pipeline.
+ *
+ * WHY THE ARBITER IS THE TWO-COLUMN CONSTRAINT AND NOT `id`. The natural key
+ * is `UNIQUE(source, external_id)`, NOT the primary key `id`, so targeting `id`
+ * would leave the duplicate-key failure in place for every real repeat sync
+ * while looking like an idempotency fix. `id` is derived from `source` +
+ * `externalId` today, so in practice a repeat sync collides on BOTH indexes;
+ * Postgres resolves the conflict against the arbiter named here, and
+ * `src/app/sources/__tests__/persist-canonical-events-upsert.test.ts` proves the
+ * behaviour by execution against a real database: a changed title updates one
+ * row; the same `externalId` under a different `source` yields two rows; and a
+ * row colliding on `id` ALONE raises 23505 instead of overwriting an unrelated
+ * event, which is the case a primary-key arbiter would silently absorb.
+ *
+ * WHAT STILL REACHES 23505 AFTER THIS CHANGE. The upsert absorbs duplicates of
+ * the natural key, so a repeat sync of the same repository succeeds. It does
+ * NOT make duplicates impossible: a row whose `id` collides while its
+ * (source, external_id) does not is invisible to `ON CONFLICT`, and the primary
+ * key raises 23505. A caller must therefore still handle 23505 as a genuine,
+ * reachable failure — it means "these are two different events claiming one
+ * primary key", which is a conflict to report, not an idempotent retry.
+ *
  * An empty list is a no-op rather than a query: a source that has nothing new
  * must not cost a round trip, and Drizzle rejects an empty `values()`.
  *
+ * WHY THE BATCH IS DEDUPLICATED BEFORE `.values()`. `ON CONFLICT DO UPDATE`
+ * absorbs a duplicate that ALREADY EXISTS in the table. It cannot absorb two
+ * duplicates of the SAME key WITHIN ONE STATEMENT: Postgres refuses to update
+ * the same conflict row twice in a single command and raises SQLSTATE 21000
+ * (`cardinality_violation`), which aborts the whole statement. The batch is
+ * therefore not partially lost, it is ENTIRELY lost — measured against a real
+ * Postgres at this head, a batch containing a repeated `(source, external_id)`
+ * raised 21000 and left zero rows behind while a control batch through the same
+ * writer succeeded, so the table was provably writable. That failure is silent
+ * at the level the only production caller sees: `syncSource`'s caller in T15's
+ * route handler cannot distinguish "this batch collided with itself" from "this
+ * source had nothing new", both of which look like nothing persisted.
+ *
+ * So the duplicate is removed from the batch rather than left for Postgres to
+ * reject. See {@link dedupeByNaturalKey} for which of two conflicting payloads
+ * survives.
+ *
+ * THE MAP IS GUARDED, and this is the fix for a layer disagreement. The domain's
+ * `isIso8601DateTime` accepts any fractional-digit count — deliberately, because
+ * a sub-millisecond instant is still orderable, and narrowing it to what a
+ * `timestamptz` bind survives would be re-deciding the domain's validity rule
+ * from the storage layer. The WRITER then refuses to silently truncate it. Both
+ * answers are right, so the disagreement is not resolved here by changing either
+ * one: `toCanonicalEventRow` is called one event at a time and its rejection is
+ * converted into a {@link SyncPersistenceError} that names the refused event.
+ * Nothing is written when any event is refused — the batch is all-or-nothing, so
+ * a partial write could not be reported as a success.
+ *
  * @returns how many rows were written.
+ * @throws SyncPersistenceError if the writer refuses any event, carrying the
+ * writer's own rejection message verbatim.
  */
 export async function persistCanonicalEvents(
   events: readonly CanonicalEvent[],
   writer?: CanonicalEventWriter,
 ): Promise<number> {
   if (events.length === 0) return 0;
-  const rows = events.map(toCanonicalEventRow);
+  // Mapping happens FIRST and deduplication SECOND, deliberately. Mapping first
+  // keeps `SyncFailure.index` a true position in the page the caller fetched;
+  // deduplicating first would renumber every event after the first duplicate,
+  // so a refusal would point at the wrong item. The dedupe still happens before
+  // `.values()`, which is where the cardinality violation is raised.
+  const rows = dedupeByNaturalKey(mapRows(events));
   // Resolved INSIDE the guard rather than as a default parameter value: a
   // default is evaluated on every call, including when a writer is supplied, so
   // `writer = getDb()` would demand DATABASE_URL from a caller that never
   // touches the database at all.
-  await (writer ?? getDb()).insert(canonicalEvents).values(rows);
+  await (writer ?? getDb())
+    .insert(canonicalEvents)
+    .values(rows)
+    .onConflictDoUpdate({
+      target: [canonicalEvents.source, canonicalEvents.externalId],
+      set: UPSERT_UPDATED_COLUMNS,
+    });
   return rows.length;
+}
+
+/**
+ * Map every event to its row, or throw the FIRST refusal as a classified
+ * {@link SyncPersistenceError}.
+ *
+ * Per-event rather than one `events.map(toCanonicalEventRow)`, so the refused
+ * event's index and ids are known. The FIRST rejection is reported, not an
+ * aggregate: the writer stops at the first, and collecting all of them would
+ * mean re-running the mapper to enumerate — pointless, since a page that has one
+ * unusable instant has a data problem the caller must fix upstream, and fixing
+ * it is what makes the rest of the page writable.
+ *
+ * Only a `TypeError` is classified. Anything else from this call is a bug in
+ * this module or in the mapper's internals, and is left to propagate rather than
+ * being laundered into a "the event was refused" answer that would be a lie.
+ */
+function mapRows(events: readonly CanonicalEvent[]): CanonicalEventRow[] {
+  const rows: CanonicalEventRow[] = [];
+  for (const [index, event] of events.entries()) {
+    try {
+      rows.push(toCanonicalEventRow(event));
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      throw new SyncPersistenceError({
+        code: SYNC_FAILURE_CODES.eventNotPersistable,
+        scope: SYNC_FAILURE_SCOPES.event,
+        index,
+        eventId: event.id,
+        externalId: event.externalId,
+        detail: error.message,
+      });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Collapse rows sharing the natural key `UNIQUE(source, external_id)`, keeping
+ * the LAST occurrence of each key.
+ *
+ * WHY THE DEDUPE IS NECESSARY. `ON CONFLICT DO UPDATE` resolves a conflict
+ * against a row that ALREADY EXISTS in the table. Two rows in ONE statement
+ * that both target the SAME conflict row is a different thing: Postgres raises
+ * SQLSTATE 21000 (`cardinality_violation`, "cannot update row more than once")
+ * and the statement aborts, so the WHOLE batch is written zero rows rather than
+ * one — the failure mode this function exists to remove. Measured on a real
+ * Postgres: a batch with one repeated natural key raised 21000 and left no rows
+ * behind, while a control batch through the same writer succeeded. `syncSource`
+ * reports both as `persisted: 0`, which is why the loss was silent.
+ *
+ * WHICH EVENT WINS: LAST OCCURRENCE WINS, stated explicitly rather than left
+ * emergent. If the batch names `(source, externalId)` more than once, the LAST
+ * such row in input order is kept and every earlier one is dropped. The reason
+ * last-wins: this function's whole purpose is to converge on the source's
+ * CURRENT view of an event — the upsert's own rule is that a repeat sync
+ * UPDATES the mutable columns (see {@link UPSERT_UPDATED_COLUMNS}) — and within
+ * one fetched page a later sighting of the same event is at least as fresh as an
+ * earlier one, exactly as a later sync overwrites an earlier sync. A page is
+ * ordered by the source, so "later in the batch" is the source's own ordering,
+ * not an accident of iteration.
+ *
+ * DETERMINISM. The rule is positional and total: for every input position there
+ * is exactly one decision (keep if no later row shares its key), so the result
+ * does not depend on object identity, property enumeration order, or Map
+ * insertion/re-insertion order. Each key is seen once in `kept`, and a later
+ * occurrence REPLACES the earlier one, so the surviving row is the last one by
+ * construction. `Map` never reorders an existing key when its value is
+ * replaced, and the key is the JSON-encoded PAIR rather than a delimiter-joined
+ * string, so no two distinct natural keys can be forged into one.
+ *
+ * THE KEY IS THE PAIR `(source, externalId)`, NOT EITHER COLUMN ALONE. `source`
+ * participates in the key because it is part of the constraint the upsert
+ * targets: the same `externalId` under two sources is two DIFFERENT events and
+ * both must survive. `id` deliberately does NOT participate: a primary-key
+ * collision that the natural key does not share is a genuine conflict for the
+ * database to raise (23505), and absorbing it here would hide two different
+ * events claiming one primary key. Deduplication must not weaken that path, and
+ * `__tests__/persist-canonical-events-upsert.test.ts` pins both halves.
+ */
+function dedupeByNaturalKey(
+  rows: readonly CanonicalEventRow[],
+): CanonicalEventRow[] {
+  const kept = new Map<string, CanonicalEventRow>();
+  for (const row of rows) {
+    // `JSON.stringify` of the pair, not a delimiter join: a delimiter can appear
+    // inside either value, so `("a|b", "c")` and `("a", "b|c")` would forge one
+    // key out of two distinct natural keys and silently drop an event. The JSON
+    // array is unambiguous for every string, so no key is ever forged.
+    kept.set(JSON.stringify([row.source, row.externalId]), row);
+  }
+  // Map iteration order is insertion order, and `set` on an EXISTING key
+  // replaces the value without moving the key, so this yields one row per
+  // natural key in the position of that key's FIRST occurrence in the batch,
+  // holding that key's LAST occurrence. Row order is irrelevant to the outcome
+  // (keys are independent) but keeping it stable makes a failure reproducible
+  // instead of dependent on a Map's internals.
+  return [...kept.values()];
+}
+
+/**
+ * Postgres check-violation SQLSTATE, in its numeric form.
+ *
+ * 23514 is the whole of class 23 (`integrity_constraint_violation`) that this
+ * table uses for CHECK constraints — see `canonical_events_type_check` and
+ * `canonical_events_metadata_is_object_check`. The numeric form carries no text
+ * in it, so nothing a driver or an attacker controls can reach a response
+ * through a comparison against it.
+ */
+const CHECK_VIOLATION = "23514";
+
+/**
+ * Detect a check-constraint violation by walking the cause chain for a
+ * SQLSTATE `code`, never for message text.
+ *
+ * The shape is deliberately identical to `isUniqueViolation` in the sync route,
+ * for the same reason and with the same two properties: the discriminator is the
+ * five-character numeric SQLSTATE, so no attacker-influenced driver text is ever
+ * parsed, and the walk is depth-bounded so a cyclic cause chain cannot hang the
+ * sync. Drizzle wraps driver failures, so the code lives on `cause` one or more
+ * levels down.
+ *
+ * WHY A NUMERIC SQLSTATE AND NOT THE CONSTRAINT NAME. Naming the constraint
+ * would classify better but cannot be done safely: the constraint name reaches
+ * us inside the driver's own message, and this module's contract is that no
+ * driver text is parsed. Two check constraints exist on this table today
+ * (`type` and `metadata`) and both mean exactly one thing here — the batch is
+ * not persistable — so the coarser classifier gives the same correct answer for
+ * both, and gives it for any check constraint added later without a code change.
+ */
+function isCheckViolation(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) return false;
+    if ((current as { code?: unknown }).code === CHECK_VIOLATION) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 export interface SyncOptions {
@@ -277,11 +743,58 @@ export interface SyncResult {
   readonly events: CanonicalEvent[];
   /** How many rows were written. */
   readonly persisted: number;
+  /**
+   * Present only when the sync did NOT complete.
+   *
+   * Absent on success. On refusal it carries the classification AND the
+   * writer's own reason, and `persisted` is `0` — the batch is all-or-nothing,
+   * so there is no partial count to report.
+   */
+  readonly failure?: SyncFailure;
 }
 
 /**
  * The user-facing loop this card exists to make reachable: fetch work from a
  * source, then persist the canonical events it maps to.
+ *
+ * A writer refusal is RETURNED, not thrown. This is the boundary half of the
+ * fix: a `CanonicalEvent` the domain considers valid can still be one the
+ * writer refuses, and that must reach the caller as a typed, actionable outcome
+ * rather than an exception escaping to whatever called this — which, once T15
+ * makes this a production route handler, is an opaque 500 with no indication of
+ * which event or why. Everything else about the sync still throws: a transport
+ * or credential failure has no classification to report and is genuinely
+ * exceptional.
+ *
+ * WHAT "THE WRITER REFUSED" COVERS, AND WHY THE CATCH IS NOT `instanceof`-ONLY.
+ * `mapRows` raises a `SyncPersistenceError` for a per-event rejection, but the
+ * mapper cannot see everything the database enforces: `metadata` is a
+ * compile-time claim with no runtime shape check, and the type allow-list is
+ * enforced by a CHECK constraint the mapper never sees. A non-object `metadata`
+ * and an out-of-list `type` therefore reach Postgres, which refuses the whole
+ * statement with SQLSTATE 23514 — and a raw driver error escaping this catch is
+ * exactly what produced the two-answers-one-batch defect. Measured against a
+ * real Postgres through this function, before the fix:
+ *
+ *   metadata = [1,2,3] -> thrown out of syncSource -> route 500 internal_error
+ *   metadata = null    -> returned as a failure   -> route 422
+ *
+ * The same refused batch, two answers, and the 500 one is a lie about a data
+ * problem. So a driver-thrown 23514 is converted into the SAME classified
+ * refusal here, by SQLSTATE and never by message text (see
+ * {@link isCheckViolation}).
+ *
+ * SCOPE, STATED RATHER THAN GUESSED. A database-raised refusal carries no
+ * offending row: the batch is one statement, so Postgres names the row it was
+ * inserting, not which of several rows tripped a constraint. Inventing an
+ * index or an event id there would be a fabricated answer, so the page-scope
+ * refusal names no event and says so through `scope`. A caller that needs to
+ * know WHICH event was refused re-fetches the page and validates it
+ * client-side; the route deliberately reports neither.
+ *
+ * The all-or-nothing property is preserved and load-bearing: a CHECK refusal
+ * aborts the whole statement, so `persisted: 0` is literally true rather than a
+ * rounded-down count.
  */
 export async function syncSource(options: SyncOptions): Promise<SyncResult> {
   const events = await fetchCanonicalEvents(
@@ -293,6 +806,70 @@ export async function syncSource(options: SyncOptions): Promise<SyncResult> {
   // ?? getDb()` is an argument expression, so `getDb()` would be evaluated on
   // every call and demand DATABASE_URL from a caller that has nothing to
   // persist. The callee resolves it inside its own empty-list guard.
-  const persisted = await persistCanonicalEvents(events, options.writer);
-  return { events, persisted };
+  try {
+    const persisted = await persistCanonicalEvents(events, options.writer);
+    return { events, persisted };
+  } catch (error) {
+    if (error instanceof SyncPersistenceError) {
+      return { events, persisted: 0, failure: error.failure };
+    }
+    if (isCheckViolation(error)) {
+      return { events, persisted: 0, failure: checkViolationFailure(error) };
+    }
+    throw error;
+  }
+}
+
+/**
+ * The persistence layer's own reason, taken from the DEEPEST link of the cause
+ * chain rather than the outermost.
+ *
+ * WHY DEPTH MATTERS, AND IT IS NOT COSMETIC. Drizzle's own failure is the
+ * outermost link and its message is `"Failed query: insert into
+ * \"canonical_events\" ..."` — true, and useless: it names no constraint and no
+ * offending value, so the caller would learn only that some insert failed. The
+ * driver's own message is the link that says WHICH rule fired. `mapRows` already
+ * keeps the writer's own reason for a mapper rejection; taking the outermost
+ * link here would make the database-raised path carry strictly LESS than the
+ * mapped one, which is backwards.
+ *
+ * The text is still carried VERBATIM — it is selected, never parsed or
+ * re-rendered, and no classification anywhere depends on its content. If no
+ * link in the chain has a string message, the outermost one's stringification
+ * is used rather than an empty detail, so the field is never blank.
+ */
+function driverMessage(error: unknown): string {
+  let deepest = error;
+  let current: unknown = error;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== "object" || current === null) break;
+    if (current instanceof Error) deepest = current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return deepest instanceof Error ? deepest.message : String(deepest);
+}
+
+/**
+ * Classify a driver-thrown check violation into the same
+ * {@link SyncFailure} the mapper produces.
+ *
+ * `detail` is the persistence layer's own reason carried VERBATIM, on exactly
+ * the same terms as a mapper rejection: it names the rule that refused the
+ * batch, which is what makes the refusal actionable to whoever has to fix the
+ * data. It is NOT rendered by the route — the sync handler selects the
+ * classification into fixed text and drops the detail, so this never reaches a
+ * response. That contract is asserted by `handler.test.ts` against a canary,
+ * not left to this comment.
+ *
+ * The code is the ONE existing `SyncFailureCode`: a new outcome was available
+ * and was deliberately not taken, because "the batch is not persistable" is the
+ * same statement whichever layer refused it, and two codes for it would let the
+ * route grow a second, differently-statused answer for the same fact.
+ */
+function checkViolationFailure(error: unknown): SyncFailure {
+  return {
+    code: SYNC_FAILURE_CODES.eventNotPersistable,
+    scope: SYNC_FAILURE_SCOPES.page,
+    detail: driverMessage(error),
+  };
 }

@@ -21,6 +21,10 @@ import {
   unique,
 } from "drizzle-orm/pg-core";
 
+import type {
+  CanonicalEventType,
+  JsonObject,
+} from "../src/core/events/canonical-event";
 import { CANONICAL_EVENT_TYPES } from "../src/core/events/canonical-event";
 
 /**
@@ -53,6 +57,16 @@ export const appMeta = pgTable("app_meta", {
  * ENUM value in Postgres requires `ALTER TYPE ... ADD VALUE` with its own
  * transaction restrictions and is not cheaply reversible, whereas a CHECK is just
  * another generated migration like every other change to this schema.
+ *
+ * DRIFT IS ENFORCED IN CI, NOT ONLY BY GENERATION (B27). "Generated from the
+ * array" is only true at generation time — a committed migration inlines static
+ * SQL literals, so adding a member to `CANONICAL_EVENT_TYPES` without running
+ * `bun run db:generate` would ship a database whose CHECK rejects the new value
+ * at insert time. Nothing in `bun run test` or `bun run lint` can see this,
+ * because `vitest.config.ts` collects `src/**` only and the DB suite needs a
+ * live Postgres. The control is the `Database migrations in sync` step in
+ * `.github/workflows/ci.yml`: it regenerates and fails if `db/migrations`
+ * differs from the committed tree.
  */
 export const canonicalEvents = pgTable(
   "canonical_events",
@@ -63,8 +77,20 @@ export const canonicalEvents = pgTable(
     source: text("source").notNull(),
     /** Identifier assigned by the source; unique only within `source`. */
     externalId: text("external_id").notNull(),
-    /** The ROLE the event plays in DevLoop, constrained to CanonicalEventType. */
-    type: text("type").notNull(),
+    /**
+     * The ROLE the event plays in DevLoop.
+     *
+     * `$type` narrows the column from `string` to `CanonicalEventType` so a
+     * TYPED insert (`NewCanonicalEventRow`, i.e. what `toCanonicalEventRow`
+     * returns) cannot carry a value outside the union — the mistake is caught
+     * by `tsc` instead of by Postgres at insert time. The database-side CHECK
+     * below remains the enforcement boundary for anything that reaches the
+     * table without going through these types (raw SQL, a future writer).
+     *
+     * The DDL is unchanged: `text("type")` still emits `"type" text NOT NULL`,
+     * so this is a compile-time narrowing only and mints no migration.
+     */
+    type: text("type").$type<CanonicalEventType>().notNull(),
     title: text("title").notNull(),
     /**
      * When the event happened at the source. Stored as `timestamptz`, so the
@@ -80,8 +106,15 @@ export const canonicalEvents = pgTable(
      * Provider-supplied extra data. NOT NULL with a `{}` default rather than
      * nullable: a NULL metadata is indistinguishable downstream from an event that
      * carried no extra data, and the type says it is always present.
+     *
+     * `$type<JsonObject>()` narrows the column from `unknown` to the core
+     * domain's JSON-safe bag, so the type contract is visible at the column
+     * rather than only at the mapper. The `jsonb_typeof` CHECK below is what
+     * actually enforces it in the database — `jsonb NOT NULL` alone still
+     * admits JSON `null`, an array, or a bare scalar, and the mapper would then
+     * silently reshape it into something the type never promised.
      */
-    metadata: jsonb("metadata").notNull().default({}),
+    metadata: jsonb("metadata").$type<JsonObject>().notNull().default({}),
   },
   (table) => [
     /**
@@ -112,6 +145,27 @@ export const canonicalEvents = pgTable(
           quoteSqlLiteral(type),
         ).join(", ")})`,
       ),
+    ),
+    /**
+     * Database-level enforcement that `metadata` really is a JSON OBJECT.
+     *
+     * `metadata jsonb NOT NULL DEFAULT '{}'` does NOT enforce `JsonObject`:
+     * Postgres happily stores JSON `null`, `[]`, `"a string"` and `42` in that
+     * column, and each of those violates `CanonicalEvent["metadata"]`'s
+     * `{ [key: string]: JsonValue }` contract. `jsonb_typeof` is the one
+     * Postgres function that distinguishes those: it returns `null` for JSON
+     * null, `array` for an array, `object` only for a real object.
+     *
+     * Note this CHECK is about the SHAPE, and unlike the type CHECK above it is
+     * NOT generated from a TypeScript value set — there is nothing to drift
+     * from. It states a property of JSON itself, so it cannot become stale the
+     * way the enumerated value list can. The drift control for THAT list is the
+     * CI step in `.github/workflows/ci.yml` which runs `bun run db:generate` and
+     * fails if `db/migrations` changes.
+     */
+    check(
+      "canonical_events_metadata_is_object_check",
+      sql.raw(`jsonb_typeof("metadata") = 'object'`),
     ),
   ],
 );

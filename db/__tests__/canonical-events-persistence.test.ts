@@ -9,8 +9,10 @@
  * Run with `bun run test:db` after `bun run db:migrate`.
  */
 
-import { eq } from "drizzle-orm";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import postgres from "postgres";
+import { readFileSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import type { CanonicalEvent } from "../../src/core/events/canonical-event";
 import { CANONICAL_EVENT_TYPES } from "../../src/core/events/canonical-event";
@@ -215,21 +217,38 @@ describe("canonical_events persistence (type -> storage -> type)", () => {
     ).toBe("2026-10-04T12:31:07.000Z");
   });
 
-  it("keeps occurredAt byte-identical across a second round trip", async () => {
-    await insert(FULL_EVENT);
+  it("pins occurredAt to a hand-written literal, not to its own round trip", async () => {
+    // B27 finding 7: this test used to assert `second === first`, where `first`
+    // is ALREADY the mapper's own `toISOString()` output — so it largely restated
+    // that `toISOString()` is stable rather than checking what was persisted. The
+    // expectation below is written out by hand, and the input is deliberately
+    // NON-canonical (a `+02:00` offset with sub-second digits and no `Z`), so
+    // the assertion can fail if the persisted instant is wrong.
+    const nonCanonical: CanonicalEvent = {
+      ...MINIMAL_EVENT,
+      id: "evt_01HQZX0000000000000000007",
+      externalId: "ext-4717",
+      occurredAt: "2026-10-04T14:31:07.250+02:00",
+    };
+    await insert(nonCanonical);
+
     const [row] = await getDb()
       .select()
       .from(canonicalEvents)
-      .where(eq(canonicalEvents.id, FULL_EVENT.id));
+      .where(eq(canonicalEvents.id, nonCanonical.id));
 
-    const first = fromCanonicalEventRow(row!).occurredAt;
-    // Feed the normalised value back through the mapper: idempotent from here.
+    // The instant, spelled out: 14:31:07.250 at +02:00 IS 12:31:07.250 UTC.
+    const EXPECTED = "2026-10-04T12:31:07.250Z";
+    expect(row!.occurredAt.toISOString()).toBe(EXPECTED);
+    expect(fromCanonicalEventRow(row!).occurredAt).toBe(EXPECTED);
+
+    // Feeding the canonical value back is idempotent — a SECOND, weaker
+    // property, now stated after the strong one above rather than instead of it.
     const second = toCanonicalEventRow({
-      ...FULL_EVENT,
-      occurredAt: first,
+      ...nonCanonical,
+      occurredAt: fromCanonicalEventRow(row!).occurredAt,
     }).occurredAt.toISOString();
-
-    expect(second).toBe(first);
+    expect(second).toBe(EXPECTED);
   });
 
   it("preserves nested metadata types instead of flattening them to strings", async () => {
@@ -316,6 +335,116 @@ describe("canonical_events persistence (type -> storage -> type)", () => {
   });
 });
 
+describe("the mapper rejects timestamps it cannot persist faithfully (B27 f4/f5)", () => {
+  // Both of these used to be accepted silently, producing a row whose
+  // `occurred_at` was not the instant the caller supplied.
+  const base = MINIMAL_EVENT;
+
+  it("rejects an offset-less ISO value, whose instant would depend on the host TZ", () => {
+    // `new Date("2026-10-04T12:31:07")` resolves in the PROCESS timezone, so
+    // this string is not an instant at all — it is three different instants
+    // depending on who parses it.
+    expect(() =>
+      toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T12:31:07" }),
+    ).toThrow(/explicit UTC offset/);
+  });
+
+  it("rejects the colon-less ±HHMM offset spelling", () => {
+    // ISO-8601 permits the basic format `+0200`, and the writer rejects it: the
+    // offset must be one of the two shapes the error message names. Pinned here
+    // because it is a narrowing we chose deliberately, not an accident — and a
+    // comment claiming a form is accepted (or rejected) is worth nothing unless
+    // a test holds the code to it.
+    expect(() =>
+      toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T14:31:07+0200" }),
+    ).toThrow(/explicit UTC offset/);
+    // The extended form of the same instant is accepted, so this pins the
+    // spelling and not the offset itself.
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T14:31:07+02:00",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T12:31:07.000Z");
+  });
+
+  it("rejects sub-millisecond precision instead of truncating it", () => {
+    expect(() =>
+      toCanonicalEventRow({ ...base, occurredAt: "2026-10-04T12:31:07.0001Z" }),
+    ).toThrow(/more precision than a Date can hold/);
+  });
+
+  it("accepts a representable fraction and an offset of either sign", () => {
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T12:31:07.250Z",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T12:31:07.250Z");
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T14:31:07+02:00",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T12:31:07.000Z");
+    // The negative sign, which this test's name claims and which the two cases
+    // above did not actually cover: 12:31:07 at -02:00 is 14:31:07 UTC. A review
+    // found the name asserting coverage that was not there, which is the same
+    // failure as a stale figure in a comment — a test whose name overstates it is
+    // a claim no assertion backs.
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-10-04T12:31:07-02:00",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-10-04T14:31:07.000Z");
+  });
+
+  it("rejects an impossible calendar date that Date would silently roll over", () => {
+    // `new Date("2026-02-30T12:31:07Z")` is 2 MARCH 2026, not NaN — measured, and
+    // it is why the old `Number.isNaN(parsed.getTime())` guard could never catch
+    // this class of input. Before the fix the row was written as
+    // occurred_at = 2026-03-02T12:31:07.000Z: a confidently wrong date, filed
+    // against the wrong period, with no error anywhere. The module's header says
+    // the writer exists so a silently wrong row is never persisted, so this is
+    // the case that header was claiming and not delivering.
+    //
+    // One per hazard the domain validator documents: a day past the end of a
+    // 31-day month, a day past the end of a 30-day month, a non-leap February
+    // 29th, and an out-of-range field.
+    for (const value of [
+      "2026-02-30T12:31:07Z",
+      "2026-04-31T12:31:07Z",
+      "2026-02-29T12:31:07Z",
+      "2026-13-01T12:31:07Z",
+      "2026-01-15T25:00:00Z",
+    ]) {
+      expect(
+        () => toCanonicalEventRow({ ...base, occurredAt: value }),
+        value,
+      ).toThrow(/not a real calendar instant/);
+    }
+  });
+
+  it("accepts a real leap day, so the calendar rule is not just 'reject more'", () => {
+    // A rejection test alone cannot tell a correct calendar rule from one that
+    // rejects every date in or after February. 2024 IS a leap year so the 29th
+    // exists, and the days either side of the boundary must still pass.
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2024-02-29T00:00:00Z",
+      }).occurredAt.toISOString(),
+    ).toBe("2024-02-29T00:00:00.000Z");
+    expect(
+      toCanonicalEventRow({
+        ...base,
+        occurredAt: "2026-02-28T00:00:00Z",
+      }).occurredAt.toISOString(),
+    ).toBe("2026-02-28T00:00:00.000Z");
+  });
+});
+
 describe("canonical_events constraints are enforced by the database", () => {
   it("rejects a type outside CanonicalEventType", async () => {
     await expectRejectedBy(
@@ -329,6 +458,51 @@ describe("canonical_events constraints are enforced by the database", () => {
         ),
       "canonical_events_type_check",
     );
+  });
+
+  it("rejects JSON null in metadata, which NOT NULL does not stop (B27 f2)", async () => {
+    // `'null'::jsonb` is the JSON null VALUE, not SQL NULL, so the NOT NULL
+    // column constraint accepts it — and it satisfies nothing `JsonObject`
+    // promises. Only `jsonb_typeof(metadata) = 'object'` rejects it.
+    await expectRejectedBy(
+      getDb().execute(sql`
+        INSERT INTO canonical_events
+          (id, source, external_id, type, title, occurred_at, metadata)
+        VALUES ('evt_json_null_meta', 'fixture-source', 'ext-json-null',
+                'mention', 'json null metadata', now(), 'null'::jsonb)
+      `),
+      "canonical_events_metadata_is_object_check",
+    );
+  });
+
+  it("rejects an array and a scalar in metadata (B27 f2)", async () => {
+    // Each literal is spliced with `sql.raw` because a jsonb value must be
+    // cast in SQL text; these three are fixed strings written here, never input.
+    for (const [index, literal] of [
+      "'[1,2,3]'",
+      "'\"a string\"'",
+      "'42'",
+    ].entries()) {
+      await expectRejectedBy(
+        getDb().execute(sql`
+          INSERT INTO canonical_events
+            (id, source, external_id, type, title, occurred_at, metadata)
+          VALUES (${`evt_nonobj_${index}`}, 'fixture-source',
+                  ${`ext-nonobj-${index}`}, 'mention', 'non-object metadata',
+                  now(), ${sql.raw(literal)}::jsonb)
+        `),
+        "canonical_events_metadata_is_object_check",
+      );
+    }
+  });
+
+  it("accepts a JSON object in metadata, including a nested one (B27 f2)", async () => {
+    await insert({
+      ...MINIMAL_EVENT,
+      id: "evt_01HQZX0000000000000000008",
+      externalId: "ext-4718",
+      metadata: { a: 1, b: { c: [true, null] } },
+    });
   });
 
   it("accepts every member of CanonicalEventType", async () => {
@@ -396,6 +570,238 @@ describe("canonical_events constraints are enforced by the database", () => {
           occurredAt: new Date("2026-05-05T05:05:05.000Z"),
         }),
       'null value in column "title"',
+    );
+  });
+});
+
+/**
+ * THE UPGRADE PATH — the part of a migration that no fresh-database test can
+ * reach, and the defect a review found and reproduced by execution.
+ *
+ * Every other case in this file runs against a database migrated by applying
+ * `0002` to an EMPTY schema. That path cannot fail: there are no rows to
+ * validate. But `ALTER TABLE ... ADD CONSTRAINT ... CHECK` validates every
+ * EXISTING row, and `0001` permitted `metadata` to be a JSON array, a bare
+ * scalar or JSON null — `jsonb NOT NULL DEFAULT '{}'` constrains neither. So a
+ * developer's existing database could hold a row the new constraint rejects, and
+ * `bun run db:migrate` would exit 1 with a message naming a constraint and not a
+ * cause. MEASURED against the unfixed migration: apply `0000` + `0001`, insert
+ * `metadata = '[1,2]'::jsonb` (the insert SUCCEEDS), apply `0002` ->
+ *
+ *   ERROR:  check constraint "canonical_events_metadata_is_object_check" of
+ *   relation "canonical_events" is violated by some row
+ *
+ * That is why the suite reported 20/20 green while `db:migrate` was broken for
+ * exactly the developers the suite exists to protect. This block closes it: it
+ * builds a REAL legacy database on the REAL Postgres by applying only the
+ * migrations that predate `0002`, puts the illegal rows there by hand, then
+ * runs the real `0002` through the real migrator.
+ *
+ * SANDBOX, NOT A SEPARATE DATABASE. It creates and drops its own SCHEMA, so it
+ * cannot disturb whatever `DATABASE_URL` points at and needs no second server —
+ * a test that could clobber a developer's real data would not be one to add to a
+ * suite this suite protects.
+ *
+ * FOUR TESTS, ONE ORDERED BUILD. Unlike the rest of this file there is no
+ * per-test cleanup: the legacy database is constructed across the first three
+ * cases, so they share state and MUST run in order. `fileParallelism: false` in
+ * `vitest.db.config.ts` makes files serial, and vitest runs the cases of a file
+ * in declaration order, so the ordering holds — but it is the reason each case
+ * below names the state it depends on rather than pretending to be independent.
+ */
+describe("the 0002 upgrade path from a legacy database holding non-object metadata", () => {
+  const SANDBOX_SCHEMA = "canonical_events_legacy_probe";
+
+  /** The migrations that existed BEFORE the shape CHECK, applied in order. */
+  const LEGACY_TAGS = ["0000_tiny_nightshade", "0001_parched_talon"] as const;
+
+  /**
+   * A connection PINNED to the sandbox schema, for statements that must resolve
+   * there.
+   *
+   * `reset` drops and recreates the sandbox on entry; without it the connection
+   * merely attaches to the existing one. That distinction is load-bearing, not
+   * convenience: resetting per call destroys the state every later case asserts
+   * on. MEASURED first — a per-call reset fails with `relation "canonical_events"
+   * does not exist`, which reads as a missing migration rather than the
+   * lifecycle bug it is.
+   *
+   * DROP runs BEFORE CREATE: dropping a schema the connection's search_path
+   * already points at leaves Postgres with "no schema has been selected to
+   * create in" for the next statement. Also measured, also not theorised.
+   */
+  async function withSandbox<T>(
+    run: (client: postgres.Sql) => Promise<T>,
+    options: { readonly reset: boolean },
+  ): Promise<T> {
+    const client = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      if (options.reset) {
+        await client.unsafe(
+          `DROP SCHEMA IF EXISTS "${SANDBOX_SCHEMA}" CASCADE`,
+        );
+        await client.unsafe(`CREATE SCHEMA "${SANDBOX_SCHEMA}"`);
+      }
+      await client.unsafe(`SET search_path TO "${SANDBOX_SCHEMA}"`);
+      return await run(client);
+    } finally {
+      await client.end();
+    }
+  }
+
+  /** Applies the named migration files to the sandbox, verbatim, in order. */
+  async function applyMigrations(
+    client: postgres.Sql,
+    tags: readonly string[],
+  ) {
+    for (const tag of tags) {
+      const file = readFileSync(
+        new URL(`../migrations/${tag}.sql`, import.meta.url),
+        "utf8",
+      );
+      // Split on the exact marker drizzle's own migrator uses
+      // (`drizzle-orm/migrator` -> `query.split("--> statement-breakpoint")`) and
+      // execute each part in ONE transaction, so this replay is the same code
+      // path `db:migrate` runs and not an approximation of it.
+      await client.begin(async (tx) => {
+        for (const statement of file.split("--> statement-breakpoint")) {
+          if (statement.trim() === "") continue;
+          await tx.unsafe(statement);
+        }
+      });
+    }
+  }
+
+  beforeAll(async () => {
+    await withSandbox(
+      async (client) => {
+        await applyMigrations(client, LEGACY_TAGS);
+      },
+      { reset: true },
+    );
+  });
+
+  afterAll(async () => {
+    await withSandbox(
+      async (client) => {
+        await client.unsafe(
+          `DROP SCHEMA IF EXISTS "${SANDBOX_SCHEMA}" CASCADE`,
+        );
+      },
+      { reset: false },
+    );
+  });
+
+  it("inserts non-object metadata on the legacy schema, proving it was legal", async () => {
+    // Its own case because it is the PREMISE of the whole block: if `0001`
+    // rejected these rows, the upgrade case below would be proving nothing.
+    await withSandbox(
+      async (client) => {
+        for (const [id, literal] of [
+          ["legacy-array", "'[1,2]'::jsonb"],
+          ["legacy-scalar", "'42'::jsonb"],
+          ["legacy-json-null", "'null'::jsonb"],
+        ] as const) {
+          await client.unsafe(`
+            INSERT INTO canonical_events
+              (id, source, external_id, type, title, occurred_at, metadata)
+            VALUES ('${id}', 'fixture-source', 'ext-${id}', 'mention',
+                    'legacy row with non-object metadata', now(), ${literal})
+          `);
+        }
+
+        const rows = await client<
+          { id: string }[]
+        >`SELECT id FROM canonical_events ORDER BY id`;
+        expect(rows.map((row) => row.id)).toEqual([
+          "legacy-array",
+          "legacy-json-null",
+          "legacy-scalar",
+        ]);
+      },
+      { reset: false },
+    );
+  });
+
+  it("applies 0002 without error, where the bare ALTER TABLE failed", async () => {
+    await withSandbox(
+      async (client) => {
+        // THE assertion that is RED against the unfixed migration: the unguarded
+        // `ADD CONSTRAINT` aborts here with `check constraint ... is violated by
+        // some row` and the transaction rolls back, so `0002` is never applied.
+        await applyMigrations(client, ["0002_loud_johnny_blaze"]);
+      },
+      { reset: false },
+    );
+  });
+
+  it("repaired the legacy rows instead of dropping or blanking them", async () => {
+    await withSandbox(
+      async (client) => {
+        const rows = await client<
+          { id: string; metadata: Record<string, unknown> }[]
+        >`SELECT id, metadata FROM canonical_events ORDER BY id`;
+
+        // The rows SURVIVED. A migration that fixes the upgrade by deleting user
+        // data is not an acceptable fix, so this is asserted explicitly rather
+        // than inferred from the constraint having landed.
+        expect(rows.map((row) => row.id)).toEqual([
+          "legacy-array",
+          "legacy-json-null",
+          "legacy-scalar",
+        ]);
+
+        // And their original payloads are preserved, WRAPPED rather than
+        // overwritten: '{}' would destroy the source's data silently, and a
+        // deleted row would destroy the event.
+        expect(rows[0]!.metadata).toEqual({
+          _devloop_legacy_non_object: [1, 2],
+        });
+        expect(rows[1]!.metadata).toEqual({ _devloop_legacy_non_object: null });
+        expect(rows[2]!.metadata).toEqual({ _devloop_legacy_non_object: 42 });
+
+        // Each is now a real JSON OBJECT — read back through the column type
+        // itself, not by re-running the predicate the migration used, so a bug in
+        // that predicate cannot make this pass.
+        for (const row of rows) {
+          const typed = await client<
+            { type: string | null }[]
+          >`SELECT jsonb_typeof(metadata) AS type FROM canonical_events WHERE id = ${row.id}`;
+          expect(typed[0]!.type, row.id).toBe("object");
+        }
+      },
+      { reset: false },
+    );
+  });
+
+  it("enforces the CHECK against NEW rows after the upgrade", async () => {
+    await withSandbox(
+      async (client) => {
+        // The repair must not have disarmed the constraint: a migration that
+        // wrapped the old rows and then added no CHECK — or added it NOT VALID
+        // and never validated it — would pass the case above.
+        let error: unknown;
+        try {
+          await client.unsafe(`
+            INSERT INTO canonical_events
+              (id, source, external_id, type, title, occurred_at, metadata)
+            VALUES ('post-upgrade-bad', 'fixture-source', 'ext-post-upgrade-bad',
+                    'mention', 'new non-object row', now(), '[9]'::jsonb)
+          `);
+        } catch (caught) {
+          error = caught;
+        }
+        if (error === undefined) {
+          throw new Error(
+            "The shape CHECK is not enforced after the upgrade: a new " +
+              "non-object metadata row was accepted.",
+          );
+        }
+        expect(String(error)).toContain(
+          "canonical_events_metadata_is_object_check",
+        );
+      },
+      { reset: false },
     );
   });
 });
