@@ -22,7 +22,7 @@
  * boundary assertion does not become invisible inside a 30-test suite.
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -110,6 +110,70 @@ function importSpecifiers(source: string): string[] {
   return specs;
 }
 
+/**
+ * The provider-SDK matcher used by the guard below.
+ *
+ * WHY IT IS A FUNCTION AND NOT AN INLINE REGEX.
+ *
+ * The previous inline pattern was
+ * `/^(node:)?(@?[\w-]+\/)?(octokit|github|gitlab|glab)/`, and its optional
+ * scope group `(@?[\w-]+\/)?` is GREEDY in a way that defeats the whole
+ * guard. Because the group is optional AND unanchored at its own end, the
+ * regex engine prefers consuming the scope, so for a real scoped package the
+ * `(octokit|github|gitlab|glab)` alternative is then matched against the
+ * PACKAGE NAME -- where none of those four words appears. Measured against the
+ * six names the guard exists to catch:
+ *
+ *   @octokit/rest   -> NOT detected
+ *   @octokit/core   -> NOT detected
+ *   @gitlab-org/api -> NOT detected
+ *   octokit         -> detected
+ *   github          -> detected
+ *   glab            -> detected
+ *
+ * So the guard fired on bare names and silently missed every real scoped SDK
+ * package -- the only spelling npm actually installs. A guard that cannot catch
+ * its own target is decorative.
+ *
+ * The fix splits the specifier into its parts and matches the SDK name against
+ * BOTH the scope and the package, rather than trying to reach either through
+ * one greedy alternation. It is exported so the behaviour is directly
+ * testable, and the test below asserts every name above is detected: the
+ * matcher is the thing under test, not an implementation detail of the scan.
+ */
+
+/** npm scopes whose name alone indicates a provider SDK. */
+const PROVIDER_SDK_NAMES = [
+  "octokit",
+  "github",
+  "gitlab",
+  "glab",
+  "gitlab-org",
+] as const;
+
+/**
+ * True when an import specifier names a provider SDK.
+ *
+ * Matches a Node builtin prefix (`node:`) nowhere -- builtins are not SDKs --
+ * and treats a scoped specifier as two name components, so `@octokit/rest` is
+ * caught on its SCOPE and `glab/api` on its PACKAGE.
+ */
+export function isProviderSdkSpecifier(spec: string): boolean {
+  const specifier = spec.startsWith("node:")
+    ? spec.slice("node:".length)
+    : spec;
+  const components = specifier.split("/");
+  // An unscoped specifier is one component; a scoped one is `@scope/name`, so
+  // the scope is components[0] and the package is components[1].
+  const names =
+    components.length > 1
+      ? [components[0]!.replace(/^@/, ""), components[1]!]
+      : [components[0]!];
+  return names.some((name) =>
+    (PROVIDER_SDK_NAMES as readonly string[]).includes(name),
+  );
+}
+
 describe("plugin boundary: core does not import the plugin implementation", () => {
   const allCoreFiles = listFiles(CORE_DIR);
   const coreFiles = allCoreFiles.filter((f) => f !== CORE_GUARD_FILE);
@@ -155,13 +219,98 @@ describe("plugin boundary: core does not import the plugin implementation", () =
     ).toEqual([]);
   });
 
+  it("the SDK matcher detects every scoped and bare provider package", () => {
+    // THE regression test for defect 3. The previous inline regex missed the
+    // three scoped names below while catching the three bare ones, which is
+    // the worst possible failure mode for a guard: it looks like it works.
+    // These are asserted individually so a partial fix names the miss.
+    for (const spec of [
+      "@octokit/rest",
+      "@octokit/core",
+      "@gitlab-org/api",
+      "octokit",
+      "github",
+      "glab",
+    ]) {
+      expect(isProviderSdkSpecifier(spec), `${spec} must be detected`).toBe(
+        true,
+      );
+    }
+  });
+
+  it("the SDK matcher does not fire on unrelated specifiers", () => {
+    // The negative control for the guard above: a matcher that matched
+    // everything would be as useless as one that matched nothing.
+    for (const spec of [
+      "@/core/events/canonical-event",
+      "./github-plugin",
+      "../native-item",
+      "node:fs",
+      "node:path",
+      "vitest",
+      "zod",
+      "drizzle-orm",
+      "githubish-lookalike",
+    ]) {
+      expect(isProviderSdkSpecifier(spec), `${spec} must NOT be detected`).toBe(
+        false,
+      );
+    }
+  });
+
+  it("the SCAN catches a scoped SDK import planted in a plugin file", () => {
+    // The negative control for the matcher, at the level that actually
+    // matters: the matcher being unit-correct is not the same as the SCAN
+    // firing. A previous run of this mutation proved the difference -- reverting
+    // only the call site to the old greedy regex left every test green,
+    // because the scan still called the (correct) exported matcher. So the
+    // guard's claim is asserted end to end here: a real scoped import planted
+    // in a real plugin file must be reported by the same scan the guard runs.
+    //
+    // The planted specifier is ASSEMBLED AT RUNTIME, not written as a literal.
+    // This file is itself under `src/plugins/**` and is therefore scanned by
+    // the guard below, which resolves import specifiers from the source TEXT
+    // with a `from "..."`-shaped regex. A commented-out example written in
+    // that exact shape would be picked up as a real import and the guard
+    // would report its own test file -- the same self-reference the core
+    // guard handles by excluding `CORE_GUARD_FILE` by exact path. Building the
+    // string keeps this file clean for the scan instead of adding a second
+    // exclusion, which would widen what the guard ignores.
+    const sdkName = "octokit";
+    const specifier = `@${sdkName}/rest`;
+    const offender = path.join(PLUGIN_DIR, "__sdk_canary__.ts");
+    writeFileSync(
+      offender,
+      [
+        `import { client } from "${specifier}";`,
+        "export const probe = client;",
+        "",
+      ].join("\n"),
+    );
+    try {
+      const offenders: string[] = [];
+      for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
+        for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+          if (isProviderSdkSpecifier(spec)) {
+            offenders.push(`${path.relative(SRC_DIR, file)} -> ${spec}`);
+          }
+        }
+      }
+      expect(offenders).toEqual([
+        `${path.join("plugins", "github", "__sdk_canary__.ts")} -> ${specifier}`,
+      ]);
+    } finally {
+      unlinkSync(offender);
+    }
+  });
+
   it("has no provider SDK import anywhere under src/plugins/**", () => {
     const offenders: string[] = [];
     for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
       for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
         // The plugin uses the platform `fetch`, not a vendor SDK, so a bare
         // import of one would be a real (and undeclared) dependency.
-        if (/^(node:)?(@?[\w-]+\/)?(octokit|github|gitlab|glab)/.test(spec)) {
+        if (isProviderSdkSpecifier(spec)) {
           offenders.push(`${path.relative(SRC_DIR, file)} -> ${spec}`);
         }
       }

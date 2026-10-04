@@ -50,14 +50,28 @@ export interface HttpTransport {
   request(request: TransportRequest): Promise<TransportResponse>;
 }
 
-/** Lowercase every header name so `response.headers["link"]` is reliable. */
-export function normaliseHeaders(
-  headers: Iterable<readonly [string, string]>,
-): Record<string, string> {
+/**
+ * Lowercase every header name so `response.headers["link"]` is reliable.
+ *
+ * The parameter is {@link FetchLike}'s header shape -- an object exposing
+ * `forEach` -- and NOT the `Iterable<[string, string]>` this used to declare.
+ * The old signature accepted a type no caller in the repo passes and no
+ * production call site ever invoked: `createFetchTransport` inlines the same
+ * three lines below because it had a real `Headers`-shaped value and no way to
+ * hand it to an `Iterable` signature without casting away the very safety the
+ * boundary is built on. A helper with no caller and an unsatisfiable signature
+ * is dead code that reads as though it were load-bearing.
+ *
+ * This signature matches the actual dependency, is called from the one place
+ * that has the value, and so is both type-correct and covered.
+ */
+export function normaliseHeaders(headers: {
+  forEach(cb: (value: string, key: string) => void): void;
+}): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [name, value] of headers) {
-    out[name.toLowerCase()] = value;
-  }
+  headers.forEach((value, key) => {
+    out[key.toLowerCase()] = value;
+  });
   return out;
 }
 
@@ -77,6 +91,19 @@ export type FetchLike = (
 /** The API root. GitHub Enterprise would override this at the composition root. */
 export const DEFAULT_API_ROOT = "https://api.github.com";
 
+/**
+ * Strip trailing slashes from an API root.
+ *
+ * `TransportRequest.path` always begins with `/` and the URL is built by plain
+ * concatenation, so a root given as `https://ghe.example.com/api/v3/` produced
+ * `...api/v3//repos/...`. Whether a provider tolerates a doubled slash is the
+ * provider's business and not something to depend on; the fix belongs here,
+ * where the two halves are joined.
+ */
+function trimTrailingSlash(apiRoot: string): string {
+  return apiRoot.replace(/\/+$/, "");
+}
+
 export interface FetchTransportOptions {
   readonly apiRoot?: string;
   readonly fetchImpl?: FetchLike;
@@ -93,7 +120,7 @@ export interface FetchTransportOptions {
 export function createFetchTransport(
   options: FetchTransportOptions = {},
 ): HttpTransport {
-  const apiRoot = options.apiRoot ?? DEFAULT_API_ROOT;
+  const apiRoot = trimTrailingSlash(options.apiRoot ?? DEFAULT_API_ROOT);
   const userAgent = options.userAgent ?? "DevLoop";
   const fetchImpl: FetchLike | undefined =
     options.fetchImpl ??
@@ -120,13 +147,9 @@ export function createFetchTransport(
           authorization: `Bearer ${request.token}`,
         },
       });
-      const collected: Record<string, string> = {};
-      response.headers.forEach((value, key) => {
-        collected[key.toLowerCase()] = value;
-      });
       return {
         status: response.status,
-        headers: collected,
+        headers: normaliseHeaders(response.headers),
         body: await response.text(),
       };
     },

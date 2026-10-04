@@ -28,9 +28,37 @@ export interface FixtureResponse {
 }
 
 /**
+ * The response served for a page the test never configured.
+ *
+ * `418` is used precisely because it is NOT a success and NOT one of the
+ * statuses `reasonForStatus` maps to a domain-specific reason -- so it lands on
+ * `unexpectedStatus` and cannot be mistaken for a real source outcome. The
+ * body is valid JSON so the failure is unambiguously the status rather than a
+ * parse error.
+ */
+const UNCONFIGURED_PAGE: FixtureResponse = {
+  status: 418,
+  body: "[]",
+};
+
+/**
  * A fake transport that serves canned responses and records every request it
  * received, so a test can assert on the parsed result AND on the request the
  * plugin actually built.
+ *
+ * An UNCONFIGURED page used to return `{body: "[]", status: 200}`, which is
+ * indistinguishable from "the source has no more data". That matters because
+ * an empty page is precisely how the plugin learns to STOP: `fetchItems`
+ * returns no cursor when the page is empty, so a typo in a `byPage` key or a
+ * missing page 2 silently turned into "pagination finished" and the test
+ * asserted a truncated result as though it were complete. Truncation that
+ * reads as success is the failure mode worth spending a line on here.
+ *
+ * An unconfigured page is now a loud, distinguishable sentinel status, so the
+ * plugin raises `http_status` on it and the test names the missing fixture.
+ * Tests that genuinely want an empty final page still say so by configuring
+ * `byPage: { "2": { body: "[]" } }` explicitly, which is what was meant all
+ * along.
  */
 export class FakeHttpTransport implements HttpTransport {
   /** Every request received, in order. */
@@ -50,8 +78,7 @@ export class FakeHttpTransport implements HttpTransport {
   async request(request: TransportRequest): Promise<TransportResponse> {
     this.requests.push(request);
     const page = request.query["page"] ?? "1";
-    const canned = this.byPage[page] ??
-      this.fallback ?? { body: "[]", status: 200 };
+    const canned = this.byPage[page] ?? this.fallback ?? UNCONFIGURED_PAGE;
     return {
       status: canned.status ?? 200,
       headers: canned.headers ?? {},

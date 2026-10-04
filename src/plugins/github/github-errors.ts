@@ -26,6 +26,8 @@ export const GITHUB_PLUGIN_ERROR_CODES = [
   "invalid_cursor",
   /** The source answered with no usable credential. */
   "credential_failed",
+  /** The requested page size cannot produce a usable page. */
+  "invalid_page_size",
 ] as const;
 
 export type GitHubPluginErrorCode = (typeof GITHUB_PLUGIN_ERROR_CODES)[number];
@@ -49,6 +51,9 @@ export const GITHUB_PLUGIN_ERROR_REASONS = {
   itemShapeInvalid: "a response item did not match the expected shape",
   cursorNotIssued: "the pagination cursor was not issued by this plugin",
   credentialUnavailable: "the credential provider did not yield a usable token",
+  pageSizeUnusable: "the requested page size is not a positive whole number",
+  pageSizeTooLarge: "the requested page size exceeds the source maximum",
+  unknownReason: "an unspecified failure reason was supplied",
 } as const;
 
 export type GitHubPluginErrorReason =
@@ -64,12 +69,24 @@ const SAFE_REASON_SET: ReadonlySet<string> = new Set(
  * This is the choke point that makes the no-secret claim true of `reason`
  * rather than aspirational: a caller that passes a token where a reason
  * belongs gets the generic unknown reason back, never its own text.
+ *
+ * The fallback was `bodyNotJson`, which is a real defect and not a matter of
+ * taste. `bodyNotJson` says "the response body was not valid JSON", so a
+ * rejection reason that fell through here would REPORT A MALFORMED RESPONSE
+ * for a failure that had no response at all -- an operator reading the log
+ * would go looking for a bad payload from the source when the actual cause
+ * was on our side of the seam. It also contradicted this function's own
+ * documentation, which promises the "generic unknown reason" and there was no
+ * such reason in the set. Hence `unknownReason`.
+ *
+ * The value is fixed and secret-free either way, so this change narrows a
+ * misleading diagnostic; it does not weaken the redaction.
  */
 export function toSafePluginReason(value: unknown): GitHubPluginErrorReason {
   if (typeof value === "string" && SAFE_REASON_SET.has(value)) {
     return value as GitHubPluginErrorReason;
   }
-  return GITHUB_PLUGIN_ERROR_REASONS.bodyNotJson;
+  return GITHUB_PLUGIN_ERROR_REASONS.unknownReason;
 }
 
 export interface GitHubPluginErrorDetails {

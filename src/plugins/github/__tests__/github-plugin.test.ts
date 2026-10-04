@@ -622,7 +622,7 @@ describe("choke points: arbitrary input cannot become a canonical value", () => 
     expect(toMetadata({ array: [1, 2] })).toEqual({ array: [1, 2] });
     // An array at the top level is not a valid bag; the guard exists for that.
     expect(toSafePluginReason.call(null, "x")).toBe(
-      GITHUB_PLUGIN_ERROR_REASONS.bodyNotJson,
+      GITHUB_PLUGIN_ERROR_REASONS.unknownReason,
     );
   });
 
@@ -633,17 +633,25 @@ describe("choke points: arbitrary input cannot become a canonical value", () => 
   });
 
   it("toSafePluginReason collapses a token-shaped string to the generic reason", () => {
-    const secret = "github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz";
+    const secret = "«redacted:github_pat_…»";
+    // `unknownReason`, NOT `bodyNotJson`. The fallback used to be the
+    // JSON-parse failure reason, which meant a rejection with no response at
+    // all was reported to an operator as a malformed response from the
+    // source -- a diagnostic that sends you to the wrong side of the seam.
     expect(toSafePluginReason(secret)).toBe(
-      GITHUB_PLUGIN_ERROR_REASONS.bodyNotJson,
+      GITHUB_PLUGIN_ERROR_REASONS.unknownReason,
     );
     expect(toSafePluginReason(secret)).not.toContain("github_pat");
     // Any non-allowlisted text at all collapses, not just token-shaped text.
     for (const value of ["anything at all", 42, null, undefined, {}, []]) {
       expect(toSafePluginReason(value)).toBe(
-        GITHUB_PLUGIN_ERROR_REASONS.bodyNotJson,
+        GITHUB_PLUGIN_ERROR_REASONS.unknownReason,
       );
     }
+    // The fallback must not masquerade as any domain-specific reason.
+    expect(toSafePluginReason(secret)).not.toBe(
+      GITHUB_PLUGIN_ERROR_REASONS.bodyNotJson,
+    );
   });
 
   it("keeps a secret out of a GitHubPluginError built with a secret reason", () => {
@@ -656,7 +664,7 @@ describe("choke points: arbitrary input cannot become a canonical value", () => 
 
     expect(error.message).not.toContain(secret);
     expect(error.message).not.toContain("github_pat");
-    expect(error.reason).toBe(GITHUB_PLUGIN_ERROR_REASONS.bodyNotJson);
+    expect(error.reason).toBe(GITHUB_PLUGIN_ERROR_REASONS.unknownReason);
   });
 
   it("structurally cannot carry a secret, even if a throw site offers one", () => {
@@ -700,9 +708,228 @@ describe("choke points: arbitrary input cannot become a canonical value", () => 
       "credential_failed",
       "http_status",
       "invalid_cursor",
+      "invalid_page_size",
       "malformed_response",
       "transport_failed",
     ]);
+  });
+});
+
+/**
+ * Regressions for the two P1 defects QA found on PR #9 head `8b13db6`.
+ *
+ * Both live in the same place -- the gap between "the awaited thing failed" and
+ * "the thing we awaited failed too" -- so they are asserted together.
+ *
+ * DEFECT 1 (`github-plugin.ts:203` and `:193`). The redaction handler was
+ * attached with `.catch(...)` AFTER `request()` / `getToken()` had already been
+ * invoked. That catches a REJECTION and nothing else: a callee that throws
+ * SYNCHRONOUSLY has already thrown by the time `.catch` is reached, so the
+ * redaction never runs and the original error -- token and all -- propagates
+ * untouched. The redaction has to wrap the CALL, not its result.
+ *
+ * DEFECT 2 (`native-item.ts:56`). The guard checked only that four required
+ * fields were non-nullish and let every optional field through unvalidated,
+ * including `labels`, which the mapper calls `.map()` on. An item with
+ * `labels: {}` was accepted by `fetchItems` and then crashed with a raw
+ * `TypeError` inside the mapper, bypassing the typed-error design entirely.
+ */
+describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects", () => {
+  /** The synthetic secret shape a provider error would realistically carry. */
+  const SYNTHETIC_SECRET = "github_pat_boom-not-a-real-token-9";
+  /** The fixed, secret-free reason the escaped error must carry instead. */
+  const TRANSPORT_FIXED_TEXT = "the HTTP transport rejected the request";
+
+  /**
+   * A transport whose `request` THROWS SYNCHRONOUSLY.
+   *
+   * Not `async` and not `Promise.reject`: an `async` method wraps a thrown
+   * error into a rejection, which is precisely the case `.catch` already
+   * handled and the case that cannot reproduce this bug.
+   */
+  function syncThrowingTransport(error: Error): HttpTransport {
+    return {
+      request(): Promise<TransportResponse> {
+        throw error;
+      },
+    };
+  }
+
+  /** A credential provider whose `getToken` THROWS SYNCHRONOUSLY. */
+  function syncThrowingCredentials(error: Error) {
+    return {
+      source: "fake" as const,
+      getToken(): Promise<string> {
+        throw error;
+      },
+    };
+  }
+
+  it("redacts a SYNCHRONOUSLY throwing transport (defect 1, request site)", async () => {
+    const plugin = new GitHubSourcePlugin({
+      transport: syncThrowingTransport(
+        new Error(`boom with token ${SYNTHETIC_SECRET}`),
+      ),
+      credentials: createFakeCredentialProvider(),
+      repository: FIXTURE_REPOSITORY,
+    });
+
+    const thrown = await plugin.fetchItems().catch((error: unknown) => error);
+
+    // Not merely "an error was raised" -- the ORIGINAL error must not be the
+    // one that escapes. If `.catch` was attached too late, `thrown` is the
+    // raw `Error` carrying the token, and every assertion below fails.
+    expect(thrown).toBeInstanceOf(GitHubPluginError);
+    expect((thrown as GitHubPluginError).code).toBe("transport_failed");
+    expect((thrown as GitHubPluginError).message).toContain("transport");
+
+    const rendered = `${(thrown as Error).message} ${String(
+      (thrown as { cause?: unknown }).cause,
+    )} ${JSON.stringify({ ...(thrown as object) })}`;
+    expect(rendered).not.toContain(SYNTHETIC_SECRET);
+    expect(rendered).not.toContain("github_pat_");
+    expect(rendered).toContain(TRANSPORT_FIXED_TEXT);
+  });
+
+  it("redacts a SYNCHRONOUSLY throwing credential provider (defect 1, getToken site)", async () => {
+    const plugin = new GitHubSourcePlugin({
+      transport: new FakeHttpTransport({ byPage: {} }),
+      credentials: syncThrowingCredentials(
+        new Error(`no token available ${SYNTHETIC_SECRET}`),
+      ),
+      repository: FIXTURE_REPOSITORY,
+    });
+
+    const thrown = await plugin.fetchItems().catch((error: unknown) => error);
+
+    expect(thrown).toBeInstanceOf(GitHubPluginError);
+    expect((thrown as GitHubPluginError).code).toBe("credential_failed");
+    const rendered = `${(thrown as Error).message} ${String(
+      (thrown as { cause?: unknown }).cause,
+    )} ${JSON.stringify({ ...(thrown as object) })}`;
+    expect(rendered).not.toContain(SYNTHETIC_SECRET);
+    expect(rendered).not.toContain("github_pat_");
+  });
+
+  it.each([
+    ["an object", {}],
+    ["a string", "bug"],
+    ["a number", 7],
+    ["an array of non-labels", [1, 2, 3]],
+    ["an array of label-shaped objects with a non-string name", [{ name: 1 }]],
+  ])(
+    "rejects an item whose labels is %s into the typed-error path (defect 2)",
+    async (_shape, labels) => {
+      const { plugin } = pluginWith({
+        "1": { body: pageBody([fixtureIssue({ labels })]) },
+      });
+
+      // Must be REJECTED BY VALIDATION -- code `malformed_response`, reason
+      // `itemShapeInvalid` -- not accepted and then crash with a raw
+      // `TypeError` when the mapper calls `.map()` on the field.
+      const thrown = await plugin.fetchItems().catch((error: unknown) => error);
+
+      expect(thrown).toBeInstanceOf(GitHubPluginError);
+      expect((thrown as GitHubPluginError).code).toBe("malformed_response");
+      expect((thrown as GitHubPluginError).reason).toBe(
+        GITHUB_PLUGIN_ERROR_REASONS.itemShapeInvalid,
+      );
+      expect((thrown as Error).name).not.toBe("TypeError");
+    },
+  );
+
+  it("accepts an ABSENT or null labels, which the mapper already tolerates", async () => {
+    // The deliberate counterweight to the cases above. `labels` is declared
+    // optional, the mapper reads it through `?? []`, and a real source omits
+    // the field or sends `null` routinely. Rejecting those would fail pages
+    // that are perfectly valid, which is the over-correction the original
+    // guard's comment was warning about -- so the rule is "wrong TYPE is
+    // rejected", not "any falsy value is rejected".
+    for (const labels of [undefined, null, []]) {
+      const { plugin } = pluginWith({
+        "1": { body: pageBody([fixtureIssue({ labels })]) },
+      });
+      const page = await plugin.fetchItems();
+      expect(page.items).toHaveLength(1);
+    }
+  });
+
+  it.each([0, -1, -30, Number.NaN, Number.POSITIVE_INFINITY, 1.5])(
+    "refuses a pageSize of %p at construction, rather than paginating forever",
+    (pageSize) => {
+      // With a page size of 0 the `count < pageSize` short-page test in
+      // `nextCursorFor` is never true, so every page looks full and pagination
+      // continues against a source with no more data. `NaN` behaves the same
+      // way. Failing loudly at construction is the only place this is
+      // catchable.
+      expect(
+        () =>
+          new GitHubSourcePlugin({
+            transport: new FakeHttpTransport({ byPage: {} }),
+            credentials: createFakeCredentialProvider(),
+            repository: FIXTURE_REPOSITORY,
+            pageSize,
+          }),
+      ).toThrow(GitHubPluginError);
+
+      try {
+        new GitHubSourcePlugin({
+          transport: new FakeHttpTransport({ byPage: {} }),
+          credentials: createFakeCredentialProvider(),
+          repository: FIXTURE_REPOSITORY,
+          pageSize,
+        });
+      } catch (error: unknown) {
+        expect((error as GitHubPluginError).code).toBe("invalid_page_size");
+      }
+    },
+  );
+
+  it("accepts a sane pageSize, including the default", () => {
+    for (const pageSize of [1, 30, 100, undefined]) {
+      expect(
+        () =>
+          new GitHubSourcePlugin({
+            transport: new FakeHttpTransport({ byPage: {} }),
+            credentials: createFakeCredentialProvider(),
+            repository: FIXTURE_REPOSITORY,
+            pageSize,
+          }),
+      ).not.toThrow();
+    }
+  });
+
+  it("never calls .map() on a non-array labels, even bypassing the guard", async () => {
+    // A second, independent line of defence on the CONSUMER side: even an item
+    // that got past `isNativeIssueItem` must not reach a raw TypeError. This
+    // is asserted directly against the mapper, which is where the crash
+    // happened.
+    const plugin = new GitHubSourcePlugin({
+      transport: new FakeHttpTransport({ byPage: {} }),
+      credentials: createFakeCredentialProvider(),
+      repository: FIXTURE_REPOSITORY,
+    });
+
+    const hostile = [
+      { ...fixtureIssue(), labels: {} },
+      { ...fixtureIssue(), labels: "bug" },
+    ] as unknown as NativeIssueItem[];
+
+    // The mapper's own handling of a malformed `labels` must be a typed
+    // error or a dropped field -- never an unhandled `TypeError`.
+    const thrown = (() => {
+      try {
+        plugin.mapToCanonicalEvents(hostile);
+        return undefined;
+      } catch (error: unknown) {
+        return error;
+      }
+    })();
+
+    if (thrown !== undefined) {
+      expect(thrown).toBeInstanceOf(GitHubPluginError);
+      expect((thrown as Error).name).not.toBe("TypeError");
+    }
   });
 });
 

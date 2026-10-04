@@ -40,8 +40,11 @@ import {
   GITHUB_PLUGIN_ERROR_REASONS,
   GitHubPluginError,
   reasonForStatus,
+  type GitHubPluginErrorCode,
+  type GitHubPluginErrorReason,
 } from "./github-errors";
 import { isNativeIssueItem, type NativeIssueItem } from "./native-item";
+import type { NativeLabel } from "./native-item";
 import type { HttpTransport } from "./transport";
 
 /**
@@ -158,6 +161,91 @@ function nonEmpty(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
+/**
+ * Read a `labels` array defensively at the point of use.
+ *
+ * `isNativeIssueItem` already rejects a non-array `labels`, so on the
+ * validated path this returns its input. The narrowing is kept anyway because
+ * the mapper is a public method: `mapToCanonicalEvents` takes a
+ * `readonly NativeIssueItem[]` from a caller and the type is erased at
+ * runtime, so an unvalidated item CAN arrive here. Calling `.map()` on
+ * whatever that is would raise a raw `TypeError` quoting the offending value
+ * -- an uncontrolled error path, and the exact leak class
+ * `github-errors.ts` exists to prevent.
+ *
+ * An unusable value degrades to an empty list rather than throwing: dropping
+ * one optional metadata field is strictly better than an uncontrolled failure,
+ * and the canonical event's shape does not depend on the field.
+ */
+function labelsOf(item: NativeIssueItem): readonly unknown[] {
+  const labels: unknown = item.labels;
+  return Array.isArray(labels) ? labels : [];
+}
+
+/**
+ * Reject a `pageSize` that cannot produce a usable page.
+ *
+ * A non-positive, fractional or `NaN` page size was previously accepted
+ * verbatim and then used two ways that both break. It is interpolated into
+ * `per_page`, so the source is asked for `0`, `-1` or `NaN` items and decides
+ * what to do with a nonsense query. And it is the threshold in
+ * `nextCursorFor`, where `count < this.pageSize` decides whether the page was
+ * short; with a page size of `0` that comparison is never true, so EVERY page
+ * looks full and pagination continues forever against a source that has no
+ * more data. Silent truncation is the failure mode here, not a loud one.
+ *
+ * The bound is a cap rather than a fixed page size because that is what the
+ * source will accept; anything above it is a caller bug worth naming.
+ */
+const MAX_PAGE_SIZE = 100;
+
+function assertUsablePageSize(pageSize: number): number {
+  if (!Number.isInteger(pageSize) || pageSize < 1) {
+    throw new GitHubPluginError("invalid_page_size", {
+      reason: GITHUB_PLUGIN_ERROR_REASONS.pageSizeUnusable,
+    });
+  }
+  if (pageSize > MAX_PAGE_SIZE) {
+    throw new GitHubPluginError("invalid_page_size", {
+      reason: GITHUB_PLUGIN_ERROR_REASONS.pageSizeTooLarge,
+    });
+  }
+  return pageSize;
+}
+
+/**
+ * Run an injected, untrusted call and replace ANY failure with a typed,
+ * secret-free {@link GitHubPluginError}.
+ *
+ * THE POINT IS WHERE THE CALL HAPPENS. `call()` is invoked inside this
+ * function's `async` body, so a synchronous `throw` from the callee is
+ * converted into a rejection of this function's own promise before `catch`
+ * ever sees it. Both failure modes -- synchronous throw and asynchronous
+ * rejection -- therefore take the identical path, and neither can carry
+ * caller-supplied text out.
+ *
+ * This is deliberately NOT the shape `call().catch(redact)`. A `.catch`
+ * handler is attached to a promise that already exists: if `call()` throws
+ * before returning that promise, nothing is left for `.catch` to attach to
+ * and the original error -- credential and all -- propagates untouched. That
+ * was a live defect here, not a theoretical one; see the call sites in
+ * `fetchItems`.
+ *
+ * The original error is dropped rather than wrapped, and is never attached as
+ * a `cause`: see the invariant at `github-errors.ts:5-10`.
+ */
+async function redactingly<T>(
+  code: GitHubPluginErrorCode,
+  reason: GitHubPluginErrorReason,
+  call: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await call();
+  } catch {
+    throw new GitHubPluginError(code, { reason });
+  }
+}
+
 export class GitHubSourcePlugin implements SourcePlugin<NativeIssueItem> {
   private readonly transport: HttpTransport;
   private readonly credentials: CredentialProvider;
@@ -174,7 +262,7 @@ export class GitHubSourcePlugin implements SourcePlugin<NativeIssueItem> {
     this.transport = options.transport;
     this.credentials = options.credentials;
     this.repository = options.repository;
-    this.pageSize = options.pageSize ?? PAGE_SIZE;
+    this.pageSize = assertUsablePageSize(options.pageSize ?? PAGE_SIZE);
   }
 
   describe(): PluginDescriptor {
@@ -190,35 +278,48 @@ export class GitHubSourcePlugin implements SourcePlugin<NativeIssueItem> {
   async fetchItems(cursor?: string): Promise<FetchedPage<NativeIssueItem>> {
     const page = this.resolveCursor(cursor);
 
-    const token = await this.credentials.getToken().catch(() => {
-      // Same reasoning as the transport rejection below: the credential path
-      // is not trusted to hand back a secret-free message, so it is replaced
-      // rather than re-thrown. `CredentialError` already is secret-free, but
-      // this does not depend on that being true of every implementation.
-      throw new GitHubPluginError("credential_failed", {
-        reason: GITHUB_PLUGIN_ERROR_REASONS.credentialUnavailable,
-      });
-    });
+    // WHY `redactingly`, AND WHY IT WRAPS THE CALL.
+    //
+    // The obvious spelling is `this.transport.request({...}).catch(redact)`,
+    // and it is WRONG. `.catch` attaches a handler to an already-created
+    // promise, so it runs for a REJECTION and for nothing else. A callee that
+    // throws SYNCHRONOUSLY has already thrown by the time `.catch` is reached:
+    // the exception unwinds past the whole expression and the redaction never
+    // runs. That is a real shape for an injected seam -- a misconfigured
+    // `fetchImpl`, a proxy-wrapped transport, a pre-flight validation in the
+    // provider -- and it defeated the invariant `github-errors.ts` exists to
+    // enforce, letting an error like `boom with token github_pat_...` escape
+    // verbatim.
+    //
+    // Invoking the callee INSIDE an `async` function fixes it structurally
+    // rather than by enumeration: an async function converts a synchronous
+    // throw into a rejection of its own returned promise BEFORE any handler is
+    // attached, so both failure modes take the identical path. There is no
+    // ordering to get wrong and no second code path to keep in sync.
+    //
+    // The original error is still dropped, never wrapped or attached as a
+    // `cause`: see `github-errors.ts:5-10`.
+    const token = await redactingly(
+      "credential_failed",
+      GITHUB_PLUGIN_ERROR_REASONS.credentialUnavailable,
+      () => this.credentials.getToken(),
+    );
 
-    const response = await this.transport
-      .request({
-        path: `/repos/${this.repository}/issues`,
-        query: {
-          per_page: String(this.pageSize),
-          page: String(page),
-          state: "all",
-          direction: "desc",
-        },
-        token,
-      })
-      .catch(() => {
-        // The rejection is dropped, not wrapped: a transport that fails with
-        // a token-shaped message must not be able to carry it into this
-        // error, through `cause` or otherwise.
-        throw new GitHubPluginError("transport_failed", {
-          reason: GITHUB_PLUGIN_ERROR_REASONS.transportRejected,
-        });
-      });
+    const response = await redactingly(
+      "transport_failed",
+      GITHUB_PLUGIN_ERROR_REASONS.transportRejected,
+      () =>
+        this.transport.request({
+          path: `/repos/${this.repository}/issues`,
+          query: {
+            per_page: String(this.pageSize),
+            page: String(page),
+            state: "all",
+            direction: "desc",
+          },
+          token,
+        }),
+    );
 
     if (response.status < 200 || response.status >= 300) {
       throw new GitHubPluginError("http_status", {
@@ -257,11 +358,16 @@ export class GitHubSourcePlugin implements SourcePlugin<NativeIssueItem> {
           closed_at: item.closed_at ?? null,
           comment_count: item.comments ?? null,
           author_login: item.user?.login ?? null,
-          labels: (item.labels ?? []).map((label) => ({
-            name: label.name,
-            color: label.color ?? null,
-            description: label.description ?? null,
-          })),
+          labels: labelsOf(item).map((label) => {
+            const record = (
+              typeof label === "object" && label !== null ? label : {}
+            ) as Partial<NativeLabel>;
+            return {
+              name: typeof record.name === "string" ? record.name : "",
+              color: nonEmpty(record.color) ?? null,
+              description: nonEmpty(record.description) ?? null,
+            };
+          }),
           is_proposal: item.pull_request !== undefined,
           proposal_draft: item.pull_request?.draft ?? null,
           proposal_html_url: item.pull_request?.html_url ?? null,
