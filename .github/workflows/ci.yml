@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A new push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Vitest/Next must behave as they do on a headless runner, and no TTY may be
+      # required. No repository secrets are used by this workflow, so it passes on
+      # a fork PR.
+      CI: true
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      # `--frozen-lockfile` rejects a STALE lockfile, but in bun 1.3.x it exits 0
+      # when bun.lock is absent entirely and silently resolves from the registry.
+      # Guard the missing case here so a deleted lockfile is a red, legible build
+      # instead of a green one that installed whatever the network served that day.
+      - name: Verify lockfile is committed
+        run: |
+          if [ ! -f bun.lock ]; then
+            echo "::error::bun.lock is missing from the repository. Run 'bun install' and commit the lockfile."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Build
+        run: bun run build
