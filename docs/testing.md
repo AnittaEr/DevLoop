@@ -58,9 +58,22 @@ yet.
 
 ## CI status
 
-**CI does NOT run `e2e` yet.** `.github/workflows/` is owned by a separate
-ticket; the e2e job is not wired into CI. Until it is, a green CI run says
-nothing about the e2e specs — run `bun run e2e` locally.
+CI has **two jobs**, both defined in `.github/workflows/ci.yml`:
 
-Vitest and Playwright do not overlap: Vitest's include is
-`src/**/*.test.{ts,tsx}`, and the Playwright specs live in `e2e/*.spec.ts`.
+- `verify` — `bun install --frozen-lockfile`, `bun run format:check`,
+  `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`.
+- `e2e` — installs Chromium, then runs `bun run build` and `bun run e2e`.
+
+They run concurrently on their own runners and report independent status and
+timing. A green CI run therefore **does** cover the e2e specs: the `e2e` check
+must be green for the PR to be mergeable. `bun run e2e` remains the local
+equivalent of the `e2e` job; it just also needs a Chromium build of the app,
+which `playwright.config.ts` handles via its `webServer` entry.
+
+Vitest's include is `["src/**/*.test.{ts,tsx}", "e2e/**/*.test.{ts,tsx}"]`
+(source of truth: `vitest.config.ts`). The `e2e/**` half is deliberate — the
+shared harness helpers under `e2e/support/` must be resolvable by Vitest so
+they can carry Vitest negative controls. The two runners still never pick up
+each other's files: Playwright's `testMatch` is `*.spec.ts`, so a `.test.ts`
+under `e2e/` is invisible to `playwright test`, and a `.spec.ts` under `e2e/`
+is invisible to Vitest.

@@ -83,11 +83,15 @@ jobs:
     # and build.
     timeout-minutes: 25
     env:
-      # Job-level CI:true is load-bearing, not decoration:
-      # playwright.config.ts reads it to select retries=2, forbidOnly, the line
-      # reporter and reuseExistingServer:false. Without it this job would run
-      # the suite in a materially different mode from local runs and from the
-      # mode B16 proved on a real runner.
+      # GitHub Actions already exports `CI=true` into every step, so this
+      # declaration is explicit documentation and robustness, not a behavioural
+      # requirement: removing it would not change what Playwright sees here.
+      # It is worth stating anyway, because playwright.config.ts does read
+      # `process.env.CI` — lines 12-14 and 32 — to select retries=2, forbidOnly,
+      # the line reporter and reuseExistingServer:false. Declaring the value we
+      # depend on at the job level means the intent survives a runner-default
+      # change or a future job that opts out, and it keeps the e2e mode pinned
+      # to the one B16 proved on a real runner.
       CI: true
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
