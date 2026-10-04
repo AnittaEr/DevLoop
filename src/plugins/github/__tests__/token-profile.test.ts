@@ -28,8 +28,18 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { createEnvCredentialProvider } from "@/core/credentials/env-provider";
+import { CredentialError } from "@/core/credentials/provider";
 
 import { GITHUB_TOKEN_PROFILE } from "../token-profile";
+import { FIXTURE_MATERIAL } from "./fixtures";
+
+/**
+ * An obviously synthetic, correctly-shaped token: this profile's own prefix
+ * followed by the fixture material. Prefixed by the profile rather than spelled
+ * out, so the two tests that drive the real reader cannot go stale behind a
+ * renamed prefix -- and no real credential can exist in this file.
+ */
+const VALID_TOKEN = `${GITHUB_TOKEN_PROFILE.prefix}${FIXTURE_MATERIAL}`;
 
 /**
  * Repository root, derived from this file's own location rather than named.
@@ -65,21 +75,68 @@ describe("the production token profile", () => {
     expect(GITHUB_TOKEN_PROFILE.envVar).toBe(documentedTokenEnvVar());
   });
 
-  it("is the variable an unconfigured reader actually reads", () => {
-    // Not a restatement of the line above: it drives the real provider, so a
-    // profile whose `envVar` is ignored somewhere downstream fails here even
-    // though the two constants match.
-    const seen: (string | undefined)[] = [];
-    const provider = createEnvCredentialProvider({
-      profile: GITHUB_TOKEN_PROFILE,
-      readEnv: () => {
-        const value = process.env[GITHUB_TOKEN_PROFILE.envVar];
-        seen.push(value);
-        return value;
-      },
-    });
-    expect(provider).toBeDefined();
-    expect(seen).toEqual([]);
+  it("is the variable an unconfigured reader actually reads", async () => {
+    // Not a restatement of the line above: it drives the REAL default reader
+    // -- `EnvCredentialProvider`'s own `() => process.env[profile.envVar]`
+    // (`src/core/credentials/env-provider.ts`), the exact path an operator hits
+    // with nothing injected -- and it actually calls `getToken()`, so a profile
+    // whose `envVar` is ignored downstream fails here even when the two
+    // constants match.
+    //
+    // Two halves, because a happy-path assertion alone would still pass if the
+    // provider consulted EVERY variable rather than the named one:
+    //   - the documented variable set  -> resolves to that token
+    //   - only a DIFFERENT variable set -> `token_absent`, proving the name is
+    //     what selects the read and not mere presence of some token
+    const OTHER = "DEVLOOP_TEST_VAR_THAT_IS_NOT_THE_TOKEN";
+    const saved = {
+      named: process.env[GITHUB_TOKEN_PROFILE.envVar],
+      other: process.env[OTHER],
+    };
+    try {
+      delete process.env[OTHER];
+      process.env[GITHUB_TOKEN_PROFILE.envVar] = VALID_TOKEN;
+
+      const provider = createEnvCredentialProvider({
+        profile: GITHUB_TOKEN_PROFILE,
+      });
+      await expect(provider.getToken()).resolves.toBe(VALID_TOKEN);
+
+      // The same provider, now with the named variable gone and a decoy token
+      // set. If it resolves, it was reading something other than the profile.
+      delete process.env[GITHUB_TOKEN_PROFILE.envVar];
+      process.env[OTHER] = VALID_TOKEN;
+      const sameProvider = createEnvCredentialProvider({
+        profile: GITHUB_TOKEN_PROFILE,
+      });
+      await expect(sameProvider.getToken()).rejects.toThrow(/not set/);
+    } finally {
+      if (saved.named === undefined)
+        delete process.env[GITHUB_TOKEN_PROFILE.envVar];
+      else process.env[GITHUB_TOKEN_PROFILE.envVar] = saved.named;
+      if (saved.other === undefined) delete process.env[OTHER];
+      else process.env[OTHER] = saved.other;
+    }
+  });
+
+  it("reports an unset variable as absent rather than as a shape defect", async () => {
+    // The third case the previous test's rewrite could have silently dropped: a
+    // variable that is not set at all must classify as `token_absent`, so an
+    // operator who forgot the export is sent to the right place. Pinned here
+    // because the whole reason QA's finding survived to review is that no test
+    // drove this path.
+    const named = GITHUB_TOKEN_PROFILE.envVar;
+    const saved = process.env[named];
+    try {
+      delete process.env[named];
+      const provider = createEnvCredentialProvider({
+        profile: GITHUB_TOKEN_PROFILE,
+      });
+      await expect(provider.getToken()).rejects.toThrow(CredentialError);
+      await expect(provider.getToken()).rejects.toThrow(/not set/);
+    } finally {
+      if (saved !== undefined) process.env[named] = saved;
+    }
   });
 
   it("still validates the token's prefix, so a wrong NAME cannot pass silently", () => {
