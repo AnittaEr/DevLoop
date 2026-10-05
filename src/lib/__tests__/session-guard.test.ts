@@ -148,21 +148,22 @@ describe("requireSession", () => {
     "imports without a Next.js request scope and without a configured secret",
     { timeout: LOAD_BEARING_TEST_TIMEOUT.moduleGraph },
     async () => {
-    // `next build` and `bun run test` both import this module with no `.env` and
-    // no request in flight. If anything ran at module scope this throws, and the
-    // failure would present as an unrelated build or collection error.
-    delete process.env.BETTER_AUTH_SECRET;
-    vi.resetModules();
+      // `next build` and `bun run test` both import this module with no `.env` and
+      // no request in flight. If anything ran at module scope this throws, and the
+      // failure would present as an unrelated build or collection error.
+      delete process.env.BETTER_AUTH_SECRET;
+      vi.resetModules();
 
-    const fresh = await import("@/lib/session-guard");
+      const fresh = await import("@/lib/session-guard");
 
-    expect(typeof fresh.requireSession).toBe("function");
-    expect(Object.keys(fresh.SESSION_GUARD_OUTCOMES).sort()).toEqual([
-      "authNotConfigured",
-      "authenticated",
-      "sessionRequired",
-    ]);
-  });
+      expect(typeof fresh.requireSession).toBe("function");
+      expect(Object.keys(fresh.SESSION_GUARD_OUTCOMES).sort()).toEqual([
+        "authNotConfigured",
+        "authenticated",
+        "sessionRequired",
+      ]);
+    },
+  );
 
   it("never reads, returns or echoes the secret value", async () => {
     process.env.BETTER_AUTH_SECRET = THROWAWAY_SECRET;

@@ -77,17 +77,30 @@ const LOAD_SCALED_MARKERS: readonly {
   readonly pattern: RegExp;
   readonly why: string;
 }[] = [
-  { pattern: /\bspawnSync\s*\(/, why: "spawns a subprocess (a Node/Bun cold start per call)" },
-  { pattern: /\bexecSync\s*\(/, why: "spawns a subprocess (a Node/Bun cold start per call)" },
-  { pattern: /\bexecFileSync\s*\(/, why: "spawns a subprocess (git, the scanner CLI, ...)" },
+  {
+    pattern: /\bspawnSync\s*\(/,
+    why: "spawns a subprocess (a Node/Bun cold start per call)",
+  },
+  {
+    pattern: /\bexecSync\s*\(/,
+    why: "spawns a subprocess (a Node/Bun cold start per call)",
+  },
+  {
+    pattern: /\bexecFileSync\s*\(/,
+    why: "spawns a subprocess (git, the scanner CLI, ...)",
+  },
   { pattern: /\bspawn\s*\(/, why: "spawns a subprocess" },
   { pattern: /\bexecFile\s*\(/, why: "spawns a subprocess" },
   { pattern: /Bun\.spawn\s*\(/, why: "spawns a subprocess" },
-  { pattern: /vi\.resetModules\s*\(\s*\)/, why: "rebuilds a module graph per case, so its cost scales with load" },
+  {
+    pattern: /vi\.resetModules\s*\(\s*\)/,
+    why: "rebuilds a module graph per case, so its cost scales with load",
+  },
 ];
 
 /** How a test names a measured budget. Both spellings are accepted. */
-const BUDGET_REFERENCE = /LOAD_BEARING_TEST_TIMEOUT\s*\.\s*[A-Za-z0-9_]+|\{\s*timeout\s*:/;
+const BUDGET_REFERENCE =
+  /LOAD_BEARING_TEST_TIMEOUT\s*\.\s*[A-Za-z0-9_]+|\{\s*timeout\s*:/;
 
 /**
  * Blank out comments and string/template literal CONTENTS, keeping the
@@ -131,7 +144,10 @@ function stripCommentsAndStrings(source: string): string {
     // with the comment inside the `{` of a describe callback, every `//` comment
     // in the file would be read as an unterminated regex and swallow the code
     // after it -- which is how a comment above an `it(` deleted the test.
-    if (rest[0] === "/" && /[(=,:[!&|?{};+\n]|\breturn\b/.test(lastSignificant)) {
+    if (
+      rest[0] === "/" &&
+      /[(=,:[!&|?{};+\n]|\breturn\b/.test(lastSignificant)
+    ) {
       let cursor = 1;
       let inClass = false;
       while (cursor < rest.length) {
@@ -148,7 +164,8 @@ function stripCommentsAndStrings(source: string): string {
         cursor += 1;
       }
       const literal = rest.slice(0, cursor);
-      out += "/" + blank(literal.slice(1, literal.length - 1)) + literal.slice(-1);
+      out +=
+        "/" + blank(literal.slice(1, literal.length - 1)) + literal.slice(-1);
       index += cursor;
       lastSignificant = "/";
       continue;
@@ -171,7 +188,8 @@ function stripCommentsAndStrings(source: string): string {
       const literal = rest.slice(0, cursor);
       // Keep the quotes so a template spanning lines still ends on its own
       // line; blank everything between them.
-      out += q + blank(literal.slice(1, literal.length - 1)) + literal.slice(-1);
+      out +=
+        q + blank(literal.slice(1, literal.length - 1)) + literal.slice(-1);
       index += cursor;
       lastSignificant = q;
       continue;
@@ -197,7 +215,11 @@ function stripCommentsAndStrings(source: string): string {
  * false flag is a comment in the next commit rather than a flaky red suite in
  * six weeks.
  */
-function ownedLines(lines: readonly string[], start: number, indent: number): string[] {
+function ownedLines(
+  lines: readonly string[],
+  start: number,
+  indent: number,
+): string[] {
   const owned: string[] = [];
   for (let index = start; index < lines.length; index += 1) {
     if (index > start) {
@@ -208,7 +230,8 @@ function ownedLines(lines: readonly string[], start: number, indent: number): st
       }
       const lineIndent = line.length - line.trimStart().length;
       const opens = /^[ \t]*(?:it|test|describe|describe[.]each)\b/.test(line);
-      if (lineIndent <= indent && (opens || !/^[ \t]*(?:it|test)\b/.test(line))) break;
+      if (lineIndent <= indent && (opens || !/^[ \t]*(?:it|test)\b/.test(line)))
+        break;
     }
     owned.push(lines[index] ?? "");
   }
@@ -227,47 +250,190 @@ const OPENING = /^[ \t]*(?:it|test)\s*(?:[.][\w.]+)?\s*\(/gm;
 const NAME = /\(\s*["'`]([^"'`]*)/;
 
 /**
- * Every `it`/`test` whose own body contains a load-scaled marker and which names
- * no budget.
+ * A FILE-level function, and the source of its own body.
  *
- * A marker in a FILE-level helper (`function runScanner()`) is attributed to the
- * tests that reach it through their own call, because the body of each `it` is
- * scanned independently. A helper shared by both a budgeted and an unbudgeted
- * test therefore flags only the unbudgeted one -- which is the honest answer,
- * since only that one inherits the 5s default for the work.
+ * The bodies are needed because load-scaled work in this suite is almost never
+ * written inside an `it`: it lives in a file-level helper (`loadRouteWith()`,
+ * `runScanner()`, `trackedTestFiles()`) that the test CALLS. A guard that only
+ * reads each `it`'s own text is therefore blind to the majority of real cases --
+ * and blind is the direction that ships. This map is what makes a marker in a
+ * helper attributable to the tests that reach it.
  */
-function loadSensitiveTests(): LoadSensitiveTest[] {
-  const offenders: LoadSensitiveTest[] = [];
-  for (const file of SCANNED_ROOTS.flatMap(listTestFiles)) {
-    const raw = readFileSync(file, "utf8");
-    const lines = raw.split("\n");
-    const strippedText = stripCommentsAndStrings(raw);
-    const stripped = strippedText.split("\n");
-    OPENING.lastIndex = 0;
-    const openings = [...strippedText.matchAll(OPENING)];
-    openings.forEach((match, order) => {
-      const start = match.index ?? 0;
-      const startLine = strippedText.slice(0, start).split("\n").length - 1;
-      const header = lines[startLine] ?? "";
-      const indent = header.length - header.trimStart().length;
-      // The budget may sit in the OPTIONS object between the name and the body
-      // (`it("name", { timeout: ... }, () => {...})`), which lives on the header
-      // line or the one after it -- not inside the body.
-      const head = [header, lines[startLine + 1] ?? ""].join("\n");
-      const body = ownedLines(stripped, startLine, indent).join("\n");
-      const marker = LOAD_SCALED_MARKERS.find((candidate) => candidate.pattern.test(body));
-      if (marker && !BUDGET_REFERENCE.test(head) && !BUDGET_REFERENCE.test(body)) {
-        offenders.push({
-          file: path.relative(REPO_ROOT, file),
-          line: startLine + 1,
-          name: NAME.exec(header)?.[1] ?? header.trim(),
-          why: marker.why,
-        });
-      }
-      void order;
-    });
+interface Helper {
+  readonly name: string;
+  readonly body: string;
+}
+
+/**
+ * `function f(...)` and `const f = (...) => ...` declarations, at ANY indentation.
+ *
+ * Any indentation, not just column 0, because a helper declared inside a
+ * `describe` is the same hazard as one at file scope: `db-schema-boundary.test.ts`
+ * declares `coreFindViolations()` inside its `describe`, and it calls
+ * `vi.resetModules()` on every invocation. Column 0 only would miss it.
+ *
+ * The arrow branch requires a real arrow head -- a bare `(` is not enough.
+ * `const body = (await res.json()) as Record<string, unknown>;` also starts
+ * with `(`, and matching it would register a string as a "helper" whose body is
+ * the rest of the file. Only a shape that can actually be CALLED is a helper.
+ *
+ * `DECL_START` matches the first line of a declaration; `DECL_CONTINUES` then
+ * walks forward over a signature that spans lines, so
+ * `const f = (\n  a: X,\n): Y => {` is still recognised as a declaration and not
+ * dropped -- dropping it is the blind direction, which is the one that ships.
+ *
+ * Over-attribution is the accepted cost: a marker in a helper is attributed to
+ * every test that reaches that helper, including tests that share it with a
+ * budgeted sibling. That errs toward flagging, which is the safe direction --
+ * a false flag is a comment in the next commit, a missed site is a flaky red
+ * suite in six weeks.
+ */
+const DECL_START =
+  /^[ \t]*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|^[ \t]*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+?)?=\s*(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>|\((?:[^()]|\([^()]*\))*\)\s*(?::[^=]+?)?=>)/;
+const DECL_CONTINUES = /=>\s*\{?\s*$/;
+
+/**
+ * The declaration starting at `start`: its whole extent, up to the brace that
+ * closes its body.
+ *
+ * Boundaries come from BRACE DEPTH over the stripped source, walking forward
+ * from the declaration's first line. Two shapes in this suite defeat anything
+ * simpler, and both are load-bearing:
+ *
+ *  - A parameter list spanning lines: `loadRouteWith`'s options type ends with
+ *    `}): Promise<...> {`. An indentation rule stops on that `}` and yields a
+ *    two-line body containing no marker, which reports the R193 site as clean --
+ *    the exact defect this change exists to close.
+ *  - A return type spanning lines: `classify`'s returns an object type, so its
+ *    signature's braces are not the body's.
+ *
+ * Depth counting handles both without a signature-joining pass, which is
+ * deliberate: an earlier attempt merged the signature into one line first, and
+ * merging a 12-line `function classify(` signature into its first line glued
+ * the opening braces of its return type to the body's, so the walk never
+ * returned to zero and swallowed the remaining 276 lines of the file.
+ *
+ * Depth counting is safe on stripped source precisely BECAUSE it is stripped:
+ * comment bodies, string bodies and regex bodies have been blanked to spaces,
+ * so every surviving brace is a structural one.
+ */
+function declarationExtent(lines: readonly string[], start: number): string {
+  let depth = 0;
+  let opened = false;
+  const extent: string[] = [];
+  for (let index = start; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    extent.push(line);
+    depth += braceDelta(line);
+    if (depth > 0) opened = true;
+    // An arrow with an expression body has no braces at all; its extent is the
+    // single line it is on, which `extent` already holds.
+    else if (opened || /;\s*$/.test(line)) break;
   }
+  return extent.join("\n");
+}
+
+/** Net `{` minus `}` on a line of stripped source. */
+function braceDelta(line: string): number {
+  let delta = 0;
+  for (const character of line) {
+    if (character === "{") delta += 1;
+    else if (character === "}") delta -= 1;
+  }
+  return delta;
+}
+
+function collectHelpers(stripped: readonly string[]): Map<string, Helper> {
+  const helpers = new Map<string, Helper>();
+  stripped.forEach((line, index) => {
+    DECL_START.lastIndex = 0;
+    const match = DECL_START.exec(line);
+    if (!match) return;
+    const name = match[1] ?? match[2];
+    if (!name || helpers.has(name)) return;
+    helpers.set(name, { name, body: declarationExtent(stripped, index) });
+  });
+  return helpers;
+}
+
+/** Does `text` call `name`? Word-bounded, so `loadRoute` != `loadRouteWith`. */
+function calls(text: string, name: string): boolean {
+  return new RegExp(`\\b${name}\\s*\\(`).test(text);
+}
+
+/**
+ * The load-scaled marker reached from `body`, following calls into file-level
+ * helpers transitively. Returns the marker, or undefined.
+ *
+ * Transitive because the delegation is usually two hops: an `it` calls
+ * `loadRouteWith()`, which calls `importFresh()`. A one-hop scan would miss the
+ * second. The visited set makes a cycle (`a` calls `b`, `b` calls `a`) terminate
+ * instead of recursing until the stack gives out.
+ */
+function markerReachedFrom(
+  body: string,
+  helpers: Map<string, Helper>,
+  seen: Set<string> = new Set(),
+): { pattern: RegExp; why: string } | undefined {
+  const own = LOAD_SCALED_MARKERS.find((candidate) =>
+    candidate.pattern.test(body),
+  );
+  if (own) return own;
+  for (const helper of helpers.values()) {
+    if (seen.has(helper.name) || !calls(body, helper.name)) continue;
+    seen.add(helper.name);
+    const reached = markerReachedFrom(helper.body, helpers, seen);
+    if (reached) return reached;
+  }
+  return undefined;
+}
+
+/**
+ * Every `it`/`test` that reaches load-scaled work -- directly or through a
+ * file-level helper -- and which names no budget.
+ *
+ * A helper shared by both a budgeted and an unbudgeted test flags only the
+ * unbudgeted one, which is the honest answer: only that one inherits the 5s
+ * default for the work.
+ */
+function scanSource(file: string, raw: string): LoadSensitiveTest[] {
+  const offenders: LoadSensitiveTest[] = [];
+  const lines = raw.split("\n");
+  const strippedText = stripCommentsAndStrings(raw);
+  const stripped = strippedText.split("\n");
+  const helpers = collectHelpers(stripped);
+  const openings = [...strippedText.matchAll(OPENING)];
+  openings.forEach((match) => {
+    const start = match.index ?? 0;
+    const startLine = strippedText.slice(0, start).split("\n").length - 1;
+    const header = lines[startLine] ?? "";
+    const indent = header.length - header.trimStart().length;
+    // The budget may sit in the OPTIONS object between the name and the body
+    // (`it("name", { timeout: ... }, () => {...})`), which lives on the header
+    // line or the one after it -- not inside the body.
+    const head = [header, lines[startLine + 1] ?? ""].join("\n");
+    const body = ownedLines(stripped, startLine, indent).join("\n");
+    const marker = markerReachedFrom(body, helpers);
+    if (
+      marker &&
+      !BUDGET_REFERENCE.test(head) &&
+      !BUDGET_REFERENCE.test(body)
+    ) {
+      offenders.push({
+        file: path.relative(REPO_ROOT, file),
+        line: startLine + 1,
+        name: NAME.exec(header)?.[1] ?? header.trim(),
+        why: marker.why,
+      });
+    }
+  });
   return offenders;
+}
+
+function loadSensitiveTests(): LoadSensitiveTest[] {
+  return SCANNED_ROOTS.flatMap(listTestFiles).flatMap((file) =>
+    scanSource(file, readFileSync(file, "utf8")),
+  );
 }
 
 function listTestFiles(dir: string): string[] {
@@ -306,7 +472,10 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
     // so it cannot pass by finding a real offender elsewhere in the tree.
     for (const marker of LOAD_SCALED_MARKERS) {
       const why = marker.why;
-      expect(why.length, "a marker with no explanation is not a rule").toBeGreaterThan(0);
+      expect(
+        why.length,
+        "a marker with no explanation is not a rule",
+      ).toBeGreaterThan(0);
     }
     const samples: readonly [RegExp, string][] = [
       [/\bspawnSync\s*\(/, "spawnSync('git', [])"],
@@ -358,7 +527,10 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
         "});",
       ].join("\n"),
     );
-    const head = budgeted.slice(budgeted.indexOf("it("), budgeted.indexOf("it(") + 400);
+    const head = budgeted.slice(
+      budgeted.indexOf("it("),
+      budgeted.indexOf("it(") + 400,
+    );
     expect(BUDGET_REFERENCE.test(head)).toBe(true);
   });
 
@@ -381,7 +553,9 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
     );
     const body = prose.slice(prose.indexOf('it("mentions'));
     expect(
-      LOAD_SCALED_MARKERS.filter((marker) => marker.pattern.test(body)).map((m) => m.why),
+      LOAD_SCALED_MARKERS.filter((marker) => marker.pattern.test(body)).map(
+        (m) => m.why,
+      ),
       "a marker inside a comment or a string literal is not real subprocess work",
     ).toEqual([]);
   });
@@ -392,9 +566,10 @@ describe("the budgets themselves are the measured ones, not decoration", () => {
     // A budget at or below the global default would be theatre: the suite would
     // look as though it had raised a limit, and nothing would change.
     for (const [name, value] of Object.entries(LOAD_BEARING_TEST_TIMEOUT)) {
-      expect(value, `${name} must exceed the 5000ms default it stands in for`).toBeGreaterThan(
-        5_000,
-      );
+      expect(
+        value,
+        `${name} must exceed the 5000ms default it stands in for`,
+      ).toBeGreaterThan(5_000);
     }
   });
 
@@ -425,9 +600,10 @@ describe("the budgets themselves are the measured ones, not decoration", () => {
     // quietly acquire the defect it exists to catch.
     const self = stripCommentsAndStrings(readFileSync(THIS_FILE, "utf8"));
     for (const marker of LOAD_SCALED_MARKERS) {
-      expect(marker.pattern.test(self), `${marker.why} -- this guard would need a budget`).toBe(
-        false,
-      );
+      expect(
+        marker.pattern.test(self),
+        `${marker.why} -- this guard would need a budget`,
+      ).toBe(false);
     }
   });
 });

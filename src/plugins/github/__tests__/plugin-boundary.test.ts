@@ -519,10 +519,12 @@ describe("plugin boundary: core does not import the plugin implementation", () =
           encoding: "utf8",
         });
         expect(result.status, result.stdout + result.stderr).toBe(0);
-        expect(result.stdout + result.stderr).not.toContain("Code style issues");
-        } finally {
-          removeCanary();
-        }
+        expect(result.stdout + result.stderr).not.toContain(
+          "Code style issues",
+        );
+      } finally {
+        removeCanary();
+      }
     },
   );
 
