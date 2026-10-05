@@ -54,6 +54,7 @@ import {
   MIN_RUN,
   formatFinding,
   parseBaseline,
+  UNREASONED_PLACEHOLDER,
   renderBaseline,
   scanText,
   shannonEntropy,
@@ -232,6 +233,27 @@ describe("secret scan: the baseline is read in BOTH directions", () => {
     expect(parsed.entries).toEqual([]);
     expect(parsed.unreasonedLines).toHaveLength(1);
     expect(parsed.unreasonedLines[0]?.line).toBe(2);
+  });
+
+  it("treats the generator's UNREASONED placeholder as no reason at all", () => {
+    // The generator writes this placeholder for a finding it has no reason for.
+    // It is a NON-EMPTY string, so a mere emptiness test accepts it and the gate
+    // then reports a "reviewed" baseline nobody reviewed. Found by running
+    // `secrets:scan:baseline` on batch 14, which emitted exactly this line and
+    // then exited 0 on its own output.
+    const line = `dbe9a14d6e7a70de\t${UNREASONED_PLACEHOLDER}`;
+    const parsed = parseBaseline(`# header\n${line}\n`);
+    expect(parsed.entries).toEqual([]);
+    expect(parsed.unreasonedLines).toHaveLength(1);
+    expect(parsed.unreasonedLines[0]?.line).toBe(2);
+
+    // A real reason that merely mentions the word must still be accepted, or
+    // the guard above would be unusable.
+    const real = parseBaseline(
+      `aaaa1111bbbb2222\tIdentified by name only: not material.\n`,
+    );
+    expect(real.entries).toHaveLength(1);
+    expect(real.unreasonedLines).toEqual([]);
   });
 
   it("round-trips through render and parse", () => {

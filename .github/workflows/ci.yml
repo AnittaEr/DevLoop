@@ -61,29 +61,6 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # B51 — the credential-shape scan. FIRST among the gates, deliberately:
-      # a leaked credential is the finding a reviewer must see immediately, and
-      # burying it behind a build or typecheck failure is how it goes unnoticed.
-      #
-      # It needs no database, no browser and no build output, so it belongs with
-      # the cheap gates here rather than in `e2e` or `db round trip`. It scans
-      # the TRACKED tree (`git ls-files`), which is the committed state a push
-      # would carry — not the working directory, so an untracked local
-      # `.env.production` is neither scanned nor required to exist.
-      #
-      # `security/secret-scan-baseline.txt` lists the findings this repository
-      # has accepted, each with the reason it is not a credential. Anything NOT
-      # in the baseline fails the job.
-      #
-      # NO THRESHOLD AND NO BYPASS. There is deliberately no severity filter, no
-      # `--exit-zero`, no `|| true` and no way to run this step green while
-      # ignoring a finding: a credential gate that can be told to ignore a high
-      # finding is a gate that reports green forever. The one legitimate escape
-      # is `git commit --no-verify`, and the reason it still fails CI is that
-      # this step is independent of whether the hook ran.
-      - name: Scan for committed credentials
-        run: bun run secrets:scan
-
       # B50 (`t_e211ed32`) — the dependency-advisory gate, placed immediately
       # after the install because `bun audit` reads the resolved lockfile, and
       # before the quality gates so an unfixable-looking advisory is reported as
@@ -115,6 +92,32 @@ jobs:
       # a red run, and it is never laundered into a green one.
       - name: Dependency advisories
         run: bun run audit
+
+      # B51 — the credential-shape scan. It runs before every QUALITY gate,
+      # deliberately: a leaked credential is the finding a reviewer must see
+      # immediately, and burying it behind a typecheck or build failure is how
+      # it goes unnoticed. It sits after B50's advisory step because that step
+      # needs the resolved lockfile from the install directly above it; the two
+      # are independent gates, and neither's failure hides the other's.
+      #
+      # It needs no database, no browser and no build output, so it belongs with
+      # the cheap gates here rather than in `e2e` or `db round trip`. It scans
+      # the TRACKED tree (`git ls-files`), which is the committed state a push
+      # would carry — not the working directory, so an untracked local
+      # `.env.production` is neither scanned nor required to exist.
+      #
+      # `security/secret-scan-baseline.txt` lists the findings this repository
+      # has accepted, each with the reason it is not a credential. Anything NOT
+      # in the baseline fails the job.
+      #
+      # NO THRESHOLD AND NO BYPASS. There is deliberately no severity filter, no
+      # `--exit-zero`, no `|| true` and no way to run this step green while
+      # ignoring a finding: a credential gate that can be told to ignore a high
+      # finding is a gate that reports green forever. The one legitimate escape
+      # is `git commit --no-verify`, and the reason it still fails CI is that
+      # this step is independent of whether the hook ran.
+      - name: Scan for committed credentials
+        run: bun run secrets:scan
 
       # `prettier --check` is the only gate here that reads .md, .yml, .json and
       # .css. Lint is `eslint .` over TypeScript, so a file carrying unresolved

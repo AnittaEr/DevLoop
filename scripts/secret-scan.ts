@@ -105,6 +105,14 @@ export interface Finding {
   readonly fingerprint: string;
 }
 
+/**
+ * Placeholder the baseline GENERATOR writes for a finding it has no reason
+ * for. It is a real string, so it parses as a non-empty reason — which is why
+ * {@link parseBaseline} treats it as unreasoned rather than accepting it. See
+ * `unreasonedLines`.
+ */
+export const UNREASONED_PLACEHOLDER = "UNREASONED — review this and replace";
+
 export interface BaselineEntry {
   readonly fingerprint: string;
   readonly reason: string;
@@ -313,7 +321,15 @@ export function parseBaseline(text: string): BaselineFile {
     const tab = raw.indexOf("\t");
     const fingerprint = tab < 0 ? trimmed : raw.slice(0, tab).trim();
     const reason = tab < 0 ? "" : raw.slice(tab + 1).trim();
-    if (fingerprint === "" || reason === "") {
+    // The generator's placeholder is a NON-EMPTY string, so an emptiness test
+    // alone would accept it and the gate would report a reviewed baseline that
+    // nobody reviewed. It is fatal for the same reason an empty reason is:
+    // both are an entry nobody can audit.
+    if (
+      fingerprint === "" ||
+      reason === "" ||
+      reason.startsWith("UNREASONED")
+    ) {
       unreasonedLines.push({ line: index + 1, text: raw });
       continue;
     }

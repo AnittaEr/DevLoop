@@ -49,6 +49,46 @@ a fresh clone has no hook until `bun run secrets:hook:install` is run there. CI
 is therefore the layer that is actually guaranteed to run on every push, and it
 does not depend on the hook having been installed.
 
+### What the rule does not catch
+
+Stating this is part of the rule. `bun run secrets:scan` is a shape-and-entropy
+gate over **base62** material, and its failure message ("If it is a real
+credential, remove it and rotate it") is advice about a _finding_, not a claim
+that every credential is found. The measured gaps:
+
+| Shape                                                                    | Caught? | Why                                                                                                                               |
+| ------------------------------------------------------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `github_pat_` + ≥ 20 contiguous base62 chars, ≥ 3.5 bits/char            | yes     | rule 1                                                                                                                            |
+| Long opaque value assigned to a `*token*`/`*secret*`/`*password*`/… name | yes     | rule 2                                                                                                                            |
+| **base64 value containing `+`, `/` or `=`**                              | **no**  | rule 2's value test is `^[A-Za-z0-9]{20,}$` — entirely base62 — so `+`/`/`/`=` make the value fail the test and it is not flagged |
+| `github_pat_` + hyphen-grouped material                                  | no      | `-` terminates a base62 run, so no run reaches 20 chars. Not a GitHub PAT format; recorded for completeness.                      |
+| A credential spread over multiple lines, or base64-decoded at runtime    | no      | the gate reads lines                                                                                                              |
+
+**This is a recorded decision, not an accident.** QA (round 1, `20d5518`)
+measured the base64 gap and explicitly forbade widening the baseline or
+loosening `MIN_RUN`/entropy to close it — a looser rule 2 is what produced a
+32-finding noise baseline in the first draft, and a baseline that noisy is the
+fastest way to make a baseline ignored. So the limitation is written down here
+instead. GitHub push protection and the remote's own secret scanning remain the
+backstop for non-base62 material; that is a remote settings change, out of scope
+for this repository.
+
+### Enabling the commit-time layer
+
+The hook is committed at `.githooks/pre-commit`; the enablement is one line per
+clone:
+
+```bash
+bun run secrets:hook:install     # runs: git config core.hooksPath .githooks
+```
+
+Run inside a git worktree, that command writes the **shared** `.git/config`, so
+it enables the hook for every sibling worktree of the repository too. Harmless
+(each commit is scanned in its own worktree) but surprising, which is why the
+installer prints the warning and the undo command
+(`git config --unset core.hooksPath`). `core.hooksPath` cannot be committed, so
+this line must be run in every fresh clone.
+
 ## Database round-trip tests
 
 ```bash

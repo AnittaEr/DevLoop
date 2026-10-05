@@ -43,6 +43,7 @@ import {
   renderBaseline,
   scanBuffer,
   unbaselinedFindings,
+  UNREASONED_PLACEHOLDER,
 } from "./secret-scan";
 
 const BASELINE_PATH = "security/secret-scan-baseline.txt";
@@ -183,7 +184,7 @@ if (writeBaseline) {
   const known = new Map(entries.map((e) => [e.fingerprint, e.reason]));
   const next: BaselineEntry[] = findings.map((f) => ({
     fingerprint: f.fingerprint,
-    reason: known.get(f.fingerprint) ?? "UNREASONED — review this and replace",
+    reason: known.get(f.fingerprint) ?? UNREASONED_PLACEHOLDER,
   }));
   writeFileSync(inRepo(BASELINE_PATH), renderBaseline(next));
   process.stdout.write(
@@ -209,9 +210,13 @@ if (findingsToReport.length > 0) {
     process.stderr.write(`  ${formatFinding(f)}\n`);
   }
   process.stderr.write(
-    "\nIf a finding is a real credential, remove it and rotate it. If it is a\n" +
+    "\nA finding means a credential-SHAPED string, not a proven credential. This\n" +
+      "gate sees base62 material only: a base64 value containing +, / or = is\n" +
+      "NOT flagged, nor is material hyphen-grouped after a vendor prefix. If a\n" +
+      "finding is a real credential, remove it and rotate it. If it is a\n" +
       "fixture, decide deliberately whether to reword the literal or add a\n" +
-      `baselined entry with a reason: bun run secrets:scan --write-baseline\n`,
+      `baselined entry with a reason: bun run secrets:scan --write-baseline\n` +
+      'See docs/testing.md "Credential scanning" for what the rule does not cover.\n',
   );
   process.exit(1);
 }
