@@ -85,6 +85,29 @@ export function readAuthSecret(): string | undefined {
 }
 
 /**
+ * The `BETTER_AUTH_URL` override, or `undefined` when there is none to honour.
+ *
+ * SEPARATE FROM `readAuthSecret` ON PURPOSE, because the two variables fail in
+ * the same way and one of them had been fixed while the other had not. An EMPTY
+ * value counts as unset for both: `.env.example` ships `BETTER_AUTH_SECRET=` and
+ * `BETTER_AUTH_URL=` empty and instructs the operator to copy the file as-is, so
+ * `""` is the state a correct setup actually produces. `requireAuthSecret()`
+ * treats `""` as unset (see its note); this makes the URL do the same rather than
+ * resolving a base URL of `""` and leaving Better Auth to warn and derive the
+ * origin from the request (QA round 2, D4).
+ *
+ * Whitespace is trimmed and a whitespace-only value counts as unset, because
+ * dotenv lines are commonly written with trailing spaces and `BETTER_AUTH_URL= `
+ * would otherwise reach the library as an unusable URL.
+ *
+ * Never returns an empty string, so callers can use `??` on the result.
+ */
+function readBaseURLOverride(): string | undefined {
+  const configured = process.env.BETTER_AUTH_URL?.trim();
+  return configured === undefined || configured === "" ? undefined : configured;
+}
+
+/**
  * The published literal `better-auth` falls back to when no secret is set.
  *
  * Named here rather than imported from the library because it is a private
@@ -218,6 +241,19 @@ export function authAdapterConfig(): DrizzleAdapterConfig {
  *
  * `baseURL` is read here rather than inlined so `BETTER_AUTH_URL` override and
  * the default live in one place; `DEFAULT_BASE_URL` is what the default is.
+ *
+ * WHY THE OVERRIDE GOES THROUGH `readBaseURLOverride`. QA round 2 (D4) measured
+ * the documented default never reaching the operator: `.env.example` ships
+ * `BETTER_AUTH_URL=` EMPTY and its own header says "COPY TO .env AND FILL IN",
+ * so the documented path (`cp .env.example .env`) produces `""`, not
+ * `undefined`. `??` falls back only on null/undefined, so `baseURL` resolved to
+ * `""` and Better Auth logged "Base URL is not set" and derived the origin from
+ * the incoming request. An EMPTY value is the state the example file actually
+ * produces, so it must be treated as unset here exactly as `requireAuthSecret`
+ * already treats `BETTER_AUTH_SECRET=""` as unset in the same module — the
+ * asymmetry was the defect. `??` stays HERE, at the single point where the
+ * default is applied, because the helper's whole job is to normalise "unset" to
+ * `undefined` without inventing a value.
  */
 export function authBaseOptions(): {
   appName: string;
@@ -227,7 +263,7 @@ export function authBaseOptions(): {
 } {
   return {
     appName: "DevLoop",
-    baseURL: process.env.BETTER_AUTH_URL ?? DEFAULT_BASE_URL,
+    baseURL: readBaseURLOverride() ?? DEFAULT_BASE_URL,
     emailAndPassword: {
       enabled: true,
     },

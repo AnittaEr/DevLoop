@@ -25,7 +25,11 @@
  * property access, and the secret refusal is request-time only.
  */
 
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { loadEnvConfig } from "@next/env";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -108,6 +112,82 @@ describe("the shipped auth instance (D3)", () => {
     withEnv("BETTER_AUTH_URL", undefined, () => {
       expect(authBaseOptions().baseURL).toBe("http://localhost:3000");
     });
+  });
+
+  /**
+   * QA round 2 (D4). The state the DOCUMENTED setup actually produces:
+   * `.env.example` ships `BETTER_AUTH_URL=` empty and its header says "COPY TO
+   * .env AND FILL IN", so `cp .env.example .env` yields `""`. `??` does not fall
+   * back on `""`, so before the fix this resolved `baseURL` to `""` and Better
+   * Auth warned "Base URL is not set" and derived the origin from the request.
+   *
+   * `requireAuthSecret` already treated an empty `BETTER_AUTH_SECRET` as unset;
+   * the URL is now symmetric, which is the property these three cases assert
+   * together rather than three separate `||` one-liners.
+   */
+  it("treats an empty BETTER_AUTH_URL as unset, not as a base URL of ''", () => {
+    withEnv("BETTER_AUTH_URL", "", () => {
+      expect(authBaseOptions().baseURL).toBe(DEFAULT_BASE_URL);
+    });
+  });
+
+  it("treats a whitespace-only BETTER_AUTH_URL as unset", () => {
+    // A dotenv line written with a trailing space is a typo, not an empty URL.
+    withEnv("BETTER_AUTH_URL", "   ", () => {
+      expect(authBaseOptions().baseURL).toBe(DEFAULT_BASE_URL);
+    });
+  });
+
+  it("trims surrounding whitespace off a real BETTER_AUTH_URL", () => {
+    withEnv("BETTER_AUTH_URL", "  http://127.0.0.1:4321  ", () => {
+      expect(authBaseOptions().baseURL).toBe("http://127.0.0.1:4321");
+    });
+  });
+
+  /**
+   * The control for the cases above, and the one QA says would have caught D4
+   * structurally rather than one input at a time: build the environment by
+   * loading a real `.env` copied from the SHIPPED `.env.example`, using
+   * `@next/env` — the loader Next.js itself uses, not a hand-rolled parser — and
+   * assert the resolved base URL. If `.env.example` ever gains another spelling
+   * of "empty" (quoted, `export`-prefixed, commented out) this case goes red
+   * instead of the defect shipping.
+   *
+   * The copy is made in a throwaway temp dir; no `.env` is ever written inside
+   * the repo, and the whole `process.env` is restored afterwards.
+   */
+  it("resolves the default base URL from an environment loaded from .env.example", () => {
+    const repoRoot = path.resolve(__dirname, "../../..");
+    const example = readFileSync(path.join(repoRoot, ".env.example"), "utf8");
+    const tempDir = mkdtempSync(path.join(tmpdir(), "devloop-env-example-"));
+    const saved = Object.entries(process.env);
+    let loaded: Record<string, string | undefined> = {};
+    try {
+      writeFileSync(path.join(tempDir, ".env"), example, "utf8");
+      // The loader Next.js itself uses, so what the test sees is what `next dev`
+      // sees. Its return value is NOT used: it reports only which files it read.
+      loadEnvConfig(tempDir, false);
+      // Snapshot what it put in the environment, then put the real one back
+      // before asserting, so this case cannot leak into the rest of the suite.
+      loaded = { ...process.env };
+    } finally {
+      for (const key of Object.keys(process.env)) delete process.env[key];
+      for (const [key, value] of saved) process.env[key] = value;
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    // The example file is the documented starting point, so the auth URL is
+    // present but blank. Assert that, or the case below proves nothing.
+    expect(loaded.BETTER_AUTH_URL).toBe("");
+
+    for (const [key, value] of Object.entries(loaded)) {
+      if (value !== undefined) process.env[key] = value;
+    }
+    try {
+      expect(authBaseOptions().baseURL).toBe(DEFAULT_BASE_URL);
+    } finally {
+      for (const key of Object.keys(loaded)) delete process.env[key];
+    }
   });
 
   it("honours BETTER_AUTH_URL when it is set", () => {
