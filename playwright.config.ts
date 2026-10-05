@@ -38,7 +38,36 @@ export default defineConfig({
   testMatch: /.*\.spec\.ts/,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  // ZERO RETRIES — DELIBERATE, AND NOT A "TEMPORARY MEASURE".
+  //
+  // THIS WAS `retries: process.env.CI ? 2 : 0`, and it made the `e2e` CI check
+  // structurally incapable of going red for the class of defect e2e specs are
+  // most often written to catch. Measured on `origin/main` (`1f4bd5c`): a spec
+  // whose assertion holds only from attempt 2 onward was reported `1 flaky`,
+  // printed its failure, and Playwright exited 0. The `e2e` job in
+  // `.github/workflows/ci.yml` exists precisely so that "when it goes red the PR
+  // checks list says e2e failed"; with two retries a real defect that happened
+  // to be order- or timing-sensitive converted that red into a green. `1 flaky`
+  // + exit 0 is the same self-certifying-green shape this repository has closed
+  // five times, and it lived in the one check whose badge is the headline
+  // claim. `forbidOnly` above already guards `test.only`; nothing guarded this.
+  //
+  // THE TRADE-OFF I AM MAKING, STATED ONCE SO IT IS NOT REDISCOVERED LATER:
+  // a flake is now a RED BUILD, not a self-healing one. That is the point — a
+  // retry that hides a first-attempt failure is indistinguishable from a test
+  // that never fails, and it trains every future reader of the checks list to
+  // discount the `e2e` badge. The residual is real and must not be talked away:
+  // a genuinely timing-flaky spec — one that is correct but order-sensitive —
+  // will now fail the run instead of healing on attempt 2 or 3, and the fix
+  // belongs in the cause (wait for the state you actually depend on, scope the
+  // fixture, stop sharing mutable state across specs), never in raising this
+  // number. If you are reading this because a spec just went red for the second
+  // time in a month, the answer is to diagnose that spec, not to reintroduce
+  // retries: this value is policed by `src/__tests__/playwright-retries.test.ts`,
+  // which reads this file as text and fails if `retries` can ever resolve to a
+  // non-zero value under CI — so raising it here turns the `verify` job red on
+  // the very commit that tries to hide an e2e failure. That is intended.
+  retries: 0,
   reporter: process.env.CI ? "line" : "list",
   use: {
     baseURL,
