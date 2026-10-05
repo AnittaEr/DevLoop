@@ -38,8 +38,13 @@
  * content from a signed-out visitor in BOTH configurations, that a
  * misconfigured server names the misconfiguration rather than a missing
  * session, and that GET and POST /api/sync keep their refusals. WHAT IS ASSERTED
- * WHERE A DATABASE EXISTS: the full sign-up → sign-in → evidence → sign-out →
- * refused round trip, and the restored classified sync body.
+ * WHERE A DATABASE EXISTS **AND ACCOUNT CREATION IS OFFERED**: the full
+ * sign-up → sign-in → evidence → sign-out → refused round trip, and the
+ * restored classified sync body. Both conditions are required — MEASURED, a
+ * secret and a migrated database without `DEVLOOP_ALLOW_SIGN_UP=1` made these
+ * two tests fail on a 30s timeout waiting for the `Name` field rather than skip,
+ * because the gate reported "usable auth" for a server that cannot offer the
+ * form this round trip needs.
  */
 
 import { expect, test } from "@playwright/test";
@@ -73,6 +78,46 @@ const SIGNOUT_REDIRECT_MARKERS = [/auth is not configured/i, /Sign in/i];
 async function authIsUsable(request: APIRequestContext): Promise<boolean> {
   const response = await request.get("/api/auth/get-session");
   return response.status() === 200;
+}
+
+/**
+ * Ask the server whether it is OFFERING account creation, over real HTTP.
+ *
+ * WHY THE EXISTING PROBE WAS NOT ENOUGH, MEASURED. `authIsUsable` answers true
+ * whenever the secret is configured and the database is reachable — which is
+ * exactly the condition CI's local run with a secret has, and which is NOT the
+ * condition for these tests to be able to sign up. `signUpAllowed()` is true
+ * only for the exact string `"1"` in `DEVLOOP_ALLOW_SIGN_UP` (c2), and the
+ * Playwright `webServer` forwards only `NEXT_TELEMETRY_DISABLED` and `CI`, so
+ * the flag is absent by default.
+ *
+ * The two authenticated tests therefore TOOK THE USABLE BRANCH AND FAILED
+ * rather than skipping: with a secret and a migrated database but the flag
+ * unset, `/sign-in` renders no `Name` field, so `signUp` timed out after 30s
+ * waiting for `getByLabel('Name')`. That is c7's own point — a skip has to
+ * describe the environment, and a gate that reports "usable" for a server that
+ * cannot complete the round trip is a gate that fails for the wrong reason.
+ *
+ * Read off the RENDERED PAGE, not off `process.env`, for the same reason
+ * `authIsUsable` is an HTTP request: the Playwright process does not load
+ * `.env`, so an environment check here would be blind to the server's real
+ * configuration.
+ */
+async function signUpIsOffered(request: APIRequestContext): Promise<boolean> {
+  const response = await request.get("/sign-in");
+  if (response.status() !== 200) return false;
+  return (await response.text()).includes('name="name"');
+}
+
+/**
+ * Whether this environment can drive the authenticated half at all.
+ *
+ * Both conditions, and the second is the one that was missing.
+ */
+async function canDriveAuthenticatedHalf(
+  request: APIRequestContext,
+): Promise<boolean> {
+  return (await authIsUsable(request)) && (await signUpIsOffered(request));
 }
 
 /**
@@ -269,9 +314,11 @@ test.describe("sign-in round trip (c5a, c7)", () => {
     request,
   }) => {
     test.skip(
-      !(await authIsUsable(request)),
-      "no auth secret or no database in this environment; the signed-out and " +
-        "misconfiguration contracts above are asserted instead",
+      !(await canDriveAuthenticatedHalf(request)),
+      "this server cannot drive the authenticated half: either no auth secret " +
+        "or no database, or account creation is not offered " +
+        "(DEVLOOP_ALLOW_SIGN_UP=1). The signed-out and misconfiguration " +
+        "contracts are asserted instead.",
     );
 
     await signUp(page);
@@ -318,9 +365,10 @@ test.describe("sign-in round trip (c5a, c7)", () => {
     // session the sync route is reachable again, so its classified body can be
     // asserted over HTTP instead of only against the real handler in a unit test.
     test.skip(
-      !(await authIsUsable(request)),
+      !(await canDriveAuthenticatedHalf(request)),
       "the classified sync body needs an authenticated session, which needs the " +
-        "auth tables in a migrated database",
+        "auth tables in a migrated database AND account creation offered " +
+        "(DEVLOOP_ALLOW_SIGN_UP=1)",
     );
 
     await signUp(page);
