@@ -4,10 +4,14 @@
  * `db/canonical-event-mapper.ts` is the type <-> storage boundary: it turns a
  * `CanonicalEvent` into a `canonical_events` row and back. The write path
  * (`toCanonicalEventRow`) clones `event.metadata` and hands it to a `jsonb`
- * column. That assignment is written `structuredClone(event.metadata) as
- * JsonObject`.
+ * column. That assignment WAS written `structuredClone(event.metadata) as
+ * JsonObject`; this rule's own commit removes the cast, so the tree today reads
+ * `structuredClone(event.metadata)`. The paragraphs below describe the state
+ * that motivated the rule, and say so in past tense deliberately — a
+ * specification that keeps describing a defect as present stops being true the
+ * moment the defect is fixed, which is the whole point of fixing it.
  *
- * The cast is not load-bearing for the type checker, and this was MEASURED on
+ * The cast was not load-bearing for the type checker, and this was MEASURED on
  * this tree at `e780063`, not assumed:
  *
  *   - remove ` as JsonObject` from that line -> `bun run typecheck` exit 0.
@@ -35,19 +39,22 @@
  *
  * WHY THE WRITE PATH ONLY, AND WHY THAT IS NOT MEASUREMENT SHOPPING.
  *
- * The same file has a second cast, on the read path:
- * `metadata: (row.metadata ?? {}) as JsonObject`. This rule is NOT pointed at
- * it, and the reason is that `tsc` already holds that line. Deleting it yields
+ * The same file USED to have a second cast, on the read path:
+ * `metadata: (row.metadata ?? {}) as JsonObject`. Batch 12 removed it, so
+ * `fromCanonicalEventRow` reads `metadata: row.metadata` today — the column is
+ * typed as `CanonicalEventType` and CHECKed by the database. This rule was
+ * never pointed at that line, and it should not be pointed at its replacement:
+ * `tsc` already held it. Deleting the cast yields
  *
  *   TS2322: Type '{}' is not assignable to type 'JsonObject'.
  *     Index signature for type 'string' is missing in type '{}'.
  *
  * — `{}` is not a `JsonObject`, so the read path is refused by the type checker
  * on its own. A lint rule defending a property the compiler already defends is
- * noise that makes the real one harder to see, and it would fire on a line whose
- * removal nobody can achieve by accident. Pointing the rule at the line that is
- * actually unguarded is the difference between a gate and a decoration. The
- * write-path cast is the one that can vanish silently.
+ * noise that makes the real one harder to see. The argument is kept here in
+ * past tense because it is still load-bearing: it is what stops a future author
+ * widening this rule to re-defend read-path narrowing that `tsc` already
+ * refuses to give up.
  *
  * SCOPE. Registered on `db/**` and `src/**` — the whole codebase, in practice,
  * minus config and e2e. `src/app/**` is included deliberately: unlike the plugin
@@ -55,24 +62,38 @@
  * laundering a value into a storage column, and a route handler or server
  * action writing to the database is exactly where that would reappear.
  *
- * THE ALLOWLIST, AND WHY IT IS PINNED TO file:line.
+ * THE ALLOWLIST, AND WHY IT IS NOW EMPTY (history, kept deliberately).
  *
- * Two occurrences of the denied shape exist in the tree today, both in
- * `db/canonical-event-mapper.ts`, both predate this rule, and both are
- * individually justified in `eslint.config.mjs`. They are pinned by LINE, not by
- * file, because the property being enforced is a property of those two lines
- * specifically: a THIRD assertion anywhere in the repo, or a second one in
- * either function, is an error. A file-level allowlist would silently legalise
- * every future cast in the mapper — which is the mapper being the single place
- * this defect has ever been observed in. Line pinning makes the exception
- * visible as a two-line diff when someone adds a third cast.
+ * At the base `e780063` the tree carried TWO occurrences of the denied shape,
+ * both in `db/canonical-event-mapper.ts` (write path line 39, read path line
+ * 63), both predating this rule. They were individually justified in
+ * `eslint.config.mjs` and pinned by LINE rather than by file, on the reasoning
+ * that the property belongs to those two lines specifically: a third assertion
+ * anywhere in the repo, or a second one in either function, is an error, where
+ * a file-level allowlist would silently legalise every future cast in the one
+ * file this defect has ever been observed in.
  *
- * A line-pinned allowlist has one obvious failure mode — editing an
- * allowlisted line shifts it, and the exception would silently stop applying and
- * start firing on a neighbour. That is the SAFE direction (lint goes red, work
- * stops, nothing is unprotected), and `unusedAllowlistEntries` below turns the
- * common case into a message that names the stale entry instead of just an
- * error on an unrelated line.
+ * That reasoning was right about line pinning and wrong about pinning AT ALL.
+ * The write-path cast was removed by this card (narrowing the value, not
+ * silencing the rule — `event.metadata` is already `JsonObject` and
+ * `structuredClone<T>(value: T): T` preserves `T`, so there was nothing to
+ * replace the assertion with), and batch 12 had already removed the read-path
+ * cast. So `allow` is now `[]` and there is no exception in force.
+ *
+ * The measured reason not to reach for an allowlist again: those entries were
+ * pinned to `db/canonical-event-mapper.ts:39` and `:63`, and the moment batch
+ * 12 merged the write-path cast moved to line 135 and the read-path cast
+ * vanished — both entries went stale in one integration and `bun run lint`
+ * failed on `main` with three errors (two stale, one real at 135). Line pinning
+ * buys precision and pays in staleness; an empty allowlist is the strongest
+ * statement of the property and cannot rot.
+ *
+ * If you add an entry: it goes in `allow` as `file:line`, and the rule's own
+ * `staleAllowlistEntry` message (reported unconditionally, once per file) will
+ * name it back to you the moment the line it names stops being an assertion.
+ * `meta.schema` accepts `allow` ONLY — there is no `unusedAllowlistEntries`
+ * option, and passing one is a schema validation crash (exit 2), not a lint
+ * error.
  */
 
 import path from "node:path";
