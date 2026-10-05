@@ -929,6 +929,71 @@ function withCursor(
 const MAX_SYNC_PAGES = 10_000;
 
 /**
+ * The outcome of a walk that reached the source's end.
+ *
+ * A FOURTH SHAPE, and narrower than {@link SyncResult} on purpose. Where a
+ * single `syncSource` call reports one of three states (refused / exhausted /
+ * partial), this walk reaches exactly one: every page it fetched was WRITTEN and
+ * the source reported no further page. So it carries no `failure` and no
+ * `nextCursor` — a refusal aborts the walk by throwing
+ * {@link SyncPageRefusedError}, and exhaustion means there is nowhere left to
+ * resume. Declaring the optional fields here would let a caller branch on a
+ * `failure` that can never be present and on a cursor that can never be
+ * meaningful, which is precisely the "which field wins" ambiguity `SyncResult`
+ * already has to document.
+ */
+export interface SyncSourceAllPagesResult {
+  /** Every event across every page, in source order. All of it was written. */
+  readonly events: CanonicalEvent[];
+  /** How many rows were written. Equals `events.length` by construction. */
+  readonly persisted: number;
+  /** How many pages were fetched and persisted, the empty last one included. */
+  readonly pages: number;
+}
+
+/**
+ * A page in the MIDDLE of a walk was refused, so the walk stopped there.
+ *
+ * Distinct from a thrown transport or credential failure: this carries the
+ * batch-12 classification, and — unlike a first-page refusal, which the caller
+ * sees directly from `syncSource` — it happens behind pages that were already
+ * written, so the caller cannot tell from anything it already holds that an
+ * earlier page succeeded.
+ *
+ * `cursor` IS THE CURSOR THAT FETCHED THE REFUSED PAGE, not the cursor after
+ * it. That is the whole point: the refused page wrote nothing (the batch is
+ * all-or-nothing), so re-driving this cursor re-fetches exactly those events
+ * and retries them once the data is fixed, while the `pages` already counted
+ * stay durable. Advancing instead would silently lose a page.
+ */
+export class SyncPageRefusedError extends Error {
+  /** The classification `syncSource` produced for the refused page. */
+  readonly failure: SyncFailure;
+  /** Cursor to re-drive to retry the refused page; `undefined` if it was the first. */
+  readonly retryCursor: string | undefined;
+  /** Pages durably written BEFORE the refusal. */
+  readonly pages: number;
+  /** Rows durably written before the refusal. */
+  readonly persisted: number;
+
+  constructor(
+    failure: SyncFailure,
+    retryCursor: string | undefined,
+    pages: number,
+    persisted: number,
+  ) {
+    super(
+      `syncSourceAllPages: page ${pages + 1} was refused (${failure.code}, scope ${failure.scope}) after ${pages} page(s); ${persisted} row(s) remain durable and the refused page is unwritten. Re-drive the same cursor to retry it.`,
+    );
+    this.name = "SyncPageRefusedError";
+    this.failure = failure;
+    this.retryCursor = retryCursor;
+    this.pages = pages;
+    this.persisted = persisted;
+  }
+}
+
+/**
  * Walk a source from `cursor` to exhaustion, syncing every page.
  *
  * EXISTS BECAUSE ONE PAGE IS NOT A SYNC. With `PAGE_SIZE = 30` and descending
@@ -944,12 +1009,25 @@ const MAX_SYNC_PAGES = 10_000;
  * a constant cursor is paging itself in circles, and silently returning the
  * first page's events once per duplicate would be a silently truncated ingest.
  *
- * @throws when `maxPages` is exceeded or a cursor repeats. A partial ingest is
- * still returned in neither case: the failure is loud instead.
+ * A REFUSED PAGE ABORTS THE WALK, AND THAT IS THE POINT. A refusal is reported,
+ * not thrown, by `syncSource` — which is right for one page but wrong for the
+ * aggregate, because a refusal on any page but the FIRST is invisible from
+ * outside: the loop sees a `SyncResult` whose `persisted` is 0 and whose
+ * `events` is a full page, and if it kept summing, the aggregate would report
+ * `persisted: 2, events.length: 4` and no failure at all. Two events were never
+ * written and the caller is told the ingest completed. So the walk stops on the
+ * first `page.failure` and throws {@link SyncPageRefusedError} naming the cursor
+ * that fetched that page. Returning-throwing keeps the result's one invariant
+ * true and unmissable: if this returns, `persisted === events.length`.
+ *
+ * @throws {RangeError} when `maxPages` is not an integer >= 1.
+ * @throws {SyncPageRefusedError} when a page is refused mid-walk, carrying the
+ * classification and the cursor to re-drive. Nothing partial is returned in any
+ * of these cases: the failure is loud instead.
  */
 export async function syncSourceAllPages(
   options: SyncOptions & { readonly maxPages?: number },
-): Promise<SyncResult & { readonly pages: number }> {
+): Promise<SyncSourceAllPagesResult> {
   const maxPages = options.maxPages ?? MAX_SYNC_PAGES;
   if (!Number.isInteger(maxPages) || maxPages < 1) {
     throw new RangeError(`syncSourceAllPages: maxPages must be >= 1`);
@@ -964,6 +1042,17 @@ export async function syncSourceAllPages(
   for (;;) {
     const page: SyncResult = await syncSource({ ...options, cursor });
     pages += 1;
+    // BEFORE anything is accumulated: a refused page contributed nothing
+    // durable, so its events must not enter `events` (which would break
+    // `persisted === events.length`) and the walk must not advance past it.
+    if (page.failure !== undefined) {
+      throw new SyncPageRefusedError(
+        page.failure,
+        cursor,
+        pages - 1,
+        persisted,
+      );
+    }
     events.push(...page.events);
     persisted += page.persisted;
     if (page.nextCursor === undefined) break;
