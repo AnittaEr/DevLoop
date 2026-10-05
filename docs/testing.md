@@ -213,3 +213,27 @@ advisory truly has no fixed release — add its ID to
 `.github/audit-baseline.json` with a one-line reason. Do not raise a severity
 threshold to hide it. A baseline entry that matches nothing in the current tree
 is reported as a `::warning::` so the file cannot rot into a permanent blanket.
+
+## No test file may be collected by no suite
+
+`src/__tests__/no-orphaned-test-files.test.ts` fails the **default** suite (so
+`verify`, which has no database) if any **tracked** file matching
+`*.test.*` / `*.spec.*` is collected by none of the three runners. It reads the
+tracked list from `git ls-files` — an untracked file is work in progress, not a
+defect — and derives the collected sets by parsing `test.include` in
+`vitest.config.ts` and `vitest.db.config.ts` plus `testDir`/`testMatch` in
+`playwright.config.ts` as **text**. It imports no config: executing a
+Vitest/Playwright config from inside a jsdom test is a measured failure, and
+`db-suite-registry.test.ts` records the exact error it causes.
+
+This is the inverse of `db-suite-registry.test.ts`. That guard answers "is this
+db-backed test collected by the _right_ suite?"; this one answers "is this test
+file collected by _any_ suite?". A file that is written, committed, and matched
+by no glob runs nowhere and looks green in every report — this guard closes that
+gap.
+
+It carries its own non-vacuity floors, asserted rather than commented: the
+tracked set must exceed 20 files, the unit config must contribute at least 10,
+the db config at least 1, and Playwright at least 1. So deleting a whole
+`include:` array turns the guard **red** instead of quietly shrinking the
+difference to nothing.
