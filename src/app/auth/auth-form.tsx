@@ -141,9 +141,10 @@ export function AuthForm({ allowSignUp }: { readonly allowSignUp: boolean }) {
           void submit("sign-in");
         }}
       >
-        <label className="flex flex-col gap-1 text-sm">
+        <label className="flex flex-col gap-1 text-sm" htmlFor="sign-in-email">
           Email
           <input
+            id="sign-in-email"
             type="email"
             name="email"
             autoComplete="email"
@@ -154,9 +155,13 @@ export function AuthForm({ allowSignUp }: { readonly allowSignUp: boolean }) {
           />
         </label>
 
-        <label className="flex flex-col gap-1 text-sm">
+        <label
+          className="flex flex-col gap-1 text-sm"
+          htmlFor="sign-in-password"
+        >
           Password
           <input
+            id="sign-in-password"
             type="password"
             name="password"
             autoComplete="current-password"
@@ -186,9 +191,10 @@ export function AuthForm({ allowSignUp }: { readonly allowSignUp: boolean }) {
             <code>DEVLOOP_ALLOW_SIGN_UP=1</code> is set; unset or{" "}
             <code>false</code>, account creation is not offered at all.
           </p>
-          <label className="flex flex-col gap-1 text-sm">
+          <label className="flex flex-col gap-1 text-sm" htmlFor="sign-up-name">
             Name
             <input
+              id="sign-up-name"
               type="text"
               name="name"
               autoComplete="name"
