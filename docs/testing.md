@@ -374,21 +374,51 @@ full-suite load those tests exceeded 5s and failed with
 The budgets live in `src/core/testing/load-bearing-test-timeout.ts` and are
 attached per test as `{ timeout: LOAD_BEARING_TEST_TIMEOUT.<key> }`:
 
-| budget         | for                                               | worst measurement it is sized from                 |
-| -------------- | ------------------------------------------------- | -------------------------------------------------- |
-| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites (`secret-scan.test.ts`) |
-| `subprocessX4` | a subprocess test measured **above** `subprocess` | 37.8s, 4 concurrent suites (the Prettier canary)   |
-| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 21.4s, 4 concurrent suites (`route-auth.test.ts`)  |
+| budget         | for                                               | worst measurement it is sized from                        |
+| -------------- | ------------------------------------------------- | --------------------------------------------------------- |
+| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites — see the caveat below         |
+| `subprocessX4` | a subprocess test measured **above** `subprocess` | 18.5s, 4 concurrent **full** suites (the Prettier canary) |
+| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 21.4s, 4 concurrent suites (`route-auth.test.ts`)         |
+
+The `subprocessX4` figure is the worst of four measured runs: 18522 / 17534 /
+17532 / 18354 ms, in four **separate** detached worktrees, against 857 / 882 /
+981 / 1059 / 1104 ms isolated. Separate worktrees matter: that test writes a
+fixed-path canary and deletes it in a `finally`, so concurrent suites sharing
+one worktree delete the file out from under each other and the timing measures
+that contention instead of the test.
+
+Two caveats stated rather than smoothed over:
+
+- **`subprocess` is sized from a file that is not on this branch yet.** The
+  28.1s measurement is `scripts/__tests__/secret-scan.test.ts`, which lives only
+  on the unintegrated branch `devloop/t_4cdeadc5` (B51) — `git ls-tree -r
+origin/main --name-only | grep -i secret` returns nothing on `main` or on the
+  branch carrying this table. So the budget has zero use sites today and sizes
+  the _next_ subprocess test to arrive. Re-measure when B51 lands.
+- An earlier version of this table quoted **37.8s** for `subprocessX4` against a
+  60s budget, while the budgets module quoted **70.1s** for the same budget. Both
+  are superseded by the 18.5s above. The old figures were measured with four
+  suites sharing one worktree, so they measured the canary-file race.
 
 The rule for a new budget is stated in that file: take the worst duration you
 have **measured** for that test under the worst load you can actually produce,
-and multiply by 4 — sized against the single-suite figure where one exists, so
-a genuinely hung subprocess still fails.
+and multiply by 4 — applied to the worst **loaded** figure, so a genuinely hung
+subprocess still fails well inside the budget.
 
 `src/__tests__/load-bearing-test-timeouts.test.ts` enforces this. It reads test
 sources as **text** (importing them would drag a module graph into the runner),
-resolves **file-level helpers** so a marker in a helper the test only _calls_ is
-still attributed to that test, and fails when a load-scaled test names no
-budget. Its coverage claim is itself under test: the guard's first version was
-blind to helper-delegated work and green on the exact defect it existed to catch,
-so a synthetic fixture now pins that behaviour.
+resolves **file-level helpers and classes** so a marker in a helper the test only
+_calls_, or in a class method it only invokes, is still attributed to that test,
+and fails when a load-scaled test names no budget. Its coverage claim is itself
+under test, in both directions:
+
+- the guard's first version was blind to helper-delegated work and green on the
+  exact defect it existed to catch;
+- its second was blind to a **class method** — QA built that counter-example and
+  the guard reported zero offenders on it.
+
+Two shapes it still does **not** resolve, asserted as limitations so the claim
+cannot drift back into coverage it does not have: an instance returned by a
+factory (`makeScanner().run()`), and an object-literal method. Both hide the
+spawn behind a value whose type only a compiler knows; closing them needs type
+information, not a wider regex.

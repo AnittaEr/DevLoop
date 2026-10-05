@@ -14,9 +14,9 @@
  * a real module graph. Those tests pay for Node/Bun start, for a formatter
  * reading `node_modules`, and for `vi.resetModules()` re-importing the route
  * and the Drizzle writer. None of that is the code under test, and all of it
- * stretches with machine load. Measured at batch-15's head (`d2db2f9`, 670
- * tests) on an 8-core machine: the Prettier canary took 1.0s isolated and
- * 70.1s when four full suites ran at once, against a 5s budget. Such a test
+ * stretches with machine load. Measured on an 8-core machine at this branch's
+ * base (`1f4bd5c`), the Prettier canary took 0.9-1.1s in isolation but 18.5s
+ * when four full suites ran at once -- against a 5s budget. Such a test
  * fails with `Error: Test timed out in 5000ms.` -- a message indistinguishable
  * from a broken assertion, which is the actual defect: a red suite stops
  * meaning a red assertion.
@@ -60,32 +60,68 @@
  * `SUBPROCESS` and `MODULE_GRAPH` are 30s, `SUBPROCESS_X4` is 60s. The rule
  * behind all three, stated once so a new test can apply it without asking:
  *
- *   Take the worst duration you have actually MEASURED for that test under the
- *   worst load you can actually produce, and multiply by 4. A budget that is
- *   close to the measurement is a budget that will be crossed by the next
- *   slow machine; a budget that is 4x it still fails a genuinely hung
- *   subprocess, which is what the timeout is for.
+ *   Take the worst duration you have MEASURED for that test under the worst
+ *   load you can actually produce, and multiply by 4. A budget close to the
+ *   measurement will be crossed by the next slow machine; a budget 4x it still
+ *   fails a genuinely hung subprocess, which is what the timeout is for.
  *
- * `SUBPROCESS_X4` exists because one measured case needs more than 30s: under
- * 4x concurrent full suites the Prettier canary ran to 70.1s (it spawns
- * Prettier TWICE -- a negative control, then the real bytes -- so it pays two
- * cold starts, not one). At 30s that case was still red. 60s covers the
- * observed 70.1s only because the observed value is inflated by 4 concurrent
- * suites each running the same test; a single suite has never taken more than
- * 8.0s. That asymmetry is deliberate and is exactly why the multiplier is
- * stated against the SINGLE-suite measurement, not the concurrent one.
+ * The multiplier is applied to the worst LOADED measurement, not the isolated
+ * one. The isolated number is quoted too, because the ratio between them is the
+ * evidence that the work is load-scaled at all -- a test whose isolated and
+ * loaded durations are the same does not need any of this.
+ *
+ * `SUBPROCESS_X4` exists because one measured case needs more than 30s. The
+ * Prettier canary (in the plugin boundary test for the SDK vendor) spawns
+ * Prettier TWICE --
+ * a negative control, then the real bytes -- so it pays two cold starts.
+ * Re-measured on this branch, in four SEPARATE detached worktrees so that the
+ * test's fixed-path canary file could not be deleted out from under a
+ * concurrent run:
+ *
+ *   isolated, 5 runs, one suite:        857 / 882 / 981 / 1059 / 1104 ms
+ *   4x concurrent FULL suites, 4 runs: 18522 / 17534 / 17532 / 18354 ms
+ *
+ * Worst loaded observation: 18522ms. 4x that is 74s, so 60s is the round
+ * number below it; 30s would leave only 1.6x headroom over the worst case
+ * actually observed, which is the number that would be crossed first on a
+ * slower machine. Isolated worst is 1104ms, so 60s is ~54x that -- and a
+ * `prettier --check` on a single file cannot legitimately take 60s, so the
+ * budget still fails a genuine hang.
+ *
+ * These four measurements REPLACE an earlier pair quoted as "1.0s isolated,
+ * 70.1s at 4x". The 70.1s figure was measured with four suites sharing ONE
+ * worktree, where this test writes a fixed-path canary file and deletes it in a
+ * `finally` -- so a concurrent suite read a deleted file and the run's duration
+ * included contention over that file rather than the test's own cost. That
+ * isolation bug is reported, not fixed (it is out of scope here). The numbers
+ * above are from separate worktrees and are the only ones quoted anywhere.
  */
 
 /**
  * Budget for a test that spawns a real subprocess (a formatter, a scanner CLI,
  * `git`) and therefore pays a Node/Bun cold start per spawn.
  *
- * Measured worst case: 28.1s (`scripts/__tests__/secret-scan.test.ts` > "the
- * shipped pre-commit HOOK blocks the commit", 4 concurrent suites, 2.2s
- * isolated). 4x the worst single-suite observation (7.7s) is ~30s.
+ * SIZED FROM A FILE THAT DOES NOT EXIST ON THIS BRANCH, deliberately, and this
+ * comment is the disclosure. `scripts/__tests__/secret-scan.test.ts` -- the
+ * worst subprocess case anyone has measured in this repo -- lives only on the
+ * unintegrated branch `devloop/t_4cdeadc5` (B51). It is absent from
+ * `origin/main` and from this branch: `git ls-tree -r origin/main --name-only |
+ * grep -i secret` returns nothing.
+ *
+ * The measurement quoted for it (worst 28.1s at 4 concurrent suites, 2.2s
+ * isolated) was taken on that branch, so it sizes this budget for a test that
+ * will arrive rather than one that is here. That is the honest reason this
+ * constant exists with zero use sites on this branch: `subprocess` is the
+ * budget the NEXT subprocess test is expected to reach for, and B51's
+ * secret-scan suite is that test.
+ *
+ * The alternative -- deriving it from the Prettier canary, which does exist
+ * here -- would double-size this budget against a measurement already claimed by
+ * `subprocessX4`, and would leave `subprocessX4` with no distinct evidence. When
+ * B51 lands, re-measure on this tree and correct this comment.
  */
 export const LOAD_BEARING_TEST_TIMEOUT = {
-  /** Spawns a subprocess; budget scaled from the worst measured run. */
+  /** Spawns a subprocess; budget scaled from the worst measured run (see above). */
   subprocess: 30_000,
   /**
    * Spawns a subprocess AND is known to exceed the above under load. Only for
