@@ -277,10 +277,10 @@ interface Helper {
  * with `(`, and matching it would register a string as a "helper" whose body is
  * the rest of the file. Only a shape that can actually be CALLED is a helper.
  *
- * `DECL_START` matches the first line of a declaration; `DECL_CONTINUES` then
- * walks forward over a signature that spans lines, so
- * `const f = (\n  a: X,\n): Y => {` is still recognised as a declaration and not
- * dropped -- dropping it is the blind direction, which is the one that ships.
+ * A declaration whose signature spans lines (`const f = (\n  a: X,\n): Y => {`)
+ * is still recognised, because `DECL_START` only reads the FIRST line and that
+ * line carries the name and the arrow head. Dropping it would be the blind
+ * direction, which is the one that ships.
  *
  * Over-attribution is the accepted cost: a marker in a helper is attributed to
  * every test that reaches that helper, including tests that share it with a
@@ -290,7 +290,6 @@ interface Helper {
  */
 const DECL_START =
   /^[ \t]*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|^[ \t]*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+?)?=\s*(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>|\((?:[^()]|\([^()]*\))*\)\s*(?::[^=]+?)?=>)/;
-const DECL_CONTINUES = /=>\s*\{?\s*$/;
 
 /**
  * The declaration starting at `start`: its whole extent, up to the brace that
@@ -532,6 +531,59 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
       budgeted.indexOf("it(") + 400,
     );
     expect(BUDGET_REFERENCE.test(head)).toBe(true);
+  });
+
+  it("follows load-scaled work reached through a file-level helper", () => {
+    // THE NON-VACUITY PROOF FOR HELPER DELEGATION, and the defect this guard
+    // shipped with. An earlier version scanned only each `it`'s OWN text, so it
+    // reported zero offenders while `route-auth.test.ts` > "CONTROL: with a
+    // session the real pipeline runs" -- a site PM MEASURED timing out on bare
+    // `origin/main` -- carried no budget. The guard was green on the exact
+    // defect it existed to catch, and its own docstring claimed coverage it did
+    // not have. That combination is the self-certifying-green failure this board
+    // exists to close, so the coverage claim is now driven by a test.
+    //
+    // Driven on synthetic source shaped like the real file: a multi-line
+    // parameter type ending `}): Promise<...> {`, and the marker several hops
+    // down inside a helper the test only CALLS. The test sits on line 9 of this
+    // fixture, which is what the expectation below asserts -- so if the scanner
+    // reports a line, it is reporting the test that called the helper and not
+    // some other `it` in the fixture.
+    const delegated = [
+      "async function loadRouteWith(options: {",
+      "  session: { kind: string };",
+      "}): Promise<{ POST: () => Promise<void> }> {",
+      "  vi.resetModules();",
+      "  return { POST: async () => undefined };",
+      "}",
+      "",
+      'describe("synthetic", () => {',
+      '  it("reaches the work only through the helper", async () => {',
+      "    const { POST } = await loadRouteWith({ session: { kind: 'none' } });",
+      "    await POST();",
+      "  });",
+      "});",
+    ].join("\n");
+
+    // Without the budget the test is an offender -- this is the RED.
+    expect(
+      scanSource("synthetic.test.ts", delegated).map((offender) => ({
+        line: offender.line,
+        name: offender.name,
+      })),
+      "a spawn or resetModules reached only through a file-level helper must " +
+        "still be attributed to the test that calls it",
+    ).toEqual([{ line: 9, name: "reaches the work only through the helper" }]);
+
+    // Adding the budget clears it -- this is the GREEN.
+    const budgeted = delegated.replace(
+      '  it("reaches the work only through the helper", async () => {',
+      "  it(\n" +
+        '    "reaches the work only through the helper",\n' +
+        "    { timeout: LOAD_BEARING_TEST_TIMEOUT.moduleGraph },\n" +
+        "    async () => {",
+    );
+    expect(scanSource("synthetic.test.ts", budgeted)).toEqual([]);
   });
 
   it("does not accept a marker that appears only in a comment or a string", () => {

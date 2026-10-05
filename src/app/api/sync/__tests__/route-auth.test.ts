@@ -33,6 +33,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { PluginRegistry } from "@/core/plugins/registry";
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
 import type { CanonicalEvent } from "@/core/events/canonical-event";
 import type {
   CanonicalEventConflictConfig,
@@ -189,81 +190,111 @@ afterEach(() => {
 });
 
 describe("POST /api/sync — the guard, with a harness proven to write", () => {
-  it("CONTROL: with a session the real pipeline runs and the writer records ONE row", async () => {
-    // This is the non-vacuity anchor for the two refusals below. If this ever
-    // records zero, the refusals prove nothing.
-    process.env.BETTER_AUTH_SECRET = "b46-route-test-secret-not-a-credential";
-    const { POST, writer, syncCalls } = await loadRouteWith({
-      session: { kind: "signed-in" },
-    });
+  // Every case here reaches `vi.resetModules()` through `loadRouteWith()`, which
+  // re-imports the route, the sync handler and the Drizzle writer per case. That
+  // cost is module-graph work, not assertion work, so it stretches with machine
+  // load exactly as a subprocess spawn does -- and PM measured this file's
+  // CONTROL case timing out on bare `origin/main` at 1f4bd5c with
+  // 'Error: Test timed out in 5000ms'.
+  //
+  // MEASURED BUDGET: `moduleGraph` on each case rather than on the describe, so
+  // the budget is attached where the work is attributed and the regression guard
+  // can see it. The four cases are budgeted individually because only the three
+  // that assert on the real pipeline's output pay the writer's cost; the fourth
+  // echoes a refusal body and is budgeted the same for consistency of the class
+  // rather than because it was measured separately.
+  const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.moduleGraph;
+  it(
+    "CONTROL: with a session the real pipeline runs and the writer records ONE row",
+    { timeout: LOAD_BEARING },
+    async () => {
+      // This is the non-vacuity anchor for the two refusals below. If this ever
+      // records zero, the refusals prove nothing.
+      process.env.BETTER_AUTH_SECRET = "b46-route-test-secret-not-a-credential";
+      const { POST, writer, syncCalls } = await loadRouteWith({
+        session: { kind: "signed-in" },
+      });
 
-    const response = await POST();
-    const body = (await response.json()) as Record<string, unknown>;
+      const response = await POST();
+      const body = (await response.json()) as Record<string, unknown>;
 
-    expect(syncCalls()).toBe(1);
-    expect(writer.written).toHaveLength(1);
-    expect(response.status).toBe(200);
-    expect(body.outcome).toBe(SYNC_OUTCOMES.synced);
-    expect(body.ok).toBe(true);
-    expect(body.persisted).toBe(1);
-    // Same body shape and same idempotency semantics as c6de1d7 (c3).
-    expect(body.idempotent).toBe(true);
-    expect(String(body.idempotencyNote)).toMatch(/ON CONFLICT DO UPDATE/i);
-    // The clause that ran is the one carrying Drizzle column references, i.e.
-    // the shipped natural-key upsert — not something this suite could invent.
-    expect(writer.conflicts).toHaveLength(1);
-  });
+      expect(syncCalls()).toBe(1);
+      expect(writer.written).toHaveLength(1);
+      expect(response.status).toBe(200);
+      expect(body.outcome).toBe(SYNC_OUTCOMES.synced);
+      expect(body.ok).toBe(true);
+      expect(body.persisted).toBe(1);
+      // Same body shape and same idempotency semantics as c6de1d7 (c3).
+      expect(body.idempotent).toBe(true);
+      expect(String(body.idempotencyNote)).toMatch(/ON CONFLICT DO UPDATE/i);
+      // The clause that ran is the one carrying Drizzle column references, i.e.
+      // the shipped natural-key upsert — not something this suite could invent.
+      expect(writer.conflicts).toHaveLength(1);
+    },
+  );
 
-  it("401 with NO session: names the condition, calls nothing, writes ZERO rows", async () => {
-    // c1. The secret IS set and no cookie is supplied, so `getSession()` takes
-    // its ordinary `null` path. This is the case a naive `catch -> 401` also
-    // passes, which is exactly why it is not the only refusal tested.
-    process.env.BETTER_AUTH_SECRET = "b46-route-test-secret-not-a-credential";
-    const { POST, writer, syncCalls } = await loadRouteWith({
-      session: { kind: "none" },
-    });
+  it(
+    "401 with NO session: names the condition, calls nothing, writes ZERO rows",
+    { timeout: LOAD_BEARING },
+    async () => {
+      // c1. The secret IS set and no cookie is supplied, so `getSession()` takes
+      // its ordinary `null` path. This is the case a naive `catch -> 401` also
+      // passes, which is exactly why it is not the only refusal tested.
+      process.env.BETTER_AUTH_SECRET = "b46-route-test-secret-not-a-credential";
+      const { POST, writer, syncCalls } = await loadRouteWith({
+        session: { kind: "none" },
+      });
 
-    const response = await POST();
-    const body = (await response.json()) as Record<string, unknown>;
+      const response = await POST();
+      const body = (await response.json()) as Record<string, unknown>;
 
-    expect(response.status).toBe(401);
-    expect(body.outcome).toBe("session_required");
-    expect(String(body.message)).toMatch(/session/i);
-    expect(body.persisted).toBe(0);
-    expect(body.fetched).toBe(0);
-    // The two halves of c1, asserted separately: the handler was never reached
-    // (so no GitHub plugin was constructed), AND the writer recorded nothing.
-    expect(syncCalls()).toBe(0);
-    expect(writer.written).toHaveLength(0);
-  });
+      expect(response.status).toBe(401);
+      expect(body.outcome).toBe("session_required");
+      expect(String(body.message)).toMatch(/session/i);
+      expect(body.persisted).toBe(0);
+      expect(body.fetched).toBe(0);
+      // The two halves of c1, asserted separately: the handler was never reached
+      // (so no GitHub plugin was constructed), AND the writer recorded nothing.
+      expect(syncCalls()).toBe(0);
+      expect(writer.written).toHaveLength(0);
+    },
+  );
 
-  it("503 — NOT 401 — when auth is unconfigured, naming the VARIABLE", async () => {
-    // D-285's trap. With `BETTER_AUTH_SECRET` unset, `getSession()` THROWS; a
-    // guard that catches everything reports a broken `.env` as a signed-out user
-    // and it hides indefinitely.
-    delete process.env.BETTER_AUTH_SECRET;
-    const { POST, writer, syncCalls } = await loadRouteWith({
-      session: { kind: "misconfigured" },
-    });
+  it(
+    "503 — NOT 401 — when auth is unconfigured, naming the VARIABLE",
+    { timeout: LOAD_BEARING },
+    async () => {
+      // D-285's trap. With `BETTER_AUTH_SECRET` unset, `getSession()` THROWS; a
+      // guard that catches everything reports a broken `.env` as a signed-out user
+      // and it hides indefinitely.
+      delete process.env.BETTER_AUTH_SECRET;
+      const { POST, writer, syncCalls } = await loadRouteWith({
+        session: { kind: "misconfigured" },
+      });
 
-    const response = await POST();
-    const body = (await response.json()) as Record<string, unknown>;
+      const response = await POST();
+      const body = (await response.json()) as Record<string, unknown>;
 
-    expect(response.status).toBe(503);
-    expect(response.status).not.toBe(401);
-    expect(body.outcome).toBe("auth_not_configured");
-    expect(String(body.message)).toMatch(/BETTER_AUTH_SECRET/);
-    expect(syncCalls()).toBe(0);
-    expect(writer.written).toHaveLength(0);
-  });
+      expect(response.status).toBe(503);
+      expect(response.status).not.toBe(401);
+      expect(body.outcome).toBe("auth_not_configured");
+      expect(String(body.message)).toMatch(/BETTER_AUTH_SECRET/);
+      expect(syncCalls()).toBe(0);
+      expect(writer.written).toHaveLength(0);
+    },
+  );
 
-  it("echoes no secret value in either refusal body", async () => {
-    const secret = "b46-route-secret-canary-4d2f";
-    process.env.BETTER_AUTH_SECRET = secret;
-    const { POST } = await loadRouteWith({ session: { kind: "none" } });
+  it(
+    "echoes no secret value in either refusal body",
+    { timeout: LOAD_BEARING },
+    async () => {
+      const secret = "b46-route-secret-canary-4d2f";
+      process.env.BETTER_AUTH_SECRET = secret;
+      const { POST } = await loadRouteWith({ session: { kind: "none" } });
 
-    const serialised = JSON.stringify(await (await POST()).json());
-    expect(serialised).not.toContain(secret);
-    expect(serialised.toLowerCase()).not.toContain("bearer ");
-  });
+      const serialised = JSON.stringify(await (await POST()).json());
+      expect(serialised).not.toContain(secret);
+      expect(serialised.toLowerCase()).not.toContain("bearer ");
+    },
+  );
 });
