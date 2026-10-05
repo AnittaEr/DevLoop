@@ -457,46 +457,68 @@ describe("plugin boundary: core does not import the plugin implementation", () =
     }
   });
 
-  it("writes a canary Prettier accepts, so a leftover cannot break format:check", () => {
-    // The canary's bytes are the whole finding: a leftover lives inside the
-    // Prettier-checked tree, so whatever these bytes are, they decide whether
-    // an interrupted run can also break `format:check`. This runs the REAL
-    // formatter over the REAL bytes rather than asserting a hand-maintained
-    // claim about what Prettier wants, which is how a wrong claim about this
-    // ended up committed twice in this file's history.
-    //
-    // Note on the measurement this guards: at base `00f7b0b` the leftover was
-    // in fact Prettier-clean, so this test passes at base too and is a
-    // regression guard, not a fix for a live break. It also cannot be the
-    // regression test for the pre-write delete -- that is the test above.
-    const specifier = `@${"octokit"}/rest`;
-    const prettier = path.join(REPO_ROOT, "node_modules", ".bin", "prettier");
-    try {
-      // A control first: an instrument that cannot detect the defect it is
-      // installed to detect proves nothing. Mis-indented bytes must be
-      // rejected, which is what makes the assertion below meaningful.
-      writeFileSync(
-        CANARY_PATH,
-        `import {client} from "${specifier}";\nexport const probe=client;\n`,
-      );
-      const control = spawnSync(prettier, ["--check", CANARY_PATH], {
-        encoding: "utf8",
-      });
-      expect(
-        control.stdout + control.stderr,
-        "the control must be REJECTED, or this test cannot fail",
-      ).toContain("Code style issues");
+  // TIMEOUT: 30s, measured. This test is the only one in the file that spawns a
+  // subprocess, and it spawns it TWICE (a negative control, then the real
+  // bytes), so its floor is two Prettier cold starts. Measured on this file at
+  // base `1f4bd5c` with `Date.now()` probes around each `spawnSync`, over 8 full
+  // `bun run test` runs:
+  //
+  //   isolated (3 runs)  control spawn 1041-1740ms, final spawn 746-1829ms
+  //   full suite (7 runs) control spawn 1922-3135ms, final spawn 2839-3981ms
+  //
+  // i.e. 2.6-6.9s of subprocess wall time inside ONE test, against a 5s default
+  // timeout. That is why this test was red at 2 of 8 full-suite runs and 0 of 8
+  // isolated runs on UNMODIFIED `origin/main`: suite load stretches Prettier's
+  // Node start, not the code under test. 30s is ~4x the worst observed total
+  // (6.9s), so the guard keeps its teeth against a genuinely hung formatter --
+  // `prettier --check` on one file cannot legitimately take 30s. Scoped to this
+  // test on purpose: the global timeout stays 5s for the other 508 tests.
+  it(
+    "writes a canary Prettier accepts, so a leftover cannot break format:check",
+    { timeout: 30_000 },
+    () => {
+      // The canary's bytes are the whole finding: a leftover lives inside the
+      // Prettier-checked tree, so whatever these bytes are, they decide whether
+      // an interrupted run can also break `format:check`. This runs the REAL
+      // formatter over the REAL bytes rather than asserting a hand-maintained
+      // claim about what Prettier wants, which is how a wrong claim about this
+      // ended up committed twice in this file's history.
+      //
+      // Note on the measurement this guards: at base `00f7b0b` the leftover was
+      // in fact Prettier-clean, so this test passes at base too and is a
+      // regression guard, not a fix for a live break. It also cannot be the
+      // regression test for the pre-write delete -- that is the test above.
+      const specifier = `@${"octokit"}/rest`;
+      const prettier = path.join(REPO_ROOT, "node_modules", ".bin", "prettier");
+      try {
+        // A control first: an instrument that cannot detect the defect it is
+        // installed to detect proves nothing. Mis-indented bytes must be
+        // rejected, which is what makes the assertion below meaningful.
+        writeFileSync(
+          CANARY_PATH,
+          `import {client} from "${specifier}";\nexport const probe=client;\n`,
+        );
+        const control = spawnSync(prettier, ["--check", CANARY_PATH], {
+          encoding: "utf8",
+        });
+        expect(
+          control.stdout + control.stderr,
+          "the control must be REJECTED, or this test cannot fail",
+        ).toContain("Code style issues");
 
-      writeFileSync(CANARY_PATH, canarySource(specifier));
-      const result = spawnSync(prettier, ["--check", CANARY_PATH], {
-        encoding: "utf8",
-      });
-      expect(result.status, result.stdout + result.stderr).toBe(0);
-      expect(result.stdout + result.stderr).not.toContain("Code style issues");
-    } finally {
-      removeCanary();
-    }
-  });
+        writeFileSync(CANARY_PATH, canarySource(specifier));
+        const result = spawnSync(prettier, ["--check", CANARY_PATH], {
+          encoding: "utf8",
+        });
+        expect(result.status, result.stdout + result.stderr).toBe(0);
+        expect(result.stdout + result.stderr).not.toContain(
+          "Code style issues",
+        );
+      } finally {
+        removeCanary();
+      }
+    },
+  );
 
   it("has no provider SDK import anywhere under src/plugins/**", () => {
     const offenders: string[] = [];

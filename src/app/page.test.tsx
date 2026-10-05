@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
@@ -39,5 +43,26 @@ describe("Home page (server render)", () => {
     const tokens = buttonVariants().split(/\s+/);
     expect(tokens).toContain("bg-primary");
     expect(tokens).toContain("hover:bg-primary/90");
+  });
+
+  it("links to the sign-in page", () => {
+    // c11's minimal edit: the home page gains a LINK and nothing else.
+    const html = renderToStaticMarkup(<Home />);
+    expect(html).toContain('href="/sign-in"');
+  });
+
+  it("carries NO session guard, because it renders no evidence", async () => {
+    // The load-bearing half of c11. The home page shows a hard-coded string, so
+    // there is nothing on it to withhold — and a guard added here would be
+    // ceremony that hides the fact that `/evidence` is the protected page. So the
+    // page must not reach the session guard, or the database, at all.
+    const source = readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "page.tsx"),
+      "utf8",
+    );
+    expect(source).not.toContain("requireSession");
+    expect(source).not.toContain("session-guard");
+    expect(source).not.toContain("readCanonicalEvents");
+    expect(source).not.toContain("canonical_events");
   });
 });

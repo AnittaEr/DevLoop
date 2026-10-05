@@ -19,7 +19,10 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun run ./db/migrate.ts",
     "db:check": "bun run ./db/check.ts",
-    "audit": "bun run ./scripts/audit.ts"
+    "audit": "bun run ./scripts/audit.ts",
+    "secrets:scan": "bun run ./scripts/scan-secrets.ts",
+    "secrets:scan:baseline": "bun run ./scripts/scan-secrets.ts --write-baseline",
+    "secrets:hook:install": "bun run ./scripts/install-secret-hook.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "1.1.0",

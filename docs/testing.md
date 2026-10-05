@@ -4,15 +4,133 @@ Three independent runners. None replaces the others.
 
 ## Commands
 
-| Command               | What it runs                                                                           |
-| --------------------- | -------------------------------------------------------------------------------------- |
-| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
-| `bun run test:db`     | Vitest — the DB round-trip suite. Needs a real Postgres (see below).                   |
-| `bun run lint`        | ESLint over the repo.                                                                  |
-| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
-| `bun run build`       | `next build` — production build.                                                       |
-| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
-| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.                               |
+| Command                | What it runs                                                                           |
+| ---------------------- | -------------------------------------------------------------------------------------- |
+| `bun run test`         | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
+| `bun run test:db`      | Vitest — the DB round-trip suite. Needs a real Postgres (see below).                   |
+| `bun run lint`         | ESLint over the repo.                                                                  |
+| `bun run typecheck`    | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
+| `bun run build`        | `next build` — production build.                                                       |
+| `bun run e2e`          | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
+| `bun run e2e:install`  | One-time: downloads the Chromium build Playwright needs.                               |
+| `bun run secrets:scan` | Scans the tracked tree for credential-shaped strings; fails on anything not baselined. |
+
+## Credential scanning
+
+`bun run secrets:scan` fails if a tracked file holds a credential-shaped string
+that is not listed in `security/secret-scan-baseline.txt`. It runs in the `verify`
+CI job, before the other gates, so a leaked credential is the first thing a red
+run reports.
+
+The rule is a **shape and entropy** rule, not a vendor-prefix substring match: a
+vendor prefix followed by a contiguous run of ≥ 20 base62 characters whose
+Shannon entropy is ≥ 3.5 bits/character. That distinction is what lets this
+repository keep its own deliberately credential-_shaped_ test fixtures without
+the gate being red on arrival — and a gate that is red on arrival is a gate that
+gets ignored. See `scripts/secret-scan.ts` for the rules and
+`scripts/__tests__/secret-scan.test.ts` for the tests that pin them.
+
+Three commands, all safe to run locally:
+
+```bash
+bun run secrets:scan             # verify; exits 1 on any unbaselined finding
+bun run secrets:scan:baseline    # rewrite the baseline's entries (still needs reasons)
+bun run secrets:hook:install     # enable the pre-commit hook in this clone
+```
+
+Every baseline entry carries a **per-entry reason** saying why the finding is not
+a credential, and an entry without one is fatal rather than ignored: a bare
+fingerprint is a silent blanket waiver wearing the costume of a reviewed entry.
+
+The `pre-commit` hook (`.githooks/pre-commit`) is the cheap first layer that
+catches a credential before it becomes a commit. It is enabled per clone by
+`git config core.hooksPath .githooks` — a **local** setting that is not pushed, so
+a fresh clone has no hook until `bun run secrets:hook:install` is run there. CI
+is therefore the layer that is actually guaranteed to run on every push, and it
+does not depend on the hook having been installed.
+
+### What the rule does not catch
+
+Stating this is part of the rule. `bun run secrets:scan` is a shape-and-entropy
+gate over **base62** material, and its failure message ("If it is a real
+credential, remove it and rotate it") is advice about a _finding_, not a claim
+that every credential is found. The measured gaps:
+
+| Shape                                                                    | Caught? | Why                                                                                                                               |
+| ------------------------------------------------------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `github_pat_` + ≥ 20 contiguous base62 chars, ≥ 3.5 bits/char            | yes     | rule 1                                                                                                                            |
+| Long opaque value assigned to a `*token*`/`*secret*`/`*password*`/… name | yes     | rule 2                                                                                                                            |
+| **base64 value containing `+`, `/` or `=`**                              | **no**  | rule 2's value test is `^[A-Za-z0-9]{20,}$` — entirely base62 — so `+`/`/`/`=` make the value fail the test and it is not flagged |
+| `github_pat_` + hyphen-grouped material                                  | no      | `-` terminates a base62 run, so no run reaches 20 chars. Not a GitHub PAT format; recorded for completeness.                      |
+| A credential spread over multiple lines, or base64-decoded at runtime    | no      | the gate reads lines                                                                                                              |
+
+**This is a recorded decision, not an accident.** QA (round 1, `20d5518`)
+measured the base64 gap and explicitly forbade widening the baseline or
+loosening `MIN_RUN`/entropy to close it — a looser rule 2 is what produced a
+32-finding noise baseline in the first draft, and a baseline that noisy is the
+fastest way to make a baseline ignored. So the limitation is written down here
+instead. GitHub push protection and the remote's own secret scanning remain the
+backstop for non-base62 material; that is a remote settings change, out of scope
+for this repository.
+
+### What the gate reads — the index, not the working tree
+
+Every byte the gate scans comes out of the git **index**, via
+`git cat-file blob :<path>`: the content the next commit will contain, or the
+content already committed after a fresh checkout. It never reads a file off
+disk.
+
+This was a real defect, found by QA at `304bacd` and measured by execution, not
+by reading the code. The first version took the path _list_ from
+`git diff --cached` and then read each path with `readFileSync` — the working
+tree — so `--staged` meant "the staged file list paired with whatever the file
+contains right now":
+
+```
+git add -f a.ts                          # index now holds the credential
+echo 'export const t = "clean";' > a.ts  # disk no longer does
+git commit -qm x                         # COMMIT_EXIT=0, hook silent
+git show HEAD:a.ts                       # the PAT IS IN THE COMMIT
+```
+
+That path needed no `--no-verify` at all. The default committed-tree mode had the
+same hole and reported green over a `HEAD` holding a real-shaped PAT whenever the
+working tree was clean; CI only escaped it because `actions/checkout` happens to
+materialise `HEAD` into the working tree first, which is a coincidence of the
+runner rather than a property of the gate.
+
+The consequence for what is and is not covered:
+
+| Content                                   | Scanned? | Why                                                                                                                                                                                                       |
+| ----------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The bytes the next commit will contain    | yes      | read from the index (`:<path>`)                                                                                                                                                                           |
+| The bytes already committed (`HEAD`)      | yes      | after a checkout the index equals `HEAD`; CI reads the same thing                                                                                                                                         |
+| An UNSTAGED file that exists only on disk | no       | deliberately — an uncommitted `.env.production` is the operator's, not a finding to block an unrelated commit over                                                                                        |
+| An UNTRACKED file                         | no       | never enters the index; `.gitignore` plus the environment are the layers for these                                                                                                                        |
+| An UNMERGED path (merge conflict)         | reported | `:<path>` needs a stage-0 entry, so the gate NAMES the path and says it did not scan it. Not fatal: `git commit` refuses an unmerged tree outright, so it cannot hide anything in a commit that gets made |
+| A gitlink / submodule                     | reported | same naming path as above; a submodule's contents belong to another repository's gate                                                                                                                     |
+
+A silently skipped path would be the same green lie in a new form, so the gate
+prints every path it could not read rather than skipping in silence. See
+`readIndexBlob` in `scripts/scan-secrets.ts` and the regression tests in
+`scripts/__tests__/secret-scan.test.ts` that stage bytes deliberately different
+from disk — they fail against the pre-fix code.
+
+### Enabling the commit-time layer
+
+The hook is committed at `.githooks/pre-commit`; the enablement is one line per
+clone:
+
+```bash
+bun run secrets:hook:install     # runs: git config core.hooksPath .githooks
+```
+
+Run inside a git worktree, that command writes the **shared** `.git/config`, so
+it enables the hook for every sibling worktree of the repository too. Harmless
+(each commit is scanned in its own worktree) but surprising, which is why the
+installer prints the warning and the undo command
+(`git config --unset core.hooksPath`). `core.hooksPath` cannot be committed, so
+this line must be run in every fresh clone.
 
 ## Database round-trip tests
 
@@ -102,9 +220,11 @@ yet.
 
 CI has **three jobs**, all defined in `.github/workflows/ci.yml`:
 
-- `verify` — `bun install --frozen-lockfile`, `bun run format:check`,
-  `bun run lint`, `bun run typecheck`, `bun run test`, the migration-drift
-  check, `bun run build`.
+- `verify` — `bun install --frozen-lockfile`, `bun run secrets:scan`,
+  `bun run format:check`, `bun run lint`, `bun run typecheck`,
+  `bun run test`, the migration-drift check, `bun run build`. The credential
+  scan runs FIRST among the gates, so a leaked credential is reported as itself
+  rather than buried behind a later failure.
 - `e2e` — verifies the lockfile, installs dependencies, runs `bun run build`,
   then installs Chromium, then runs `bun run e2e`. The build must precede the
   e2e steps (see the ordering note in `ci.yml`).
