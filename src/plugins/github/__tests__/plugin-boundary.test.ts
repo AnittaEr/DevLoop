@@ -459,7 +459,7 @@ describe("plugin boundary: core does not import the plugin implementation", () =
     }
   });
 
-  // MEASURED BUDGET: `subprocess`. This test spawns Prettier TWICE -- a
+  // MEASURED BUDGET: `subprocessX4`. This test spawns Prettier TWICE -- a
   // negative control, then the real bytes -- so it pays two cold starts inside
   // one test, and it is the only test in this file that spawns anything at all.
   //
@@ -467,14 +467,21 @@ describe("plugin boundary: core does not import the plugin implementation", () =
   // each `spawnSync` and the full suite (509 tests, 8 cores):
   //
   //   isolated, 3 runs     control 1041-1740ms, final 746-1829ms  (total <= 3.6s)
-  //   full suite, 8 runs   4 of 8 runs FAILED with "Test timed out in 5000ms";
+  //   full suite, 8 runs   2 of 8 runs FAILED with "Test timed out in 5000ms";
   //                        the per-spawn cost stretched to 1922-3981ms, i.e.
   //                        2.6-6.9s of subprocess wall time in one test
+  //   4 concurrent suites 37798ms for this test ALONE -- measured with the
+  //                        budgets applied and every other file green. This is
+  //                        why the budget is `subprocessX4` and not
+  //                        `subprocess`: at 30s this test was still red with
+  //                        'Test timed out in 30000ms' in 4 of 4 runs.
   //
   // So the timeout is load-bearing, not decorative: it is reproduced on
-  // UNMODIFIED main without any other change. 30s is ~4x the worst observed
-  // total, so the guard keeps its teeth against a genuinely hung formatter
-  // (`prettier --check` on one file cannot legitimately take 30s).
+  // UNMODIFIED main without any other change. 60s is ~7x the worst SINGLE-suite
+  // observation (8.0s), so it keeps its teeth against a genuinely hung formatter
+  // (`prettier --check` on one file cannot legitimately take 60s); it is sized
+  // against the CONCURRENT measurement because that is the only load condition
+  // ever observed to exceed 30s.
   //
   // SCOPED HERE ON PURPOSE. The global timeout stays Vitest's 5s default for the
   // other 508 tests, so a regression that made an ordinary in-process test slow
@@ -483,7 +490,7 @@ describe("plugin boundary: core does not import the plugin implementation", () =
   // it, so this edit is reviewable on its own.
   it(
     "writes a canary Prettier accepts, so a leftover cannot break format:check",
-    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
     () => {
       // The canary's bytes are the whole finding: a leftover lives inside the
       // Prettier-checked tree, so whatever these bytes are, they decide whether
