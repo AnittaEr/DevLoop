@@ -250,7 +250,7 @@ const OPENING = /^[ \t]*(?:it|test)\s*(?:[.][\w.]+)?\s*\(/gm;
 const NAME = /\(\s*["'`]([^"'`]*)/;
 
 /**
- * A FILE-level function, and the source of its own body.
+ * A FILE-level function OR CLASS, and the source of its own body.
  *
  * The bodies are needed because load-scaled work in this suite is almost never
  * written inside an `it`: it lives in a file-level helper (`loadRouteWith()`,
@@ -262,6 +262,8 @@ const NAME = /\(\s*["'`]([^"'`]*)/;
 interface Helper {
   readonly name: string;
   readonly body: string;
+  /** A class is reached by `new C()` or by one of its methods, not by a call. */
+  readonly isClass?: boolean;
 }
 
 /**
@@ -282,6 +284,14 @@ interface Helper {
  * line carries the name and the arrow head. Dropping it would be the blind
  * direction, which is the one that ships.
  *
+ * `class C` is a THIRD shape, and its absence was a real blind spot: a test that
+ * reaches a spawn through a method (`new Scanner().run()`) is reached by CALL
+ * exactly as a function is, but the class was never registered, so the guard
+ * reported zero offenders on it. QA built that counter-example and the guard went
+ * green. The class BODY is registered rather than its individual methods, which
+ * is what makes both method and `constructor` shapes resolve from one entry --
+ * per-method declarations are a second, undocumented grammar to keep in step.
+ *
  * Over-attribution is the accepted cost: a marker in a helper is attributed to
  * every test that reaches that helper, including tests that share it with a
  * budgeted sibling. That errs toward flagging, which is the safe direction --
@@ -289,7 +299,11 @@ interface Helper {
  * suite in six weeks.
  */
 const DECL_START =
-  /^[ \t]*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|^[ \t]*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+?)?=\s*(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>|\((?:[^()]|\([^()]*\))*\)\s*(?::[^=]+?)?=>)/;
+  /^[ \t]*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|^[ \t]*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+?)?=\s*(?:async\s+)?(?:function\b|[A-Za-z_$][\w$]*\s*=>|\((?:[^()]|\([^()]*\))*\)\s*(?::[^=]+?)?=>)|^[ \t]*class\s+([A-Za-z_$][\w$]*)/;
+
+/** `class C extends B {` -- B's body is reachable through C's instances. */
+const SUPERCLASS =
+  /^[ \t]*class\s+[A-Za-z_$][\w$]*\s+extends\s+([A-Za-z_$][\w$]*)/;
 
 /**
  * The declaration starting at `start`: its whole extent, up to the brace that
@@ -348,9 +362,20 @@ function collectHelpers(stripped: readonly string[]): Map<string, Helper> {
     DECL_START.lastIndex = 0;
     const match = DECL_START.exec(line);
     if (!match) return;
-    const name = match[1] ?? match[2];
+    const name = match[1] ?? match[2] ?? match[3];
     if (!name || helpers.has(name)) return;
-    helpers.set(name, { name, body: declarationExtent(stripped, index) });
+    const isClass = match[3] !== undefined;
+    // A class whose superclass is already known reaches that body's markers
+    // too, so the subclass entry carries both. Over-attribution again, which is
+    // the accepted direction.
+    const superName = SUPERCLASS.exec(line)?.[1];
+    const inherited =
+      superName && helpers.has(superName) ? helpers.get(superName)?.body : "";
+    helpers.set(name, {
+      name,
+      isClass,
+      body: [inherited ?? "", declarationExtent(stripped, index)].join("\n"),
+    });
   });
   return helpers;
 }
@@ -358,6 +383,65 @@ function collectHelpers(stripped: readonly string[]): Map<string, Helper> {
 /** Does `text` call `name`? Word-bounded, so `loadRoute` != `loadRouteWith`. */
 function calls(text: string, name: string): boolean {
   return new RegExp(`\\b${name}\\s*\\(`).test(text);
+}
+
+/**
+ * The method names a class body DECLARES.
+ *
+ * Used to reach a class whose instance the test only has as an untyped value --
+ * `new Scanner().run()` names `Scanner`, but `scanner.run()` names only the
+ * method. Requiring the method name to be DECLARED by the class is what keeps
+ * this from attributing every `.map(`/`.push(` in the suite to every class: a
+ * name declared by no class here matches nothing.
+ *
+ * Object-literal methods are intentionally not resolved. A `{ run() { spawnSync } }`
+ * factory is a real shape, but it is a fourth grammar, and the honest move is to
+ * record it as a limitation under a failing-if-unresolved test rather than to
+ * grow the matcher until it is untestable.
+ */
+const METHOD_DECL =
+  /^[ \t]*(?:(?:public|private|protected|readonly|static|async|abstract|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^;{]*>)?\s*\([^;{]*\)\s*(?::[^;{]+)?\{/;
+
+function methodNamesIn(classBody: string): readonly string[] {
+  const names = new Set<string>();
+  for (const line of classBody.split("\n")) {
+    const match = METHOD_DECL.exec(line);
+    if (match?.[1]) names.add(match[1]);
+  }
+  return [...names];
+}
+
+/**
+ * Does `text` reach a class BODY -- by construction, or by calling one of its
+ * declared methods?
+ *
+ * A class is reached by CALL in two shapes the guard must both see, because the
+ * second is exactly the blind spot QA's counter-example found
+ * (`new Scanner().run()` still qualifies, but so does holding the instance in a
+ * variable first):
+ *
+ *  1. `new C()` -- names the class.
+ *  2. `scanner.run()` -- names only the METHOD, never the class, which is why the
+ *     method-name list is needed at all.
+ *
+ * Two further shapes are NOT resolved and are recorded as limitations rather
+ * than claimed as coverage, each pinned by a test below so the claim cannot drift
+ * back into the docstring:
+ *
+ *  3. `extends` -- a subclass instance reaches its superclass body. Handled by
+ *     folding the known superclass body into the subclass at collection time,
+ *     which only works when the superclass is declared FIRST in the file.
+ *  4. An instance returned by a factory (`const s = makeScanner()`), and an
+ *     object-literal method (`{ run() { spawnSync } }`). Neither is recoverable
+ *     from text without type information.
+ */
+function reachesClass(text: string, name: string, body: string): boolean {
+  if (new RegExp(`\\bnew\\s+${name}\\s*\\(`).test(text)) return true;
+  // Shape 2: a method call whose name is declared by this class.
+  for (const method of methodNamesIn(body)) {
+    if (new RegExp(`\\.\\s*${method}\\s*\\(`).test(text)) return true;
+  }
+  return false;
 }
 
 /**
@@ -379,7 +463,15 @@ function markerReachedFrom(
   );
   if (own) return own;
   for (const helper of helpers.values()) {
-    if (seen.has(helper.name) || !calls(body, helper.name)) continue;
+    if (seen.has(helper.name)) continue;
+    // A helper is reached by CALLING it; a class is reached by CONSTRUCTING it
+    // or by calling one of its methods, which names neither the class nor a
+    // plain call. Both forms must resolve or the scan is blind to classes.
+    const reachedByCall =
+      helper.isClass === true
+        ? reachesClass(body, helper.name, helper.body)
+        : calls(body, helper.name);
+    if (!reachedByCall) continue;
     seen.add(helper.name);
     const reached = markerReachedFrom(helper.body, helpers, seen);
     if (reached) return reached;
@@ -584,6 +676,113 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
         "    async () => {",
     );
     expect(scanSource("synthetic.test.ts", budgeted)).toEqual([]);
+  });
+
+  it("follows load-scaled work reached through a class method", () => {
+    // D3. QA built this counter-example and the guard reported ZERO offenders on
+    // it: `DECL_START` resolved `function f(` and `const f = ... =>` and nothing
+    // else, so a spawn inside a class method -- reached by CALL, exactly like a
+    // function helper -- was invisible. The guard was green while an unbudgeted
+    // spawn sat in a method, which is PM's finding-2 defect class in a narrower
+    // shape. Driven here so the docstring's coverage claim is a test, not a hope.
+    const viaMethod = [
+      "class Scanner {",
+      "  run(): string {",
+      "    execFileSync('git', ['--version']);",
+      "    return 'ok';",
+      "  }",
+      "}",
+      "",
+      'describe("synthetic", () => {',
+      '  it("reaches a spawn through a class method, no budget", () => {',
+      "    new Scanner().run();",
+      "  });",
+      "});",
+    ].join("\n");
+    expect(
+      scanSource("synthetic.test.ts", viaMethod).map((o) => ({
+        line: o.line,
+        name: o.name,
+      })),
+      "a spawn inside a class method must be attributed to the test that calls it",
+    ).toEqual([
+      { line: 9, name: "reaches a spawn through a class method, no budget" },
+    ]);
+
+    // GREEN: the same file with a budget on that test scans clean.
+    const budgeted = viaMethod.replace(
+      '  it("reaches a spawn through a class method, no budget", () => {',
+      "  it(\n" +
+        '    "reaches a spawn through a class method, no budget",\n' +
+        "    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },\n" +
+        "    () => {",
+    );
+    expect(scanSource("synthetic.test.ts", budgeted)).toEqual([]);
+  });
+
+  it("resolves a class method called through a variable, and via `extends`", () => {
+    // The two shapes that follow from registering the class body rather than each
+    // method declaration: the instance held in a variable (so the test never
+    // writes the class name at all), and a subclass instance reaching its
+    // superclass body.
+    const viaVariable = [
+      "class Base {",
+      "  boot(): void {",
+      "    vi.resetModules();",
+      "  }",
+      "}",
+      "class Child extends Base {",
+      "  boot(): void {",
+      "    super.boot();",
+      "  }",
+      "}",
+      "",
+      'describe("synthetic", () => {',
+      '  it("calls an inherited method on a typed variable", () => {',
+      "    const scanner: Base = new Child();",
+      "    scanner.boot();",
+      "  });",
+      "});",
+    ].join("\n");
+    const offenders = scanSource("synthetic.test.ts", viaVariable);
+    expect(
+      offenders.map((o) => o.line),
+      "a class body reached only by a method call on a variable -- through " +
+        "`extends` -- must still be attributed to the calling test",
+    ).toContain(13);
+  });
+
+  it("does NOT resolve the two shapes it cannot, and says so rather than claiming them", () => {
+    // The honest half of D3. A factory that returns an instance, and an
+    // object-literal method, are both real shapes that reach a spawn by CALL.
+    // Neither is recoverable from text without type information, so this guard
+    // does not claim them. Asserting the limitation HERE is what stops the
+    // docstring from quietly widening back into coverage it does not have --
+    // which is the whole defect this round exists to close.
+    const viaFactory = [
+      "class Scanner {",
+      "  run(): string {",
+      "    execFileSync('git', ['--version']);",
+      "    return 'ok';",
+      "  }",
+      "}",
+      "function makeScanner(): Scanner {",
+      "  return new Scanner();",
+      "}",
+      "",
+      'describe("synthetic", () => {',
+      '  it("reaches a spawn through a factory", () => {',
+      "    const scanner = makeScanner();",
+      "    scanner.run();",
+      "  });",
+      "});",
+    ].join("\n");
+    expect(
+      scanSource("synthetic.test.ts", viaFactory).map((o) => o.line),
+      "LIMITATION, asserted so it stays a limitation: a factory that returns an " +
+        "instance hides the class name, so this text scan cannot attribute the " +
+        "spawn. Closing it needs type information, not a wider regex.",
+    ).not.toContain(14);
   });
 
   it("does not accept a marker that appears only in a comment or a string", () => {
