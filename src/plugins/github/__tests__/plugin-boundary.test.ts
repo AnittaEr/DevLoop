@@ -22,7 +22,14 @@
  * boundary assertion does not become invisible inside a 30-test suite.
  */
 
-import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,6 +39,8 @@ const THIS_FILE = fileURLToPath(import.meta.url);
 const PLUGIN_DIR = path.resolve(path.dirname(THIS_FILE), "..");
 const SRC_DIR = path.resolve(PLUGIN_DIR, "..", "..");
 const CORE_DIR = path.join(SRC_DIR, "core");
+/** Repo root, for locating the installed Prettier binary. */
+const REPO_ROOT = path.resolve(SRC_DIR, "..");
 
 const SCANNED_EXTENSIONS = [
   ".ts",
@@ -174,6 +183,84 @@ export function isProviderSdkSpecifier(spec: string): boolean {
   );
 }
 
+/**
+ * The planted canary path, and why it is deleted BEFORE being written.
+ *
+ * The canary has to be a REAL `.ts` file inside `src/plugins/**`, because the
+ * scan it exercises reads files off disk and resolves import specifiers from
+ * source text. That places it inside the tsconfig `include` glob, and a
+ * leftover from a killed worker (SIGKILL, a crashed runner, a cancelled CI
+ * job) then breaks `bun run typecheck` with TS2307 on `@octokit/rest`.
+ *
+ * Blast radius, MEASURED at base `00f7b0b` on the bytes a REAL leftover has.
+ * The way to get those bytes is not to hand-plant a file: disable base's own
+ * `finally` cleanup, run base's test, and inspect what it left behind.
+ *
+ *   bun run typecheck    -> exit 2, TS2307 on '@octokit/rest'
+ *   bun run format:check -> exit 0, PASSES
+ *   bun run lint         -> exit 0, PASSES
+ *
+ * So the blast radius is ONE gate, not three and not two. An earlier round of
+ * review claimed `format:check` also failed; that claim came from a file
+ * hand-planted with a trailing blank line, which the canary never writes --
+ * base builds its source as `["...probe = client;", ""].join("\n")`, which is
+ * a single terminating newline, and Prettier accepts that exactly. A hand-
+ * planted approximation is not evidence about the real artefact; the bytes a
+ * killed run leaves are. A second review round re-ran the measurement this way
+ * and confirmed the original claim, so this comment now carries the procedure
+ * as well as the result, because the result is only trustworthy with it.
+ *
+ * Two changes harden the write. `canarySource()` below is the single source of
+ * the canary's bytes, so a future edit cannot silently reintroduce bytes that
+ * break `format:check` -- the test at the end of this file runs the real
+ * Prettier over the real bytes rather than asserting a hand-maintained claim
+ * about what Prettier wants. And `withCanary()` deletes any pre-existing
+ * leftover BEFORE writing, then writes with the exclusive-create flag so the
+ * delete is load-bearing rather than decorative: with the delete removed the
+ * write fails EEXIST instead of silently overwriting, and that failure is what
+ * the regression test catches. `removeCanary()` is idempotent so the `finally`
+ * cannot fail with ENOENT against a file that has already gone.
+ *
+ * The next `bun run test` would have cleaned the leftover up on its own, so
+ * this was always bounded and self-recovering. It is still worth closing: a
+ * worktree that an interrupted run can leave red is not acceptable.
+ */
+const CANARY_PATH = path.join(PLUGIN_DIR, "__sdk_canary__.ts");
+
+/** The canary's exact source, Prettier-clean and ending in a single newline. */
+function canarySource(specifier: string): string {
+  return (
+    [
+      `import { client } from "${specifier}";`,
+      "export const probe = client;",
+    ].join("\n") + "\n"
+  );
+}
+
+function removeCanary(): void {
+  if (existsSync(CANARY_PATH)) unlinkSync(CANARY_PATH);
+}
+
+/**
+ * Plant a canary, run `body` against the tree with it present, always clean up.
+ *
+ * This is the REAL write-and-cleanup sequence, in one place, so the regression
+ * test below drives this function rather than re-implementing a private copy
+ * of it. A guard that asserts its own copy of the code under test cannot catch
+ * a revert of that code.
+ */
+function withCanary(specifier: string, body: () => void): void {
+  // Pre-write cleanup of a leftover from a killed run. Load-bearing because
+  // of the exclusive-create flag on the write below.
+  removeCanary();
+  writeFileSync(CANARY_PATH, canarySource(specifier), { flag: "wx" });
+  try {
+    body();
+  } finally {
+    removeCanary();
+  }
+}
+
 describe("plugin boundary: core does not import the plugin implementation", () => {
   const allCoreFiles = listFiles(CORE_DIR);
   const coreFiles = allCoreFiles.filter((f) => f !== CORE_GUARD_FILE);
@@ -278,16 +365,7 @@ describe("plugin boundary: core does not import the plugin implementation", () =
     // exclusion, which would widen what the guard ignores.
     const sdkName = "octokit";
     const specifier = `@${sdkName}/rest`;
-    const offender = path.join(PLUGIN_DIR, "__sdk_canary__.ts");
-    writeFileSync(
-      offender,
-      [
-        `import { client } from "${specifier}";`,
-        "export const probe = client;",
-        "",
-      ].join("\n"),
-    );
-    try {
+    withCanary(specifier, () => {
       const offenders: string[] = [];
       for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
         for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
@@ -299,8 +377,124 @@ describe("plugin boundary: core does not import the plugin implementation", () =
       expect(offenders).toEqual([
         `${path.join("plugins", "github", "__sdk_canary__.ts")} -> ${specifier}`,
       ]);
+    });
+  });
+
+  it("clears a leftover canary from a run that was killed mid-test", () => {
+    // THE regression test for the third finding. A worker killed between its
+    // write and its `finally` used to leave `__sdk_canary__.ts` in the
+    // the typechecked tree, where `bun run typecheck` fails with TS2307.
+    // Measured at base `00f7b0b` on the bytes a real leftover has (`lint` and
+    // `format:check` both pass on those, so the blast radius is one gate).
+    //
+    // This test drives the REAL `withCanary()` -- the same function the scan
+    // test above uses -- rather than a private copy of it. An earlier version
+    // of this test re-implemented the write and cleanup inline and then
+    // asserted on its own copy, which meant deleting the real pre-write
+    // `removeCanary()` left the suite fully green. A guard that cannot catch
+    // its own target is decorative.
+    const specifier = `@${"octokit"}/rest`;
+    // A leftover, planted by hand, carrying a body the real sequence will NOT
+    // write, so "was it replaced?" is observable and not just "does it exist?".
+    const staleSource = `import { client } from "${specifier}";\nexport const probe = client; // STALE LEFTOVER\n`;
+    try {
+      writeFileSync(CANARY_PATH, staleSource);
+      expect(existsSync(CANARY_PATH)).toBe(true);
+
+      // While the leftover is STILL on disk, the scan must DETECT it. This is
+      // the half that stops "self-healing" from being satisfied by a cleanup
+      // that also blinded the guard: if detection were silently skipped, the
+      // assertions below would pass for the wrong reason.
+      const detectedWhilePresent: string[] = [];
+      for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
+        for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+          if (isProviderSdkSpecifier(spec)) {
+            detectedWhilePresent.push(
+              `${path.relative(SRC_DIR, file)} -> ${spec}`,
+            );
+          }
+        }
+      }
+      expect(detectedWhilePresent).toEqual([
+        `${path.join("plugins", "github", "__sdk_canary__.ts")} -> ${specifier}`,
+      ]);
+
+      // Now drive the real sequence, with the leftover still on disk. It must
+      // succeed (no EEXIST, no stale bytes) and leave the tree clean.
+      let sourceInsideBody: string | null = null;
+      withCanary(specifier, () => {
+        sourceInsideBody = readFileSync(CANARY_PATH, "utf8");
+        // The pre-write cleanup replaced the stale body with this run's own.
+        // `withCanary` writes with flag "wx", so this can only hold if the
+        // leftover was genuinely deleted first -- otherwise the exclusive
+        // create throws EEXIST and the test fails here.
+        expect(sourceInsideBody).toBe(canarySource(specifier));
+        expect(sourceInsideBody).not.toContain("STALE LEFTOVER");
+      });
+      expect(sourceInsideBody).toBe(canarySource(specifier));
+
+      // After the sequence the tree is clean again, which is the whole point:
+      // the gate that failed on the leftover (`tsc`, TS2307) has nothing left
+      // to fail on.
+      expect(existsSync(CANARY_PATH)).toBe(false);
+      const offenders: string[] = [];
+      for (const file of listFiles(path.join(SRC_DIR, "plugins"))) {
+        for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+          if (isProviderSdkSpecifier(spec)) offenders.push(spec);
+        }
+      }
+      expect(offenders).toEqual([]);
+
+      // And `removeCanary` is idempotent, so the `finally` inside `withCanary`
+      // and any later run cannot throw ENOENT against a file that is already
+      // gone -- which would turn a self-healing fix into a different failure.
+      expect(() => {
+        removeCanary();
+        removeCanary();
+      }).not.toThrow();
     } finally {
-      unlinkSync(offender);
+      removeCanary();
+    }
+  });
+
+  it("writes a canary Prettier accepts, so a leftover cannot break format:check", () => {
+    // The canary's bytes are the whole finding: a leftover lives inside the
+    // Prettier-checked tree, so whatever these bytes are, they decide whether
+    // an interrupted run can also break `format:check`. This runs the REAL
+    // formatter over the REAL bytes rather than asserting a hand-maintained
+    // claim about what Prettier wants, which is how a wrong claim about this
+    // ended up committed twice in this file's history.
+    //
+    // Note on the measurement this guards: at base `00f7b0b` the leftover was
+    // in fact Prettier-clean, so this test passes at base too and is a
+    // regression guard, not a fix for a live break. It also cannot be the
+    // regression test for the pre-write delete -- that is the test above.
+    const specifier = `@${"octokit"}/rest`;
+    const prettier = path.join(REPO_ROOT, "node_modules", ".bin", "prettier");
+    try {
+      // A control first: an instrument that cannot detect the defect it is
+      // installed to detect proves nothing. Mis-indented bytes must be
+      // rejected, which is what makes the assertion below meaningful.
+      writeFileSync(
+        CANARY_PATH,
+        `import {client} from "${specifier}";\nexport const probe=client;\n`,
+      );
+      const control = spawnSync(prettier, ["--check", CANARY_PATH], {
+        encoding: "utf8",
+      });
+      expect(
+        control.stdout + control.stderr,
+        "the control must be REJECTED, or this test cannot fail",
+      ).toContain("Code style issues");
+
+      writeFileSync(CANARY_PATH, canarySource(specifier));
+      const result = spawnSync(prettier, ["--check", CANARY_PATH], {
+        encoding: "utf8",
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(result.stdout + result.stderr).not.toContain("Code style issues");
+    } finally {
+      removeCanary();
     }
   });
 

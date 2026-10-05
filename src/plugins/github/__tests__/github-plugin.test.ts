@@ -25,16 +25,23 @@ import {
   toJsonValue,
   toMetadata,
 } from "../github-plugin";
-import { GitHubPluginError, toSafePluginReason } from "../github-errors";
+import {
+  GitHubPluginError,
+  toSafePluginReason,
+  toSafePluginCode,
+} from "../github-errors";
 import {
   GITHUB_PLUGIN_ERROR_REASONS,
   GITHUB_PLUGIN_ERROR_CODES,
   reasonForStatus,
 } from "../github-errors";
+import type { GitHubPluginErrorCode } from "../github-errors";
 import type { NativeIssueItem } from "../native-item";
 import type { HttpTransport, TransportResponse } from "../transport";
 import {
   FIXTURE_REPOSITORY,
+  FIXTURE_TOKEN,
+  GITHUB_PROFILE,
   FakeHttpTransport,
   fullPage,
   pageBody,
@@ -52,7 +59,7 @@ function pluginWith(
   const transport = new FakeHttpTransport({ byPage });
   const plugin = new GitHubSourcePlugin({
     transport,
-    credentials: createFakeCredentialProvider(),
+    credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
     repository: FIXTURE_REPOSITORY,
     pageSize,
   });
@@ -330,12 +337,12 @@ describe("GitHubSourcePlugin.mapToCanonicalEvents", () => {
     const transport = new FakeHttpTransport({ byPage: {} });
     const here = new GitHubSourcePlugin({
       transport,
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
     const there = new GitHubSourcePlugin({
       transport,
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: "other/place",
     });
     const raw = [fixtureIssue() as unknown as NativeIssueItem];
@@ -460,7 +467,7 @@ describe("GitHubSourcePlugin error handling", () => {
       transport: rejectingTransport(
         new Error(`request failed for token ${secret}`),
       ),
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -711,7 +718,148 @@ describe("choke points: arbitrary input cannot become a canonical value", () => 
       "invalid_page_size",
       "malformed_response",
       "transport_failed",
+      // The collapse target for a code that is not a member. It is part of the
+      // closed set, not a hole in it: the set stays closed AND secret-free,
+      // and the fallback reports "we could not classify this" rather than
+      // borrowing a domain-specific reason it did not earn.
+      "unknown_code",
     ]);
+  });
+});
+
+describe("GitHubPluginError error-surface hardening", () => {
+  /**
+   * The probe strings below are token-SHAPED, not tokens.
+   *
+   * They are assembled from fragments so no credential-shaped literal is ever
+   * committed in full, and they are obviously synthetic: a real fine-grained
+   * PAT is `github_pat_` + 22 base62 characters of entropy, while the
+   * placeholder below spells out NOT_A_REAL_TOKEN in place of it.
+   */
+  const SYNTHETIC_SECRET = ["github", "pat", "SYNTHETIC", "PLACEHOLDER"].join(
+    "_",
+  );
+
+  it("refuses to put an off-list code into .code or .message", () => {
+    // The defect: `new GitHubPluginError(<caller text>, ...)` interpolated
+    // `code` into the message and assigned it to `.code` without any check, so
+    // the class doc's claim that the surface is "structural rather than a
+    // promise about how careful each call site is" was false of `code`.
+    // Unreachable from any of the nine production throw sites today; this test
+    // is what stops that from being the only thing holding the line.
+    const error = new GitHubPluginError(
+      SYNTHETIC_SECRET as unknown as GitHubPluginErrorCode,
+      { reason: GITHUB_PLUGIN_ERROR_REASONS.transportRejected },
+    );
+
+    expect(error.code).toBe("unknown_code");
+    expect(error.message).not.toContain(SYNTHETIC_SECRET);
+    // Not asserted: `not.toContain("github")`. The fixed template legitimately
+    // says "github source plugin failed", so a substring check on the probe's
+    // own prefix cannot distinguish a leak from the fixed text. The exact
+    // equality below is the assertion that can: it fails if ANY character of
+    // the caller's text survives into the message.
+    expect(error.message).toBe(
+      "[unknown_code] github source plugin failed: the HTTP transport rejected the request",
+    );
+    // Nothing anywhere on the object, own or serialised, carries it.
+    expect(JSON.stringify(error)).not.toContain(SYNTHETIC_SECRET);
+    expect(Object.values(error).join("|")).not.toContain(SYNTHETIC_SECRET);
+  });
+
+  it("collapses every off-list code, not just token-shaped text", () => {
+    // A guard that only catches the probe would be as useless as one that
+    // catches nothing, so the collapse is asserted over the whole off-list
+    // space the way `toSafePluginReason`'s own tests are.
+    for (const value of [
+      "",
+      " ",
+      "TRANSPORT_FAILED",
+      "not a code",
+      42,
+      null,
+      undefined,
+      {},
+      [],
+    ]) {
+      expect(toSafePluginCode(value)).toBe("unknown_code");
+    }
+  });
+
+  it("passes every member of the code set through byte for byte", () => {
+    // The negative control for the test above: if the collapse matched
+    // everything, `.code` would never be the real classification and the
+    // plugin's diagnostics would be worthless.
+    for (const code of GITHUB_PLUGIN_ERROR_CODES) {
+      expect(toSafePluginCode(code)).toBe(code);
+      const error = new GitHubPluginError(code, {
+        reason: GITHUB_PLUGIN_ERROR_REASONS.serverError,
+      });
+      expect(error.code).toBe(code);
+      expect(error.message).toContain(`[${code}]`);
+    }
+  });
+
+  it("keeps the code allowlist closed at runtime, not only in the types", () => {
+    // `as const` is erased at compile time. Measured on the pre-fix tree,
+    // `push("anything")` succeeded and every later membership check inherited
+    // the widened set -- so "closed set" was a claim about the checker, not
+    // about the program.
+    expect(Object.isFrozen(GITHUB_PLUGIN_ERROR_CODES)).toBe(true);
+    expect(() => {
+      (GITHUB_PLUGIN_ERROR_CODES as unknown as string[]).push("widened");
+    }).toThrow(TypeError);
+    expect([...GITHUB_PLUGIN_ERROR_CODES]).not.toContain("widened");
+    // Freezing the array also stops a member being replaced in place.
+    expect(() => {
+      Object.defineProperty(GITHUB_PLUGIN_ERROR_CODES, 0, { value: "x" });
+    }).toThrow(TypeError);
+    expect(GITHUB_PLUGIN_ERROR_CODES).toContain("transport_failed");
+  });
+
+  it("keeps the reason allowlist frozen so it cannot be widened from outside", () => {
+    // THE regression test for the second finding. Pre-fix, this assignment
+    // succeeded and a subsequently constructed error reported the
+    // attacker-supplied string as its own reason -- bypassing
+    // `toSafePluginReason` without ever calling it, which is exactly the
+    // "promise about how careful each call site is" the module disclaims.
+    expect(Object.isFrozen(GITHUB_PLUGIN_ERROR_REASONS)).toBe(true);
+    const original = GITHUB_PLUGIN_ERROR_REASONS.transportRejected;
+
+    expect(() => {
+      (
+        GITHUB_PLUGIN_ERROR_REASONS as unknown as Record<string, string>
+      ).transportRejected = SYNTHETIC_SECRET;
+    }).toThrow(TypeError);
+
+    // The value is genuinely unchanged, not merely the assignment refused.
+    expect(GITHUB_PLUGIN_ERROR_REASONS.transportRejected).toBe(original);
+    expect(GITHUB_PLUGIN_ERROR_REASONS.transportRejected).not.toContain(
+      "SYNTHETIC",
+    );
+
+    // And a fresh error still reports the real reason, not the generic one.
+    // Pre-fix this second assertion failed: the mutated member was no longer
+    // in `SAFE_REASON_SET`, so `toSafePluginReason` returned `unknownReason`
+    // and the plugin reported "an unspecified failure reason was supplied"
+    // for a transport rejection it could name exactly.
+    const error = new GitHubPluginError("transport_failed", {
+      reason: GITHUB_PLUGIN_ERROR_REASONS.transportRejected,
+    });
+    expect(error.reason).toBe(original);
+    expect(error.reason).not.toBe(GITHUB_PLUGIN_ERROR_REASONS.unknownReason);
+    expect(error.message).toContain(original);
+
+    // A NEW key must not be addable either, or the "closed set" claim would be
+    // satisfied only for existing members.
+    expect(() => {
+      (
+        GITHUB_PLUGIN_ERROR_REASONS as unknown as Record<string, string>
+      ).injected = SYNTHETIC_SECRET;
+    }).toThrow(TypeError);
+    expect(Object.values(GITHUB_PLUGIN_ERROR_REASONS)).not.toContain(
+      SYNTHETIC_SECRET,
+    );
   });
 });
 
@@ -770,7 +918,7 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
       transport: syncThrowingTransport(
         new Error(`boom with token ${SYNTHETIC_SECRET}`),
       ),
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -866,7 +1014,9 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
         () =>
           new GitHubSourcePlugin({
             transport: new FakeHttpTransport({ byPage: {} }),
-            credentials: createFakeCredentialProvider(),
+            credentials: createFakeCredentialProvider({
+              profile: GITHUB_PROFILE,
+            }),
             repository: FIXTURE_REPOSITORY,
             pageSize,
           }),
@@ -875,7 +1025,9 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
       try {
         new GitHubSourcePlugin({
           transport: new FakeHttpTransport({ byPage: {} }),
-          credentials: createFakeCredentialProvider(),
+          credentials: createFakeCredentialProvider({
+            profile: GITHUB_PROFILE,
+          }),
           repository: FIXTURE_REPOSITORY,
           pageSize,
         });
@@ -891,7 +1043,9 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
         () =>
           new GitHubSourcePlugin({
             transport: new FakeHttpTransport({ byPage: {} }),
-            credentials: createFakeCredentialProvider(),
+            credentials: createFakeCredentialProvider({
+              profile: GITHUB_PROFILE,
+            }),
             repository: FIXTURE_REPOSITORY,
             pageSize,
           }),
@@ -906,7 +1060,7 @@ describe("GitHubSourcePlugin: redaction and validation regress the QA P1 defects
     // happened.
     const plugin = new GitHubSourcePlugin({
       transport: new FakeHttpTransport({ byPage: {} }),
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -955,7 +1109,7 @@ describe("GitHubSourcePlugin: no network in tests", () => {
     });
     const plugin = new GitHubSourcePlugin({
       transport,
-      credentials: createFakeCredentialProvider(),
+      credentials: createFakeCredentialProvider({ profile: GITHUB_PROFILE }),
       repository: FIXTURE_REPOSITORY,
     });
 
@@ -964,5 +1118,19 @@ describe("GitHubSourcePlugin: no network in tests", () => {
 
     expect(events).toHaveLength(2);
     expect(events.map((e) => e.type)).toEqual(["issue", "change_proposal"]);
+  });
+});
+
+describe("fixture token tracks what core actually issues", () => {
+  it("issues exactly the token the fixture declares, with no separator", async () => {
+    // This is what makes FIXTURE_TOKEN an enforced invariant rather than an
+    // asserted one. The fixture has to name core's material and the way core
+    // joins it to the prefix, and neither is exported; so instead of trusting a
+    // comment, ask the real provider. If `fakes.ts` ever changes its material
+    // or its concatenation, THIS test fails — the constant can no longer
+    // quietly disagree with the provider.
+    const provider = createFakeCredentialProvider({ profile: GITHUB_PROFILE });
+
+    await expect(provider.getToken()).resolves.toBe(FIXTURE_TOKEN);
   });
 });

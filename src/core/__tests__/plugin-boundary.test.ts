@@ -67,18 +67,35 @@ const DENY_LIST: readonly DenyFamily[] = [
   },
 ] as const;
 
-/** Module specifiers `src/core/` may never reach for. */
+/**
+ * B19: deny-list matching is case-insensitive everywhere.
+ *
+ * Declared once so the token matcher, the typed-field-name matcher and the
+ * forbidden-import gate cannot drift apart on this axis: a guard that folds case
+ * in one place and not another is exactly the half-fixed hole B19 closed.
+ */
+const CASE_INSENSITIVE = "i";
+
+/**
+ * Module specifiers `src/core/` may never reach for.
+ *
+ * B19: the patterns that spell a provider in lowercase carry the
+ * case-insensitive flag for the same reason the deny tokens do. `@OCTOKIT/rest`
+ * or `require("Bitbucket")` would otherwise be a working import path that the
+ * guard cannot see. The path-shape patterns (`plugins/`, `node_modules/`) are
+ * provider-neutral and do not need it.
+ */
 const FORBIDDEN_IMPORT_PATTERNS: ReadonlyArray<{
   readonly family: string;
   readonly pattern: RegExp;
 }> = [
   { family: "plugin-boundary", pattern: /(^|["'`])\/?(src\/)?plugins\// },
   { family: "plugin-boundary", pattern: /@\/plugins\// },
-  { family: "provider-sdk", pattern: /@octokit\// },
+  { family: "provider-sdk", pattern: /@octokit\//i },
   { family: "provider-sdk", pattern: /(^|["'`/])node_modules\// },
-  { family: "provider-sdk", pattern: /(^|["'`/])@gitlab\// },
-  { family: "provider-sdk", pattern: /bitbucket/ },
-  { family: "provider-sdk", pattern: /azure-devops/ },
+  { family: "provider-sdk", pattern: /(^|["'`/])@gitlab\//i },
+  { family: "provider-sdk", pattern: /bitbucket/i },
+  { family: "provider-sdk", pattern: /azure-devops/i },
 ];
 
 // Module-load invariant: a deny-list that failed to load would make every case
@@ -129,26 +146,197 @@ export type Violation = {
  * `spr_`), and the leading boundary becomes "not preceded by an alphanumeric":
  * `_` and `.` are legitimate delimiters, so `expr_pr_foo` and `obj.pr_title`
  * are caught while `expr_`/`xmr_` stay clean.
+ *
+ * B19 ROOT CAUSE — there were TWO independent defects, and fixing only the
+ * first would have shipped a guard that still could not see the leak it was
+ * written for. Both are fixed here; both were measured, not assumed.
+ *
+ * (1) CASE. Every deny token is written in lowercase (`github`, `octokit`,
+ * `pr_`, `mr_`, ...) and the pattern carried no `i` flag, so `GITHUB_TOKEN`,
+ * `OCTOKIT` and `PR_TITLE` were all invisible. Matching is now
+ * case-insensitive.
+ *
+ * (2) BOUNDARY — the half that mattered most. The trailing `\b` on a
+ * word-terminated token is unsatisfiable in the middle of an identifier: in
+ * `GITHUB_TOKEN` the character after `GITHUB` is `_`, and `_` is a word
+ * character, so no boundary exists there. Case-folding ALONE still left
+ * `GITHUB_TOKEN`, `GitHubToken` and the real `GITHUB_TOKEN_PREFIX` export
+ * reporting ZERO violations — measured, not assumed. Provider vocabulary nearly
+ * always appears as a PREFIX of a longer constant (`GITHUB_TOKEN_PREFIX`,
+ * `GITHUB_TOKEN_ENV_VAR`), which is exactly the shape a hard `\b` cannot see.
+ *
+ * The trailing test is therefore NOT part of the pattern. It is
+ * {@link tokenEndsCleanly}, which decides in code because the decision needs to
+ * see the ACTUAL case of the next character, and the `i` flag destroys exactly
+ * that: under case-insensitive matching a negated class `[^a-z]` also excludes
+ * `A-Z`, so expressing "the next character is not a lowercase letter" as
+ * `[^a-z]` rejects the camelCase hump and silently re-opens the hole. That was
+ * attempted and measured here before being abandoned.
+ *
+ * This only ever ADDS detection; the lowercase spellings matched before and
+ * still do (see the "adds detection and removes none" control).
+
+ *
+ * B26 ROOT CAUSE: the trailing `\b` was the whole trailing rule, and a
+ * camelCase hump supplies no boundary -- `\bgithub\b` cannot match anywhere in
+ * `githubPullRequest`, `githubIssue` or `githubWebhookDelivery`, so the deny-list
+ * token was inert in exactly the shape real TypeScript uses. Measured at
+ * fa8f753: `export const githubPullRequest = "review";` under `src/core/`
+ * reported zero violations.
+ *
+ * The trailing rule is therefore now "the token is not continued by a LOWER
+ * case letter, digit or underscore" -- `(?![a-z0-9_])`. An uppercase letter
+ * after the token is a camelCase hump and is provider vocabulary continuing;
+ * a lowercase one is a longer word that merely starts the same way, so
+ * `repo` still does not fire on `repository` and `ado` still does not fire on
+ * `shadow`. The LEADING boundary is untouched, so a token that merely appears
+ * mid-word (`spr_`, `repr_`, `shadow`) stays clean either way.
+ *
+ * Separately, a deny-list token is written in snake_case
+ * (`pull_request`, `azure_devops`, `work_item`) while the identifiers TypeScript
+ * code actually uses are camelCase (`pullRequest`, `azureDevopsWorkItem`), so
+ * the body is built case-tolerantly and with the internal `_` optional:
+ * `pull_request` -> `[pP]ull[_]?[rR]equest`. That is a MATCHER change, not a
+ * deny-list change -- no token is added, removed or renamed, and the deny-list
+ * itself is out of scope for this card.
+ *
+ * Case tolerance is spelled as explicit `[cC]` classes, NOT the `i` flag: under
+ * `i` the trailing lookahead `(?![a-z0-9_])` would also accept an uppercase
+ * letter and would then reject `githubPullRequest` again. The two rules need
+ * OPPOSITE case sensitivity, so the body cannot carry the flag.
+ *
+ * Case tolerance applies to every character AFTER the first and never to the
+ * first one. The hump inside a token is where camelCase capitalises
+ * (`pullRequest`, `azureDevopsWorkItem`); the token's own first letter is
+ * lowercase in every camelCase shape, so tolerating case there buys nothing and
+ * costs a real false positive: prose writing "GitHub" with a capital G is
+ * everywhere in `src/core/credentials/**` (measured at fa8f753, 7 lines across
+ * env-provider.ts / fakes.ts / provider.ts), and capitalising the FIRST letter of
+ * the deny-list's first token turns every one of those comments into a
+ * violation.
+ *
+ * ---------------------------------------------------------------------------
+ * B27 RECONCILIATION (this card merges B19 `40138c2` and B26 `1228acc`, which
+ * are siblings off `fa8f753` and conflict in three hunks of this file).
+ *
+ * B26's block above is RETAINED IN FULL, verbatim, as the record of the root
+ * cause it found. Its finding is correct and is implemented here. Three of its
+ * DERIVED PRESCRIPTIONS are SUPERSEDED by the merge, are NOT implemented, and
+ * must not be re-derived from this comment by a later reader:
+ *
+ *   (S1) "Case tolerance is spelled as explicit `[cC]` classes, NOT the `i`
+ *        flag", and (S2) "Case tolerance applies to every character AFTER the
+ *        first and never to the first one."
+ *        Both are the same rule seen from two sides: keep the FIRST character of
+ *        a token case-SENSITIVE, and therefore never let the whole token fold.
+ *        That is irreconcilable with B19 criterion (i), which requires
+ *        `GITHUB_TOKEN`, `github_token` and `GitHubToken` all to fire. Under `i`
+ *        the deny token `github` IS `GitHub` IS `GITHUB`, so a rule that fires on
+ *        the standalone upper-case spelling necessarily fires on the prose
+ *        spelling; there is no intermediate spelling to carve out. Measured
+ *        here: conditioning the exception on a hump continuation does not rescue
+ *        it either, because the required probe `const OCTOKIT = 1;` has a SPACE
+ *        after the match, so the exception cannot engage. B19's `i` +
+ *        {@link tokenEndsCleanly} is kept; B26's `[cC]` helper `caseTolerant` is
+ *        consequently unused and removed, since `i` subsumes it.
+ *
+ *   (S3) The false positive those prescriptions existed to avoid -- prose
+ *        writing "GitHub" with a capital G in `src/core/credentials/**`. It no
+ *        longer exists on this tree, and it is B19 that removed it: B19 deleted
+ *        `GITHUB_TOKEN_PREFIX` and `GITHUB_TOKEN_ENV_VAR` from
+ *        `src/core/credentials/provider.ts` as the leak it was fixing, and with
+ *        them the vendor prose. Measured on the assembled tree of this card at
+ *        `origin/main` `1e62702` + `40138c2` + `1228acc`:
+ *          grep -rn 'GITHUB\|GitHub\|github' src/core --include=*.ts \
+ *            | grep -v 'core/__tests__/plugin-boundary'   -> 0 lines
+ *          grep -rn 'GITHUB_TOKEN_PREFIX' src e2e db docs \
+ *            | grep -v plugin-boundary                      -> 0 lines
+ *        So B26's premise was dissolved by the very sibling commit being merged
+ *        into it, and its "does NOT flag prose that merely capitalises" control
+ *        was dropped rather than satisfied. It is recorded as SUPERSEDED in the
+ *        test block too, not silently deleted.
+ *
+ * WHAT B26 CONTRIBUTED AND IS KEPT:
+ *   - the camelCase-hump trailing semantics (uppercase continuation is provider
+ *     vocabulary, lowercase is a longer unrelated word). B26 spelled this as
+ *     `(?![a-z0-9_])`; it is spelled {@link tokenEndsCleanly} here, which is
+ *     strictly WIDER -- it additionally admits `_` and digits, which is what
+ *     makes `GITHUB_TOKEN_PREFIX` fire. B19's spelling subsumes B26's; B26's
+ *     `lead` boundary is identical to B19's and is kept verbatim.
+ *   - the snake_case -> camelCase bridge: the internal `_` becomes optional, so
+ *     `pull_request` also matches `pullRequest`. The `[cC]` classes are not
+ *     needed for this, because the `i` flag already folds case -- only the
+ *     `[_]?` part of B26's body builder is load-bearing here, and it is.
+ *   - the leading-boundary discipline, which both sides agree on and which is
+ *     what keeps `shadow` (`ado`), `xgithuby` (`github`) and `spr_`/`repr_`
+ *     (`pr_`) clean. These are the negative controls this card's criteria name.
+
  */
 function tokenPattern(token: string): RegExp {
-  const escaped = escapeForRegExp(token);
+  const bare = escapeForRegExp(token);
   if (token.endsWith("_")) {
-    return new RegExp(`(?:^|[^A-Za-z0-9])${escaped}`);
+    return new RegExp(`(?:^|[^A-Za-z0-9])${bare}`, CASE_INSENSITIVE);
   }
+  const body = [...token]
+    .map((char) => {
+      // B27: `[_]?` is B26's snake_case -> camelCase bridge and is load-bearing
+      // under any case policy. The `[cC]` classes B26 paired it with are NOT,
+      // because the `i` flag already folds case -- see the B27 reconciliation in
+      // this header. Every character other than the optional `_` is taken
+      // literally and folded by the flag.
+      if (char === "_") return "[_]?";
+      return escapeForRegExp(char);
+    })
+    .join("");
   const lead = /[A-Za-z0-9]/.test(token[0] ?? "") ? "\\b" : "";
-  const trail = /[A-Za-z0-9_]/.test(token[token.length - 1] ?? "") ? "\\b" : "";
-  return new RegExp(`${lead}${escaped}${trail}`);
+  return new RegExp(`${lead}${body}`, CASE_INSENSITIVE);
+}
+
+/**
+ * Does the match that just ended sit at a legal END of a provider identifier?
+ *
+ * `matchLength` is the length of the text the pattern ACTUALLY matched, which
+ * is NOT `token.length`: B26's `[_]?` makes the internal underscore optional, so
+ * the deny-list token `azure_devops` (11 chars) matches the 10 characters of
+ * `azureDevops`. Reading the character after `token.length` would land one past
+ * the real end of the match and ask about the wrong character. Measured: with
+ * `token.length` here, `azureDevopsWorkItem` and `mergeRequestState` reported
+ * zero violations.
+ *
+ * A token embedded in the middle of a LOWERSPACED word is a different symbol
+ * (`xgithuby`, and `shadow` for `ado`), so a lowercase continuation is
+ * refused. Everything else is a real leak and is admitted:
+ *   - end of the line / identifier   -> `github`, `OCTOKIT`
+ *   - an underscore or delimiter     -> `GITHUB_TOKEN_PREFIX`
+ *   - a camelCase hump (uppercase)   -> `GitHubToken`, `githubPullRequest`
+ *
+ * This is also where B26's hump rule lives. B26 expressed it as the lookahead
+ * `(?![a-z0-9_])` and explained in its header why the `i` flag cannot carry it:
+ * under `i` a negated lowercase class also excludes `A-Z`. That reasoning is
+ * exactly why this decision is made in CODE, on the real character, instead of
+ * inside the pattern -- see the B27 reconciliation in the {@link tokenPattern}
+ * header for what was kept and what was superseded.
+ */
+function tokenEndsCleanly(
+  line: string,
+  matchIndex: number,
+  matchLength: number,
+): boolean {
+  const next = line[matchIndex + matchLength];
+  return next === undefined || next === "_" || !/[a-z]/.test(next);
 }
 
 function escapeForRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\/\-]/g, "\\$&");
 }
 
-/** A typed field position: `repo:`, `repo?:`, inside an interface / type / object type. */
+/**
+ * A typed field position: `repo:`, `repo?:`, inside an interface / type / object type.
+ */
 function fieldNamePattern(token: string): RegExp {
   return new RegExp(
     `(?:^|[{;,\\n])\\s*(?:readonly\\s+)?${escapeForRegExp(token)}\\s*\\??\\s*:`,
-    "m",
+    `m${CASE_INSENSITIVE}`,
   );
 }
 
@@ -158,13 +346,45 @@ const FIELD_NAME_PATTERNS = new Map<string, RegExp>(
   ),
 );
 
-const TOKEN_PATTERNS = DENY_LIST.flatMap((entry) =>
-  entry.tokens.map((token) => ({
-    family: entry.family,
-    token,
-    pattern: tokenPattern(token),
-  })),
-);
+const TOKEN_PATTERNS: ReadonlyMap<string, { family: string; pattern: RegExp }> =
+  new Map(
+    DENY_LIST.flatMap((entry) =>
+      entry.tokens.map(
+        (token) =>
+          [
+            token,
+            { family: entry.family, pattern: tokenPattern(token) },
+          ] as const,
+      ),
+    ),
+  );
+
+/**
+ * Does `line` contain `token` in a position that means "provider identifier"?
+ *
+ * Every candidate match is inspected, not just the first: `RegExp.test` stops at
+ * the first hit, which may be the illegal embedded one, so a line carrying both
+ * an embedded and a legal occurrence would otherwise be missed.
+ */
+function tokenMatches(line: string, token: string): boolean {
+  const entry = TOKEN_PATTERNS.get(token);
+  if (entry === undefined) return false;
+  if (!entry.pattern.test(line)) return false;
+  // `_`-terminated tokens already encode their trailing delimiter, and tokens
+  // ending in a non-word character have nothing to check after them.
+  if (!/[A-Za-z0-9]$/.test(token)) return true;
+  // `g` is required by matchAll, and dropping it would make the loop see only
+  // the first candidate — the exact case this re-checks.
+  const re = new RegExp(entry.pattern.source, `g${CASE_INSENSITIVE}`);
+  for (const m of line.matchAll(re)) {
+    if (m.index === undefined) continue;
+    // `m[0].length`, not `token.length`: B26's `[_]?` makes the matched span
+    // shorter than the deny-list token whenever the underscore was absent
+    // (`azure_devops` matching `azureDevops`). See {@link tokenEndsCleanly}.
+    if (tokenEndsCleanly(line, m.index, m[0].length)) return true;
+  }
+  return false;
+}
 
 /**
  * Strip `//` line comments ONLY, replacing each stripped character with a space
@@ -565,20 +785,20 @@ export function findViolations(source: string, file: string): Violation[] {
 
   lines.forEach((line, index) => {
     if (line.trim() === "") return;
-    for (const entry of TOKEN_PATTERNS) {
+    for (const [token, entry] of TOKEN_PATTERNS) {
       const deny = DENY_LIST.find(
-        (d) => d.family === entry.family && d.tokens.includes(entry.token),
+        (d) => d.family === entry.family && d.tokens.includes(token),
       );
       if (deny?.fieldNameOnly === true) {
-        const fieldPattern = FIELD_NAME_PATTERNS.get(entry.token);
+        const fieldPattern = FIELD_NAME_PATTERNS.get(token);
         if (fieldPattern && !fieldPattern.test(line)) continue;
       }
-      if (entry.pattern.test(line)) {
+      if (tokenMatches(line, token)) {
         violations.push({
           file,
           line: index + 1,
           family: entry.family,
-          token: entry.token,
+          token,
           source: lineAt(lines, index),
         });
       }
@@ -737,6 +957,153 @@ describe("plugin-boundary scanner (positive control)", () => {
     // And the unrelated `ado` / `shadow` protection is untouched.
     expect(scanOne("const shadow = 1;")).toEqual([]);
     expect(scanOne("const ado = 1;").map((v) => v.token)).toContain("ado");
+  });
+
+  it("catches a provider token at the START of a camelCase identifier", () => {
+    // B26. `\bgithub\b` cannot match anywhere inside `githubPullRequest` --
+    // camelCase supplies no word boundary after the token -- so the deny-list
+    // entry was inert in exactly the shape real TypeScript uses. Measured at
+    // fa8f753: all six of these reported zero violations.
+    for (const [snippet, family] of [
+      ["export const githubPullRequest = 1;", "github"],
+      ["export const githubIssue = 1;", "github"],
+      ["export const githubWebhookDelivery = 1;", "github"],
+      ["export const gitlabMergeRequest = 1;", "gitlab"],
+      ["export const bitbucketWorkspace = 1;", "bitbucket"],
+      ["export const azureDevopsWorkItem = 1;", "azure-devops"],
+    ] as const) {
+      expect(
+        scanOne(snippet).map((v) => v.family),
+        `expected family ${family} to fire on: ${snippet}`,
+      ).toContain(family);
+    }
+  });
+
+  it("catches a snake_case deny-list token written in camelCase", () => {
+    // The deny-list is written in snake_case and TypeScript is not, so the
+    // matcher has to bridge the gap without the deny-list changing. Asserted
+    // per token so a token that stops bridging is a named failure.
+    for (const [snippet, token] of [
+      ["export const pullRequest = 1;", "pull_request"],
+      ["export type S = { pullRequest: string };", "pull_request"],
+      ["export const mergeRequestState = 1;", "merge_request"],
+      ["export const workItemId = 1;", "work_item"],
+      ["export const issueNumber = 1;", "issue_number"],
+    ] as const) {
+      expect(
+        scanOne(snippet).map((v) => v.token),
+        `expected ${token} to fire on: ${snippet}`,
+      ).toContain(token);
+    }
+  });
+
+  it("keeps the trailing rule case-sensitive while the body is tolerant", () => {
+    // The body tolerates case (`pullRequest`) but the trailing lookahead must
+    // NOT: an uppercase letter is a camelCase hump continuing the provider
+    // vocabulary, a lowercase one is a longer unrelated word. So `repo` still
+    // does not fire on `repository` or `report`, and `ado` still does not fire on
+    // `shadow` -- now via a lookahead rather than the old trailing `\b`.
+    expect(scanOne("const repository = 1;").map((v) => v.token)).not.toContain(
+      "repo",
+    );
+    expect(scanOne("const report = 1;").map((v) => v.token)).not.toContain(
+      "repo",
+    );
+    expect(scanOne("const shadow = 1;")).toEqual([]);
+    expect(scanOne("const ado = 1;").map((v) => v.token)).toContain("ado");
+  });
+
+  it("SUPERSEDED (B27): prose capitalising a deny-list token IS a violation", () => {
+    // B26 asserted its four prose snippets stay CLEAN, and asserted that the
+    // guard must never case-tolerate a token's first character in order to keep
+    // them clean. B27 merged that with B19, which requires `GITHUB_TOKEN` and
+    // `GitHubToken` to fire. The two are the SAME MATCH -- under the `i` flag
+    // the deny token `github` IS `GitHub` IS `GITHUB` -- so no matcher can
+    // satisfy both.
+    //
+    // ONE measurement table, every row reproduced by running the real
+    // `findViolations` over the snippet at this head (B19 required these to
+    // FIRE; B26 required the first four to stay CLEAN):
+    //
+    //   "/**\n * Resolve the GitHub token.\n */\nexport const x = 1;"
+    //       -> github   (FIRES -- B26 required CLEAN, B19 requires FIRE)
+    //   'const s = "Reads the GitHub fine-grained PAT.";'
+    //       -> github   (FIRES -- same conflict)
+    //   "const GitHub = 1;"
+    //       -> github   (FIRES -- same conflict)
+    //   "// the GitHub plugin\nexport const y = 1;"
+    //       -> CLEAN    (B26's FOURTH snippet, and it is NOT part of the
+    //                    conflict at all: `//` line comments are stripped by
+    //                    this scanner's documented comment policy --
+    //                    `stripLineComments`, policy header lines 16-18 -- so
+    //                    it is clean under ANY case policy. Listed here so the
+    //                    row is not silently re-counted as a B26 silence.)
+    //   "const GitHubToken = 1;"
+    //       -> github   (FIRES -- B19 REQUIRED; asserted by this test)
+    //   "export const GITHUB_TOKEN = 1;"
+    //       -> github   (FIRES -- B19 REQUIRED; asserted elsewhere)
+    //   "const OCTOKIT = 1;"
+    //       -> octokit  (FIRES -- B19 REQUIRED; asserted elsewhere)
+    //
+    // So the FIRES rows are B19's REQUIRED detections and the prose rows among
+    // them are exactly B26's required silences. There is no spelling that
+    // separates them, and conditioning the exception on a hump continuation does
+    // not help either: `const OCTOKIT = 1;` has a SPACE after the match, so the
+    // exception can never engage there.
+    //
+    // B19's side is kept, because this card's ACCEPTANCE CRITERIA (i) names
+    // `GITHUB_TOKEN` / `github_token` / `GitHubToken` as required, and names the
+    // negative controls as `expr_` / `xmr_` / `spr_` / `repr_` / `shadow` --
+    // prose capitalisation is not among them.
+    //
+    // What makes this safe is the compensating control below: the false positive
+    // only ever existed against prose that is no longer on the tree. This test is
+    // therefore ARMED rather than merely commented -- it asserts the deliberate
+    // direction of the tradeoff, so if a later reader "fixes" the prose case by
+    // dropping the `i` flag, this goes red too.
+    for (const snippet of [
+      "/**\n * Resolve the GitHub token.\n */\nexport const x = 1;",
+      'const s = "Reads the GitHub fine-grained PAT.";',
+      "const GitHub = 1;",
+    ]) {
+      expect(
+        scanOne(snippet).map((v) => v.token),
+        `expected B19 case-blindness to fire on: ${snippet}`,
+      ).toContain("github");
+    }
+  });
+
+  it("has zero false positives on the real src/core tree (B27 compensating control)", () => {
+    // The whole reason B26's prose rule existed: case-blindness produces
+    // false positives against prose capitalising a vendor name. B27 keeps
+    // case-blindness, so this is the control that keeps it honest.
+    //
+    // The pressure is GONE because B19 -- the sibling commit merged into B26
+    // here -- deleted the vendor prose it was fixing: `GITHUB_TOKEN_PREFIX` and
+    // `GITHUB_TOKEN_ENV_VAR` are removed from `src/core/credentials/provider.ts`
+    // and the provider is now constructed from a `TokenProfile`. Measured on this
+    // assembled tree:
+    //   grep -rn 'GITHUB\\|GitHub\\|github' src/core --include=*.ts
+    //     | grep -v 'core/__tests__/plugin-boundary'   -> 0 lines
+    //
+    // So the guard is case-blind AND the real tree has nothing for it to be
+    // wrong about. If a future change reintroduces vendor prose into src/core,
+    // this reports the exact file:line instead of letting the guard silently
+    // start failing on the project's own code.
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) return walk(full);
+        if (!/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(e.name)) return [];
+        return full === THIS_FILE ? [] : [full];
+      });
+    const found = walk(CORE_DIR).flatMap((file) =>
+      findViolations(readFileSync(file, "utf8"), path.relative(CORE_DIR, file)),
+    );
+    expect(
+      found.map((v) => `${v.file}:${v.line} ${v.token}`),
+      "case-blindness must not produce a false positive on the real src/core tree",
+    ).toEqual([]);
   });
 
   it("catches generic source-control field names in a type literal", () => {
@@ -1170,5 +1537,143 @@ describe("plugin-boundary scanner (regex after a control paren, B18)", () => {
     expect(scanOne("if (x) f(); // pr_hidden")).toEqual([]);
     expect(scanOne("if (x) /[//]/; // pr_hidden")).toEqual([]);
     expect(scanOne("while (x) g(); // pr_hidden")).toEqual([]);
+  });
+});
+
+/**
+ * B19 regression: the guard was CASE-BLIND, and a second defect hid behind the
+ * first.
+ *
+ * Measured at `fa8f753` against this exact `findViolations`, by running the real
+ * export over probe inputs:
+ *
+ *   DETECTED :: const github = 1;
+ *   MISSED   :: export const GITHUB_TOKEN = 1;
+ *   MISSED   :: const GitHubToken = 1;
+ *   MISSED   :: const OCTOKIT = 1;
+ *   DETECTED :: const pr_title = 1;
+ *   MISSED   :: const PR_TITLE = 1;
+ *   MISSED   :: export const GITHUB_TOKEN_PREFIX = "github_pat_";
+ *   MISSED   :: import { X } from "OCTOKIT";
+ *
+ * Two independent causes, and fixing only the first is NOT sufficient (see
+ * {@link tokenPattern}): every deny token is lowercase, and the trailing `\b`
+ * was unsatisfiable inside a compound identifier.
+ *
+ * This block is the RED-THEN-GREEN control. Revert the `i` flag in
+ * {@link tokenPattern} and the first case fails; revert the trailing-boundary
+ * work in {@link tokenEndsCleanly} and the first case fails again. A guard
+ * change with no such proof is not accepted.
+ */
+describe("plugin-boundary scanner (case folding, B19)", () => {
+  const scanOne = (snippet: string) => findViolations(snippet, "fixture.ts");
+  const tokensOf = (snippet: string) => scanOne(snippet).map((v) => v.token);
+  const familiesOf = (snippet: string) => scanOne(snippet).map((v) => v.family);
+
+  /**
+   * One provider concept per row, across every way code gets named, each with
+   * the family it must report.
+   *
+   * The expected family is per-row rather than a blanket "github": the
+   * case-folding applies to the WHOLE deny-list, so a GitLab or Bitbucket
+   * spelling that folds into detection is the same fix working, and asserting
+   * `github` there would have failed on a correct scanner.
+   */
+  const SPELLINGS: ReadonlyArray<readonly [string, string, string]> = [
+    ["SCREAMING_CASE identifier", "export const GITHUB_TOKEN = 1;", "github"],
+    [
+      "SCREAMING_CASE compound (the shape of the real leak)",
+      'export const GITHUB_TOKEN_PREFIX = "github_pat_";',
+      "github",
+    ],
+    ["PascalCase identifier", "const GitHubToken = 1;", "github"],
+    ["SCREAMING_CASE, octokit", "const OCTOKIT = 1;", "github"],
+    [
+      "SCREAMING_CASE, underscore-suffixed family",
+      "const PR_TITLE = 1;",
+      "github",
+    ],
+    [
+      "SCREAMING_CASE import specifier",
+      'import { X } from "OCTOKIT";',
+      "github",
+    ],
+    ["SCREAMING_CASE, gitlab family", "const MERGE_REQUEST_ID = 1;", "gitlab"],
+    [
+      "SCREAMING_CASE, bitbucket family",
+      "const BITBUCKET_TOKEN = 1;",
+      "bitbucket",
+    ],
+  ];
+
+  it("catches every uppercase and camelCase spelling", () => {
+    for (const [label, snippet, family] of SPELLINGS) {
+      expect(
+        familiesOf(snippet),
+        `expected a ${family} violation for ${label}: ${snippet}`,
+      ).toContain(family);
+    }
+  });
+
+  it("adds detection and removes none: the lowercase spellings still fire", () => {
+    // The negative control for the whole change. Each of these was DETECTED
+    // before it and MUST still be detected after: a widening that dropped a
+    // lowercase match would be a regression dressed as a fix.
+    for (const snippet of ["const github = 1;", "const pr_title = 1;"]) {
+      expect(
+        familiesOf(snippet),
+        `lowercase control lost: ${snippet}`,
+      ).toContain("github");
+    }
+    // Named per family, so a family that stops being detected is attributable.
+    expect(tokensOf("const pr_title = 1;")).toContain("pr_");
+    expect(tokensOf("const a1_mr_b = 1;")).toContain("mr_");
+    expect(tokensOf("const octokit = 1;")).toContain("octokit");
+  });
+
+  it("still refuses a token embedded in the middle of a lowercase word", () => {
+    // The cost of the widened trailing boundary: `xgithuby` is a different
+    // symbol, and so is `shadow` for `ado`. Both must stay clean or the widening
+    // would fire on ordinary identifiers and make the guard unusable.
+    expect(scanOne("const xgithuby = 1;")).toEqual([]);
+    expect(scanOne("const shadow = 1;")).toEqual([]);
+    expect(scanOne("const repositoryx = 1;")).toEqual([]);
+    expect(scanOne("const expr_ = 1;")).toEqual([]);
+    expect(scanOne("const xmr_thing = 1;")).toEqual([]);
+  });
+
+  it("keeps the pre-existing look-alike controls clean", () => {
+    // B19 must not disturb the boundary rules B18/B20 established for the
+    // `_`-terminated families.
+    expect(scanOne("const spr_ = 1;")).toEqual([]);
+    expect(scanOne("const repr_ = 1;")).toEqual([]);
+  });
+
+  it("catches a forbidden SDK import spelled in any case", () => {
+    // The import half of the original hole: case-sensitive
+    // FORBIDDEN_IMPORT_PATTERNS meant `@OCTOKIT/rest` was a working import path
+    // the guard could not see.
+    for (const snippet of [
+      'import { X } from "@OCTOKIT/rest";',
+      'import { X } from "@octokit/rest";',
+      'const o = require("@OCTOKIT/rest");',
+    ]) {
+      expect(
+        familiesOf(snippet),
+        `expected provider-sdk for: ${snippet}`,
+      ).toContain("provider-sdk");
+    }
+  });
+
+  it("folds case for typed field names too, not just plain tokens", () => {
+    // The `fieldNameOnly` family (repo/repository/branch/commit_sha) goes
+    // through a SEPARATE matcher. A guard that folds case in one place and not
+    // the other is exactly the half-fixed hole, so this asserts both halves.
+    expect(tokensOf("type Meta = { REPOSITORY: string };")).toContain(
+      "repository",
+    );
+    expect(tokensOf("type Meta = { repository: string };")).toContain(
+      "repository",
+    );
   });
 });

@@ -8,6 +8,10 @@
  * `src/core/credentials/fakes.ts`.
  */
 
+import type { TokenProfile } from "@/core/credentials/provider";
+
+import { GITHUB_TOKEN_PROFILE } from "../token-profile";
+
 import type {
   HttpTransport,
   TransportRequest,
@@ -17,8 +21,47 @@ import type {
 /** The repository the fixtures describe. */
 export const FIXTURE_REPOSITORY = "acme/widgets";
 
-/** A synthetic, obviously-not-real credential. */
-export const FIXTURE_TOKEN = "github_pat_-not-a-real-fixture-token-1";
+/**
+ * The GitHub token profile, re-exported from the plugin's non-test module.
+ *
+ * B19 (`40138c2`) made `profile` a REQUIRED option on the fake credential
+ * provider and removed core's hard-coded GitHub prefix and env-var name, so
+ * every consumer must now state which provider's token shape it is validating
+ * against. The vendor half of that knowledge belongs to the plugin, so it is
+ * DECLARED once in `../token-profile` and re-exported here under this name:
+ * one declaration, and no way for the production call site's profile to drift
+ * away from the one these tests validate against.
+ *
+ * Re-exported rather than restated so the 6 `createFakeCredentialProvider`
+ * call sites in `github-plugin.test.ts` and the `FIXTURE_MATERIAL` equality
+ * assertion below keep their existing names and behaviour byte-identical.
+ *
+ * `envVar` is a NAME, never a value, and is never read here -- these tests
+ * construct no real credential and read no environment.
+ */
+export const GITHUB_PROFILE: TokenProfile = GITHUB_TOKEN_PROFILE;
+
+/**
+ * The synthetic material core appends to a profile's prefix.
+ *
+ * `FIXTURE_MATERIAL` in `src/core/credentials/fakes.ts` is NOT exported (core
+ * must not hand vendor knowledge to callers), so the fixture repeats the string
+ * and `github-plugin.test.ts` ENFORCES the equality by asking a live
+ * `FakeCredentialProvider` for its token. If core ever changes its material or
+ * its concatenation, that test goes red instead of this constant quietly
+ * disagreeing with what the provider actually issues.
+ */
+export const FIXTURE_MATERIAL = "not-a-real-fixture-token-1";
+
+/**
+ * The synthetic, obviously-not-real credential this plugin's tests expect the
+ * fake provider to issue: `GITHUB_PROFILE.prefix` and the material joined the
+ * way core joins them — no separator.
+ *
+ * Equality with the live provider's token is a test, not a comment; see
+ * {@link FIXTURE_MATERIAL}.
+ */
+export const FIXTURE_TOKEN = `${GITHUB_PROFILE.prefix}${FIXTURE_MATERIAL}`;
 
 /** One canned HTTP response, keyed by the `page` query parameter. */
 export interface FixtureResponse {
