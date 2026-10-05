@@ -250,7 +250,7 @@ export function authAdapterConfig(): DrizzleAdapterConfig {
  * `""` and Better Auth logged "Base URL is not set" and derived the origin from
  * the incoming request. An EMPTY value is the state the example file actually
  * produces, so it must be treated as unset here exactly as `requireAuthSecret`
- * already treats `BETTER_AUTH_SECRET=""` as unset in the same module — the
+ * already treats an empty `BETTER_AUTH_SECRET` as unset in the same module — the
  * asymmetry was the defect. `??` stays HERE, at the single point where the
  * default is applied, because the helper's whole job is to normalise "unset" to
  * `undefined` without inventing a value.
