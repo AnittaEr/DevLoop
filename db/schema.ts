@@ -12,6 +12,7 @@
 
 import { sql } from "drizzle-orm";
 import {
+  boolean,
   check,
   index,
   jsonb,
@@ -181,7 +182,151 @@ function quoteSqlLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Better Auth's four tables (T19).
+ *
+ * WHY THE PROPERTY NAMES ARE camelCase AND MUST STAY THAT WAY. The Drizzle
+ * adapter addresses this schema two ways, both keyed on the Drizzle PROPERTY
+ * name, never on the SQL column name:
+ *   - `getSchema(model)` looks up `config.schema[model]`, so the EXPORT name must
+ *     be `user` / `session` / `account` / `verification` (Better Auth's default
+ *     singular `modelName`s; `usePlural` is NOT used, see below).
+ *   - `convertWhereClause` / `getFieldName` index the table object with
+ *     `getDefaultFieldName(...)`, whose result is the Better Auth FIELD key
+ *     (`emailVerified`, `userId`, `createdAt`, ...) or whatever `fieldName` that
+ *     key maps to. Verified in 1.7.7 against
+ *     `getExpectedSchema({ emailAndPassword: { enabled: true } })`, which is also
+ *     what `diffSchema` compares this schema against at runtime: a property that
+ *     does not match a field key is reported as a missing column and every auth
+ *     request throws SchemaMismatchError.
+ *
+ * WHY THE SQL COLUMN NAMES ARE camelCase TOO, against this file's own convention.
+ * `app_meta` / `canonical_events` above map camelCase properties onto snake_case
+ * SQL, which is this repo's convention -- but those tables are ours, whereas these
+ * four are Better Auth's contract. Its CLI (`auth generate`) emits
+ * `emailVerified boolean`, so shipping snake_case SQL here would mean the next
+ * `auth generate`/`auth migrate` diffs every column for no reason. The card
+ * permits snake_case "only where the existing schema's convention requires it";
+ * here it does not, because nothing in DevLoop reads these tables by SQL name.
+ * They are quoted identifiers, so `"user"` and `"emailVerified"` are unambiguous
+ * even where `user` is a Postgres keyword.
+ *
+ * NEITHER `usePlural` NOR `schemaName` IS USED. `usePlural` would make the adapter
+ * look for `users`/`sessions`/... , so the exported singular names below are
+ * load-bearing. `schemaName` would put the tables in a Postgres namespace, which
+ * adds a `search_path` dependency to every statement for no v1 benefit (DevLoop is
+ * local-only, single database, D2).
+ *
+ * Every column here is INFRASTRUCTURE vocabulary and names no provider, so the
+ * db/ persistence boundary guard (`src/__tests__/db-schema-boundary.test.ts`)
+ * stays green; `providerId`/`accountId` on `account` are generic OAuth-provider
+ * slots owned by the auth library, and no provider is named or configured.
+ *
+ * NO EXISTING TABLE IS RENAMED OR REORDERED. `app_meta` and `canonical_events`
+ * keep their live `canonical_events_type_check` /
+ * `canonical_events_metadata_is_object_check` constraints untouched.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Auth user. DevLoop is a single local user (D2/D3), but the table is Better Auth's
+ * and is left general rather than narrowed to one row.
+ */
+export const user = pgTable("user", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  email: text("email").notNull().unique(),
+  emailVerified: boolean("emailVerified").notNull().default(false),
+  image: text("image"),
+  createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updatedAt", { withTimezone: true }).notNull(),
+});
+
+/** Auth session. `userId` cascades on delete, matching the adapter's expectation. */
+export const session = pgTable(
+  "session",
+  {
+    id: text("id").primaryKey(),
+    /** Opaque session token; unique so a token can never resolve to two rows. */
+    token: text("token").notNull().unique(),
+    expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+    createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).notNull(),
+    ipAddress: text("ipAddress"),
+    userAgent: text("userAgent"),
+    userId: text("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+  },
+  (table) => [
+    /** The adapter declares `userId` as an indexed field; mirror that. */
+    index("session_user_id_idx").on(table.userId),
+  ],
+);
+
+/**
+ * Auth account: one credential or OAuth-provider row per linked identity.
+ *
+ * `accountId` + `providerId` is unique because that pair IS the account's natural
+ * key -- it is how Better Auth finds the row to update on repeat sign-in, so a
+ * duplicate would let one identity hold two accounts.
+ */
+export const account = pgTable(
+  "account",
+  {
+    id: text("id").primaryKey(),
+    accountId: text("accountId").notNull(),
+    providerId: text("providerId").notNull(),
+    userId: text("userId")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    accessToken: text("accessToken"),
+    refreshToken: text("refreshToken"),
+    idToken: text("idToken"),
+    accessTokenExpiresAt: timestamp("accessTokenExpiresAt", {
+      withTimezone: true,
+    }),
+    refreshTokenExpiresAt: timestamp("refreshTokenExpiresAt", {
+      withTimezone: true,
+    }),
+    scope: text("scope"),
+    /** Scrypt password hash. Nullable: a social-only account has none. */
+    password: text("password"),
+    createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    unique("account_account_id_provider_id_key").on(
+      table.accountId,
+      table.providerId,
+    ),
+    index("account_user_id_idx").on(table.userId),
+  ],
+);
+
+/** Auth verification: email-verification and password-reset tokens. */
+export const verification = pgTable(
+  "verification",
+  {
+    id: text("id").primaryKey(),
+    /** The email (or other subject) the token was issued for. */
+    identifier: text("identifier").notNull(),
+    value: text("value").notNull(),
+    expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
+    createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updatedAt", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    /** The adapter declares `identifier` as an indexed field; mirror that. */
+    index("verification_identifier_idx").on(table.identifier),
+  ],
+);
+
 export type AppMetaRow = typeof appMeta.$inferSelect;
 export type NewAppMetaRow = typeof appMeta.$inferInsert;
 export type CanonicalEventRow = typeof canonicalEvents.$inferSelect;
 export type NewCanonicalEventRow = typeof canonicalEvents.$inferInsert;
+export type UserRow = typeof user.$inferSelect;
+export type NewUserRow = typeof user.$inferInsert;
+export type SessionRow = typeof session.$inferSelect;
+export type AccountRow = typeof account.$inferSelect;
+export type VerificationRow = typeof verification.$inferSelect;
