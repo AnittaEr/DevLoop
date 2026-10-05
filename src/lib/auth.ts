@@ -20,10 +20,18 @@
  * (`dist/context/create-context.mjs`). Its own rejection of that literal fires
  * ONLY under `NODE_ENV=production` — and v1 has no deployment (hard rule 7),
  * so the mode DevLoop actually runs in is the one where the library accepts the
- * public key. So `requireAuthSecret()` below is the refusal, and the route
- * handlers call it before Better Auth sees a request. It is deliberately not a
- * module-scope throw: `next build` and `bun run test` both import this module
- * with no `.env`.
+ * public key. So `requireAuthSecret()` below is the refusal, and EVERY production
+ * consumer of this instance calls it before Better Auth sees a request — the
+ * `[...all]` route handlers, and `getSession()` / `isSignedIn()` in
+ * `src/lib/auth-session.ts`. It is deliberately not a module-scope throw: `next
+ * build` and `bun run test` both import this module with no `.env`.
+ *
+ * BOTH CONSUMERS, NOT ONE. QA round 3 (D5) measured what a single call site left
+ * out: the module-scope instance below resolves to the published default with no
+ * `.env`, so a session cookie forged with that default key was accepted by the
+ * session helper — a live auth bypass that the route guard did not cover, because
+ * the route guard only covers `/api/auth/*`. The refusal is a property of the
+ * instance, so it belongs on every path that reads through it.
  *
  * `BETTER_AUTH_URL` is the base URL Better Auth derives cookie domain, redirects
  * and the `/api/auth/*` mount point from. It defaults to `http://localhost:3000`,
@@ -45,6 +53,8 @@
  * false in 1.7.7. Setting it explicitly means a future library default change
  * cannot silently start sending data out of a local-only app (D2, hard rule 7).
  */
+
+import { randomBytes } from "node:crypto";
 
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
@@ -300,17 +310,81 @@ export function createAuth(
 }
 
 /**
+ * The `secret` option for the shipped instance: DevLoop's real secret when one is
+ * configured, and a per-process RANDOM key when none is.
+ *
+ * WHY NOT SIMPLY LEAVE IT TO THE LIBRARY (QA round 3, D5). Better Auth resolves
+ * `options.secret || env.BETTER_AUTH_SECRET || env.AUTH_SECRET || ""` and, when
+ * all three are empty, falls back to the literal published in its own source
+ * (`create-context.mjs`, `DEFAULT_SECRET`). It rejects that literal only under
+ * `NODE_ENV=production`, the mode v1 never runs in (hard rule 7: no deployment).
+ * QA measured the consequence: a session cookie forged with the published default
+ * was ACCEPTED by this instance, and the route guard did not stop it — that guard
+ * covers `/api/auth/*` only, and `auth.api.getSession` is reachable directly.
+ *
+ * WHY A RANDOM KEY AND NOT A THROW. The obvious fix — a getter that throws — was
+ * implemented and measured, and it is wrong. `betterAuth` calls its context
+ * initialiser EAGERLY (`auth/base.mjs`: `const authContext = initFn(options)…`),
+ * so a getter that throws makes the memoised `$context` promise reject at IMPORT
+ * time. That produced two real faults, both measured in this repo's own suite:
+ * an unhandled rejection in every test run, and a permanently poisoned context —
+ * setting `BETTER_AUTH_SECRET` later could never repair it, so a correctly
+ * configured process still failed. A refusal that cannot be recovered from is not
+ * a refusal, it is a crash.
+ *
+ * A per-process random key has none of those properties and closes the same hole:
+ * the instance NEVER signs with the published default, so a cookie forged with
+ * that default cannot verify, whatever path it arrives by. The failure direction
+ * is the safe one — an unconfigured process can only ever read "signed out", and
+ * an unguessable key is not a credential.
+ *
+ * IT IS NOT A SUBSTITUTE FOR THE REFUSAL, ONLY A BACKSTOP. Both consumers still
+ * call `requireAuthSecret()` first and fail closed loudly, with a typed
+ * `AuthSecretMissingError`: the route answers a deliberate 503 and
+ * `getSession()` refuses rather than reporting a signed-out user. This value only
+ * decides what happens if some future caller reaches `auth.api.*` directly and
+ * skips both.
+ *
+ * GENERATED ONCE PER PROCESS AND HELD IN MEMORY ONLY — never written to a file, a
+ * log or an env file. Two processes therefore disagree on it, which is correct:
+ * a session from an unconfigured process must not be usable by another one.
+ */
+let ephemeralSecret: string | undefined;
+
+/** The throwaway key for this process when no secret is configured. */
+function unconfiguredEphemeralSecret(): string {
+  ephemeralSecret ??= `devloop-unconfigured-${randomBytes(32).toString("base64url")}`;
+  return ephemeralSecret;
+}
+
+/**
+ * The `secret` value handed to Better Auth for the shipped instance.
+ *
+ * Deliberately NOT a getter that throws — see the note above for why that poisons
+ * the eagerly-created context. A getter that RETURNS is safe: `initFn` reads it
+ * once, during construction.
+ */
+function authSecretOption(): string {
+  try {
+    return requireAuthSecret();
+  } catch {
+    return unconfiguredEphemeralSecret();
+  }
+}
+
+/**
  * The request-time auth instance used by the `[...all]` route and the session
  * helper.
  *
  * TWO THINGS ARE DELIBERATELY NOT PASSED HERE:
  *
- *   - `secret`. Better Auth resolves `options.secret || env.BETTER_AUTH_SECRET`
- *     itself (`create-context.mjs`), so the module-scope instance can leave it to
- *     the library and stay importable with no `.env`. The refusal that the
- *     library only applies under `NODE_ENV=production` is `requireAuthSecret()`,
- *     which the route calls at REQUEST time — see its note for why not module
- *     scope.
+ *   - a literal `secret`. It is passed as a GETTER (see `authSecretOption`)
+ *     rather than left to the library or read eagerly, so the refusal happens at
+ *     the instance boundary and cannot be bypassed by a consumer that calls
+ *     `auth.api.*` directly instead of going through DevLoop's helpers. See that
+ *     getter's own note; the route and `getSession()` additionally call
+ *     `requireAuthSecret()` up front so they can answer with a typed 503 rather
+ *     than propagate the throw.
  *
  *   - a resolved database. `getDb()` throws when `DATABASE_URL` is unset, and
  *     this module is imported by `next build` and by `bun run test`, neither of
@@ -319,5 +393,9 @@ export function createAuth(
  */
 export const auth = betterAuth({
   ...authBaseOptions(),
+  // A per-process random key when unconfigured, so the instance never signs with
+  // Better Auth's published default. See `authSecretOption`'s note — notably why
+  // this is a value and not a getter that throws.
+  secret: authSecretOption(),
   database: drizzleAdapter(lazyDrizzleClient(), authAdapterConfig()),
 });
