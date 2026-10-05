@@ -22,7 +22,8 @@ mode to configure.
 ## Requirements
 
 - bun 1.3.10 (see `packageManager` in `package.json`)
-- A local PostgreSQL server — `/sign-in`, `/evidence` and the sync API need it
+- A local PostgreSQL server — the sync API (`/api/sync`) and the database
+  suites need it
 
 ## Getting started
 
@@ -40,15 +41,17 @@ bun run dev            # http://localhost:3000
 cp .env.example .env
 ```
 
-Two variables must be set before `/sign-in` and `/evidence` work at all:
+Two variables must be set before the pieces that use them work at all:
 
 | Variable             | Required | Notes                                                           |
 | -------------------- | -------- | --------------------------------------------------------------- |
 | `DATABASE_URL`       | yes      | Local PostgreSQL connection string, e.g. the `.env.example` one |
 | `BETTER_AUTH_SECRET` | yes      | Generate with `openssl rand -base64 32`                         |
 
-If `BETTER_AUTH_SECRET` is unset, the auth route answers **503
-`auth_not_configured`** rather than failing open.
+`DATABASE_URL` is read by `db:migrate`, by drizzle-kit and by the runtime client
+behind `/api/sync`, so the sync API is dead until it is set. `BETTER_AUTH_SECRET`
+is read by `src/lib/auth.ts`: if it is unset, the `/api/auth/*` route answers
+**503 `auth_not_configured`** rather than failing open.
 
 `GITHUB_FINE_GRAINED_PAT` is optional: it is the credential the GitHub plugin
 reads when you sync from GitHub. Leave it empty and the plugin is simply not
@@ -99,6 +102,20 @@ bun run db:migrate && bun run test:db                 # db round trip job
 `bun run e2e` needs `bun run build` first (Playwright's web server runs
 `bun run start`, which serves `.next/`), and `bun run test:db` needs
 `bun run db:migrate` against a live database.
+
+Two `verify`-job steps this gate also does not run:
+
+```bash
+bun run audit                                            # Dependency advisories
+bun run db:generate && git diff --exit-code -- db/migrations   # migrations in sync
+```
+
+`bun run audit` reads the advisory feed and fails loudly when the feed is
+unreachable or unparseable, so it is a real red-capable gate, not a report.
+The second is `bun run db:generate` followed by a `git diff` over
+`db/migrations`: anything other than empty means `db/schema.ts` and the
+committed migrations disagree, and nothing else in this list can see that
+drift because it lives only in a generated `.sql` file.
 
 ## CI
 
@@ -153,11 +170,14 @@ Steps of `db`:
 | Apply migrations             | `bun run db:migrate`                 |
 | DB round-trip tests          | `bun run test:db`                    |
 
-**Local green is not CI green.** The gate above covers the `verify` job and
-parts of `e2e` (build only). It proves nothing about the Playwright run or the
-database round trip, so you can be locally green and red in CI. Run
-`bun run e2e` after `bun run e2e:install` and `bun run db:migrate && bun run
-test:db` before you call a change done.
+**Local green is not CI green.** The gate above covers five of `verify`'s
+substantive steps — format check, lint, typecheck, test, build — and parts of
+`e2e` (build only). It does not cover `bun run audit` or the
+`Database migrations in sync` drift check, and it proves nothing about the
+Playwright run or the database round trip, so you can be locally green and red
+in CI. Run `bun run audit` and `bun run db:generate && git diff --exit-code --
+db/migrations` alongside it, plus `bun run e2e` after `bun run e2e:install` and
+`bun run db:migrate && bun run test:db`, before you call a change done.
 
 Every job refuses to start if `bun.lock` is missing from the repository, and
 `--frozen-lockfile` makes it fail loudly on a stale lockfile rather than

@@ -36,7 +36,7 @@
  * adding one is out of scope for a documentation fix.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -320,6 +320,118 @@ describe("README CI section", () => {
     // And the true replacement must name the two runners it does not cover.
     expect(readme).toContain("bun run e2e");
     expect(readme).toContain("bun run test:db");
+  });
+
+  it("does not claim the local gate covers the whole verify job", () => {
+    // QA round 1 (t_db9d9455) found the first fix of the claim above had
+    // substituted one false equivalence for a narrower one: "the gate above
+    // covers the `verify` job" is false, because two of verify's substantive
+    // steps — `bun run audit` and the `Database migrations in sync` drift
+    // check — are not in the gate. Both are named as not covered, and both
+    // commands are documented, so a reader who runs only the gate still knows
+    // which two checks they skipped.
+    expect(readme).not.toMatch(/covers the `?verify`? job\b/i);
+    expect(readme).not.toMatch(/covers (the )?`?verify`? job and\b/i);
+    // The negative half of the claim, stated positively: the two uncovered
+    // `verify` steps and their commands must all be present.
+    const verification = readme.slice(readme.indexOf("\n## Verification\n"));
+    expect(verification).toMatch(/does not run/i);
+    expect(verification).toContain("bun run audit");
+    expect(verification).toContain("bun run db:generate");
+    expect(verification).toContain("db/migrations");
+  });
+});
+
+describe("README routes", () => {
+  it("names only routes this tree actually serves", () => {
+    // QA round 1 defect 1: the first version of this README documented
+    // `/sign-in` and `/evidence`, which do not exist at this commit — T20
+    // (b2f0056), which builds them, is UNINTEGRATED and not an ancestor of
+    // this head. A newcomer following that line got a Next.js 404 with the
+    // README having promised the page.
+    //
+    // Derived from the tree, not from a list in this file: every backticked
+    // token that looks like an app route must resolve to a `page.tsx` or a
+    // `route.ts` under `src/app`. `/api/auth/*` is a wildcard mount and is
+    // matched by its `[...all]` directory, which `routePaths()` normalises to
+    // `/api/auth/*`.
+    function routePaths(): string[] {
+      const appDir = path.join(REPO_ROOT, "src", "app");
+      const found: string[] = [];
+      const walk = (dir: string, prefix: string) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (entry.name.startsWith(".") || entry.name === "__tests__") {
+            continue;
+          }
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full, `${prefix}/${entry.name}`);
+          } else if (/^(page|route)\.tsx?$/.test(entry.name)) {
+            // A Next.js route group — `(marketing)` — is not part of the URL,
+            // and a catch-all segment `[...all]` is a wildcard mount.
+            const segments = prefix
+              .split("/")
+              .filter(
+                (segment) =>
+                  segment &&
+                  !/^\(.*\)$/.test(segment) &&
+                  !/^\[\.\.\./.test(segment),
+              );
+            const urlPath = `/${segments.join("/")}`.replace(/\/$/, "");
+            if (/\[\.\.\./.test(prefix)) found.push(`${urlPath}/*`);
+            else found.push(urlPath === "" ? "/" : urlPath);
+          }
+        }
+      };
+      walk(appDir, "");
+      return found.sort();
+    }
+
+    const actual = routePaths();
+    // Guard against the walk silently finding nothing, which would make every
+    // route assertion below vacuous.
+    expect(
+      actual.length,
+      "src/app must contain at least one route",
+    ).toBeGreaterThan(0);
+    expect(actual).toContain("/api/sync");
+
+    const documented = [...readme.matchAll(/`(\/[^`\n]+)`/g)].map((match) =>
+      (match[1] as string).trim(),
+    );
+
+    const phantom = documented.filter(
+      (route) =>
+        !actual.some(
+          (known) =>
+            route === known ||
+            // The README's `/api/auth/*` is the wildcard over `[...all]`.
+            (route.endsWith("/*") && known.endsWith("/*")) ||
+            route === "/",
+        ),
+    );
+
+    expect(
+      phantom,
+      phantom.length === 0
+        ? undefined
+        : [
+            "The README names routes that src/app does not serve at this",
+            "commit. Describe an unmerged route as arriving, never as present.",
+            ...phantom.map((route) => `  - ${route}`),
+          ].join("\n"),
+    ).toEqual([]);
+  });
+
+  it("names no sign-in or evidence page as a route of this tree", () => {
+    // The two specific routes QA named, asserted directly so the regression is
+    // legible in the failure output rather than only as a generic phantom.
+    for (const route of ["/sign-in", "/evidence"]) {
+      expect(
+        readme,
+        `README must not present ${route} as an existing route; T20 is unintegrated`,
+      ).not.toMatch(new RegExp(`\`${route}\``, "g"));
+    }
   });
 });
 
