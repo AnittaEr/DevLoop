@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# B51 pre-commit hook — scan the STAGED tree for credential-shaped strings.
+#
+# WHY A COMMIT-TIME LAYER EXISTS AT ALL, GIVEN CI ALREADY SCANS. The CI step
+# (`bun run secrets:scan` in the `verify` job) is the backstop: it scans the
+# committed tree on the PR. It is not the first line of defence, because a
+# credential that reaches `main` has already been published, and "fix it in a
+# follow-up commit" does not un-publish a token. Catching it before the commit
+# exists is the cheap layer; CI is the layer that holds when the cheap one was
+# bypassed with `git commit --no-verify`.
+#
+# WHY `core.hooksPath` AND NOT A PACKAGE SCRIPT (the tradeoff, stated plainly).
+# A `precommit`-style script wired into `package.json` and run by hand is
+# ADVISORY: it runs only when a developer remembers to run it, which means it
+# does not run. This hook is wired through `git config core.hooksPath
+# .githooks`, committed to the repository, so a fresh clone that has run
+# `git config core.hooksPath .githooks` (or any setup that does) picks it up
+# with no per-developer setup step beyond that one line.
+#
+# THE RESIDUAL HONEST LIMITATION. `core.hooksPath` is set in `.git/config`,
+# which is LOCAL to a clone and is NOT pushed with the repository. A hook
+# cannot be enforced by a file it lives in. So the hook is the cheap first layer
+# and CI remains the layer that is actually guaranteed to run for every commit —
+# see `.github/workflows/ci.yml`. Treat a green local commit with no local hook
+# as meaning "CI will catch it", not "this commit is clean". The `## Credential
+# scanning` section of `docs/testing.md` (the "Enabling the commit-time layer"
+# subsection) documents the one-line enablement; the `secrets:hook:install`
+# script below does it for you.
+#
+# WHAT IT SCANS. Only the files staged for THIS commit (via
+# `git diff --cached --name-only`), using the same rules and the same baseline as
+# the CI gate, so a commit blocked here is blocked for the same reason CI would
+# block it. It deliberately does not scan the whole tree: the whole tree is
+# CI's job, and a slow commit-time hook gets bypassed with `--no-verify`.
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if ! command -v bun >/dev/null 2>&1; then
+  # Not installed: do not block the commit, and say why. A hook that hard-fails
+  # every commit on a machine without bun trains everyone to pass --no-verify,
+  # which disables the layer for the credential case too.
+  echo "pre-commit: bun not found; skipping the credential scan." >&2
+  echo "pre-commit: install bun (https://bun.sh) to enable this check, or rely" >&2
+  echo "pre-commit: on the CI gate, which always runs." >&2
+  exit 0
+fi
+
+staged="$(git diff --cached --name-only --diff-filter=ACM)"
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+echo "pre-commit: scanning staged files for credential-shaped strings…"
+# `--staged` is passed so the scan covers exactly the staged set. Findings are
+# checked against the committed baseline; an unbaselined one fails the commit.
+# No bypass flag is exposed: the only way past this hook is --no-verify, and
+# that is a decision CI will still catch.
+output="$(bun run ./scripts/scan-secrets.ts --staged 2>&1)" && status=0 || status=$?
+
+if [ "$status" -ne 0 ]; then
+  echo "$output" >&2
+  echo "" >&2
+  echo "pre-commit: REFUSING the commit — a staged file holds a credential-shaped" >&2
+  echo "pre-commit: string that is not in security/secret-scan-baseline.txt." >&2
+  echo "" >&2
+  echo "pre-commit: If it is a real credential: unstage it (git restore --staged" >&2
+  echo "pre-commit: <file>), remove it, and ROTATE it — removing it from the" >&2
+  echo "pre-commit: working tree does not un-publish anything already pushed." >&2
+  echo "pre-commit: If it is a test fixture: reword the literal, or accept it" >&2
+  echo "pre-commit: deliberately with bun run secrets:scan:baseline and a reason." >&2
+  echo "pre-commit:" >&2
+  echo "pre-commit: --no-verify skips this hook but NOT the CI gate." >&2
+  exit "$status"
+fi
+
+exit 0

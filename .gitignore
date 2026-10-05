@@ -24,9 +24,26 @@ playwright-report/
 .playwright/
 
 # env
-.env
-.env.local
-.env.*.local
+#
+# The whole env-file FAMILY, not three shapes of it. Measured at c6de1d7:
+# `.env`, `.env.local` and `.env.*.local` were ignored while `.env.production`
+# and `.env.staging` were NOT — so the two names a deploy-shaped file is most
+# likely to take were exactly the two that staged silently, with no warning:
+#
+#   $ printf 'GITHUB_FINE_GRAINED_PAT=github_pat_…\n' > .env.production
+#   $ git add --dry-run .env.production   ->  add '.env.production'
+#
+# `.env*` covers .env, .env.local, .env.production, .env.staging,
+# .env.development.local and .env.production.local. `.env.example` is RE-
+# ADDED below: it is the file that documents GITHUB_FINE_GRAINED_PAT for the
+# operator, and it must never hold a real value, so it stays tracked as the
+# example and is policed for emptiness by `bun run secrets:scan`.
+.env*
+!.env.example
+!.env*.example
+
+# local key material, in case an operator writes one next to the app
+*.key
 
 # typescript
 *.tsbuildinfo

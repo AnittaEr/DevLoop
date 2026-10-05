@@ -4,15 +4,50 @@ Three independent runners. None replaces the others.
 
 ## Commands
 
-| Command               | What it runs                                                                           |
-| --------------------- | -------------------------------------------------------------------------------------- |
-| `bun run test`        | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
-| `bun run test:db`     | Vitest — the DB round-trip suite. Needs a real Postgres (see below).                   |
-| `bun run lint`        | ESLint over the repo.                                                                  |
-| `bun run typecheck`   | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
-| `bun run build`       | `next build` — production build.                                                       |
-| `bun run e2e`         | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
-| `bun run e2e:install` | One-time: downloads the Chromium build Playwright needs.                               |
+| Command                | What it runs                                                                           |
+| ---------------------- | -------------------------------------------------------------------------------------- |
+| `bun run test`         | Vitest — jsdom unit and component tests under `src/**`, plus `e2e/support/__tests__/`. |
+| `bun run test:db`      | Vitest — the DB round-trip suite. Needs a real Postgres (see below).                   |
+| `bun run lint`         | ESLint over the repo.                                                                  |
+| `bun run typecheck`    | `tsc --noEmit` (includes `e2e/` and `playwright.config.ts`).                           |
+| `bun run build`        | `next build` — production build.                                                       |
+| `bun run e2e`          | Playwright end-to-end specs in `e2e/` against a real Chromium.                         |
+| `bun run e2e:install`  | One-time: downloads the Chromium build Playwright needs.                               |
+| `bun run secrets:scan` | Scans the tracked tree for credential-shaped strings; fails on anything not baselined. |
+
+## Credential scanning
+
+`bun run secrets:scan` fails if a tracked file holds a credential-shaped string
+that is not listed in `security/secret-scan-baseline.txt`. It runs in the `verify`
+CI job, before the other gates, so a leaked credential is the first thing a red
+run reports.
+
+The rule is a **shape and entropy** rule, not a vendor-prefix substring match: a
+vendor prefix followed by a contiguous run of ≥ 20 base62 characters whose
+Shannon entropy is ≥ 3.5 bits/character. That distinction is what lets this
+repository keep its own deliberately credential-_shaped_ test fixtures without
+the gate being red on arrival — and a gate that is red on arrival is a gate that
+gets ignored. See `scripts/secret-scan.ts` for the rules and
+`scripts/__tests__/secret-scan.test.ts` for the tests that pin them.
+
+Three commands, all safe to run locally:
+
+```bash
+bun run secrets:scan             # verify; exits 1 on any unbaselined finding
+bun run secrets:scan:baseline    # rewrite the baseline's entries (still needs reasons)
+bun run secrets:hook:install     # enable the pre-commit hook in this clone
+```
+
+Every baseline entry carries a **per-entry reason** saying why the finding is not
+a credential, and an entry without one is fatal rather than ignored: a bare
+fingerprint is a silent blanket waiver wearing the costume of a reviewed entry.
+
+The `pre-commit` hook (`.githooks/pre-commit`) is the cheap first layer that
+catches a credential before it becomes a commit. It is enabled per clone by
+`git config core.hooksPath .githooks` — a **local** setting that is not pushed, so
+a fresh clone has no hook until `bun run secrets:hook:install` is run there. CI
+is therefore the layer that is actually guaranteed to run on every push, and it
+does not depend on the hook having been installed.
 
 ## Database round-trip tests
 
@@ -102,9 +137,11 @@ yet.
 
 CI has **three jobs**, all defined in `.github/workflows/ci.yml`:
 
-- `verify` — `bun install --frozen-lockfile`, `bun run format:check`,
-  `bun run lint`, `bun run typecheck`, `bun run test`, the migration-drift
-  check, `bun run build`.
+- `verify` — `bun install --frozen-lockfile`, `bun run secrets:scan`,
+  `bun run format:check`, `bun run lint`, `bun run typecheck`,
+  `bun run test`, the migration-drift check, `bun run build`. The credential
+  scan runs FIRST among the gates, so a leaked credential is reported as itself
+  rather than buried behind a later failure.
 - `e2e` — verifies the lockfile, installs dependencies, runs `bun run build`,
   then installs Chromium, then runs `bun run e2e`. The build must precede the
   e2e steps (see the ordering note in `ci.yml`).
