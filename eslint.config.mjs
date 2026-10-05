@@ -157,50 +157,39 @@ const eslintConfig = [
   {
     // R145: an assertion to a JSON type on a jsonb-bound value erases the only
     // check that the value is JSON-safe, and `tsc` does not notice — measured on
-    // this tree, not assumed: dropping ` as JsonObject` from
-    // `db/canonical-event-mapper.ts:39` leaves `bun run typecheck` at exit 0,
-    // and so does replacing the value with `"nonsense" as unknown as
-    // JsonObject`. See `eslint-plugin-no-json-assert.mjs` for why this is an
-    // AST rule rather than a text search, and why the read-path cast on line 63
-    // is deliberately NOT denied (`{}` is not assignable to `JsonObject`, so
-    // `tsc` already refuses to remove it).
+    // this tree, not assumed: dropping ` as JsonObject` from the write path of
+    // `db/canonical-event-mapper.ts` leaves `bun run typecheck` at exit 0, and
+    // so does replacing the value with `"nonsense" as unknown as JsonObject`.
+    // See `eslint-plugin-no-json-assert.mjs` for why this is an AST rule rather
+    // than a text search, and why the read-path cast is deliberately NOT denied
+    // (`{}` is not assignable to `JsonObject`, so `tsc` already refuses to
+    // remove it).
     //
-    // PRE-EXISTING VIOLATIONS AT THE BASE `e780063`, measured with
+    // THE ALLOWLIST IS EMPTY, and that is the strongest statement this rule can
+    // make. It was not empty at first: the base `e780063` carried two
+    // occurrences, measured with
     //   grep -rnE "as (JsonObject|Json|JsonValue|PgJsonb)\b" db src e2e \
     //     --include='*.ts' --include='*.tsx'
-    // which returned exactly two hits, both in `db/canonical-event-mapper.ts`
-    // and BOTH PRE-EXISTING this rule. Per the ticket they are NOT silently
-    // fixed — the mapper is DO NOT TOUCH because batch 12 (PR #13) owns it — so
-    // each is allowlisted individually below, by file:line.
+    // — `db/canonical-event-mapper.ts:39` (WRITE path, the R145 defect itself,
+    // an assertion nothing checks) and `db/canonical-event-mapper.ts:63` (READ
+    // path, redundant rather than unchecked; the rule never reports it). Both
+    // were allowlisted by file:line pending batch 12, which owned the mapper.
     //
-    // `db/canonical-event-mapper.ts:39` — the WRITE path. This is the R145
-    // defect itself: `structuredClone(event.metadata) as JsonObject` is an
-    // assertion nothing checks. Allowlisted only because the file is owned by
-    // an in-flight integration; removing the cast there is a one-line change
-    // that this card must not make.
+    // That allowlist was line-pinned, and batch 12 then moved the write-path cast
+    // from line 39 to line 135 and dropped the read-path cast entirely — so both
+    // entries went stale and lint reported 3 errors on the integrated head. The
+    // cast has now been removed by narrowing the value (no replacement cast),
+    // both entries are deleted, and `allow` is `[]`.
     //
-    // `db/canonical-event-mapper.ts:63` — the READ path. Genuinely redundant
-    // rather than unchecked: tsc already rejects its removal (TS2322). The rule
-    // does not fire on it at all (see the plugin module), so this entry exists
-    // only to keep the allowlist honest about both lines the base carries.
-    //
-    // `unusedAllowlistEntries` is deliberately NOT enabled. It would flag any
-    // entry that matches nothing, but the line-63 entry cannot ever be "used"
-    // (the rule never reports it), so enabling it would fail lint permanently
-    // over a permanently-unmatched entry. Stale entries are handled by the
-    // rule's own `staleAllowlistEntry` message instead.
+    // Do NOT add an entry here to silence a violation: that is the exact shape of
+    // defect this rule exists to catch. Narrow the value at the boundary instead.
+    // `unusedAllowlistEntries` is NOT enabled; stale entries are reported by the
+    // rule's own `staleAllowlistEntry` message, which is what caught the two
+    // above on the integrated head.
     files: ["db/**/*.{ts,tsx}", "src/**/*.{ts,tsx}"],
     plugins: { "no-json-assert": noJsonAssertPlugin },
     rules: {
-      [JSON_ASSERT_RULE_ID]: [
-        "error",
-        {
-          allow: [
-            "db/canonical-event-mapper.ts:39",
-            "db/canonical-event-mapper.ts:63",
-          ],
-        },
-      ],
+      [JSON_ASSERT_RULE_ID]: ["error", { allow: [] }],
     },
   },
 ];

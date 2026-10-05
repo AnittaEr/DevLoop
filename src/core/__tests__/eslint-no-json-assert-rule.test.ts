@@ -50,7 +50,7 @@
  * and start flagging, say, `e2e/**` fixtures.
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Linter } from "eslint";
@@ -76,6 +76,45 @@ const ROOT = path.resolve(
 );
 
 const linter = new Linter();
+
+/**
+ * The denied shape as a text pattern, built from the PLUGIN'S OWN exported set
+ * rather than hardcoded here.
+ *
+ * A second copy of the type list in a test is a list that can drift: the rule
+ * could gain `PgJsonb` and this scan would keep checking for four names. Derived,
+ * it cannot. This pattern is for the two tests that assert a CLAIM ABOUT THE
+ * TREE (a count over files), not for deciding what the rule reports — that is
+ * decided by the AST visitor, which is why `bun run lint` passes over this file
+ * even though the pattern below matches its own docstrings.
+ */
+const DENIED_SHAPE = new RegExp(
+  `as (?:${[...DENIED_TYPE_NAMES].join("|")})\\b`,
+);
+
+/**
+ * Every `.ts`/`.tsx` file under `ROOT/<relative>`, recursively.
+ *
+ * Used to re-assert the rule's scope claim over the WHOLE tree rather than one
+ * named file, so the empty allowlist is a codebase-wide statement. `node_modules`
+ * is skipped: a dependency's source is not this repo's assertion and linters do
+ * not gate on it.
+ */
+function walk(root: string, relative: string): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(path.join(root, relative), {
+    withFileTypes: true,
+  })) {
+    if (entry.name === "node_modules") continue;
+    const child = path.join(relative, entry.name);
+    if (entry.isDirectory()) {
+      found.push(...walk(root, child));
+    } else {
+      found.push(path.join(root, child));
+    }
+  }
+  return found;
+}
 
 /**
  * The TypeScript parser, which this rule cannot work without.
@@ -376,17 +415,25 @@ describe("no-json-assert: it is REGISTERED in eslint.config.mjs (the R1a defence
     }
   });
 
-  it("carries the two base occurrences as explicit, individually-named entries", () => {
-    // The ticket forbids silently fixing pre-existing violations and requires
-    // each to be named. If a future author deletes the allowlist to "clean up",
-    // this fails and names what must be re-justified rather than re-added blind.
+  it("carries an EMPTY allowlist", () => {
+    // c5, applied at the integrated head bd15b73: the write-path cast was
+    // removed by narrowing the value, so `allow` is `[]`. This asserts the
+    // STRONGEST state, which is the point of c5: an allowlist entry is a hole
+    // in this rule, and a future author adding one to silence a violation is
+    // re-introducing the exact defect R145 describes. So a non-empty allowlist
+    // is now a test failure naming what must be justified in eslint.config.mjs,
+    // not a silent pass.
     const config = eslintConfig as unknown as Linter.Config[];
     const scoped = config.filter((entry) => entry.plugins?.["no-json-assert"]);
     const entry = scoped[0]?.rules?.[RULE_ID] as unknown as
       | ["error", { allow: string[] }]
       | undefined;
     expect(entry?.[0]).toBe("error");
-    expect(entry?.[1]?.allow).toContain("db/canonical-event-mapper.ts:39");
+    expect(
+      entry?.[1]?.allow,
+      "the no-json-assert allowlist must stay empty; narrow the value at the " +
+        "boundary instead of asserting it (see eslint.config.mjs)",
+    ).toEqual([]);
   });
 
   it("is a real plugin module, not an empty stub", () => {
@@ -398,21 +445,57 @@ describe("no-json-assert: it is REGISTERED in eslint.config.mjs (the R1a defence
 });
 
 describe("no-json-assert: the scope it claims matches what it does", () => {
-  it("db/canonical-event-mapper.ts is the only file in the repo with the denied shape", () => {
-    // A pure assertion about the tree, kept honest at the base: if a third
-    // occurrence appears anywhere, the allowlist above is incomplete and lint
-    // would be red — which is the intended outcome, asserted here so it is
-    // diagnosed as "a new cast appeared" rather than "lint broke".
+  it("db/canonical-event-mapper.ts has NO occurrence of the denied shape", () => {
+    // The property c5 exists to make true: zero assertions to a JSON type in
+    // the one file that carried them. Asserted here so that re-introducing one
+    // fails as "the cast came back" rather than as "lint broke", and so the
+    // `allow: []` assertion above cannot be weakened without this going too.
     const source = readFileSync(
       path.join(ROOT, "db", "canonical-event-mapper.ts"),
       "utf8",
     );
-    const occurrences = source.match(
-      /as (?:JsonObject|Json|JsonValue|PgJsonb)\b/g,
-    );
-    // Two: the write path (unguarded by tsc, the R145 subject) and the read
-    // path (already guarded by tsc). Both are allowlisted with that reasoning
-    // recorded in eslint.config.mjs.
-    expect(occurrences).toHaveLength(2);
+    // `?? []` because `String.match` returns null on no match, and a null here
+    // would fail `toHaveLength` with "Target cannot be null or undefined" rather
+    // than the message naming the property.
+    const occurrences =
+      source.match(new RegExp(DENIED_SHAPE.source, "g")) ?? [];
+    // Zero, at the integrated head. The base `e780063` carried two: the write
+    // path (unguarded by tsc — the R145 subject, removed by c5) and the read
+    // path (already guarded by tsc, removed by batch 12).
+    expect(
+      occurrences,
+      "db/canonical-event-mapper.ts has re-acquired an assertion to a JSON type",
+    ).toHaveLength(0);
+  });
+
+  it("no file in db/ or src/ has an occurrence of the denied shape", () => {
+    // c2's measurement, re-asserted as an invariant rather than reported once:
+    // the count is 0 across both trees the rule covers, so the empty allowlist
+    // is a statement about the whole codebase and not just about the mapper.
+    //
+    // THIS FILE IS EXEMPTED, and the exemption is the point rather than a
+    // workaround: it names `as JsonObject` in its own docstrings and regexes, so
+    // a text scan necessarily hits itself. That self-hit is also why the shipped
+    // rule is an AST rule — `bun run lint` passes over this very file with
+    // `allow: []` precisely because string literals and comments are not
+    // assertions. Skipping it here keeps this test's text scan aligned with what
+    // the rule actually enforces instead of contradicting it.
+    const SELF = path.relative(ROOT, fileURLToPath(import.meta.url));
+    const hits: string[] = [];
+    for (const root of ["db", "src"]) {
+      for (const file of walk(ROOT, root)) {
+        if (!/\.tsx?$/.test(file)) continue;
+        const relative = path.relative(ROOT, file);
+        if (relative === SELF) continue;
+        const text = readFileSync(file, "utf8");
+        if (DENIED_SHAPE.test(text)) {
+          hits.push(relative);
+        }
+      }
+    }
+    expect(
+      hits,
+      `assertions to a JSON type exist outside the allowlist: ${hits.join(", ")}`,
+    ).toEqual([]);
   });
 });
