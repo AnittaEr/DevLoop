@@ -357,3 +357,38 @@ tracked set must exceed 20 files, the unit config must contribute at least 10,
 the db config at least 1, and Playwright at least 1. So deleting a whole
 `include:` array turns the guard **red** instead of quietly shrinking the
 difference to nothing.
+
+## Load-bearing tests carry a MEASURED per-test timeout
+
+`vitest.config.ts` sets **no** `testTimeout`, so every test inherits Vitest's
+built-in `5000ms`. That default is deliberate and stays: it is what makes the
+~500 in-process tests honest about a regression that made an ordinary assertion
+slow. **Do not raise it.** A global raise spends a bigger budget on every test
+to serve the handful that do real I/O, and lets a genuine hang sit unnoticed for
+the new number.
+
+A test that spawns a subprocess, or rebuilds a module graph per case, has a
+duration that is a property of the **machine**, not of the code. Under
+full-suite load those tests exceeded 5s and failed with
+`Error: Test timed out in 5000ms` — a red that does not mean a red assertion.
+The budgets live in `src/core/testing/load-bearing-test-timeout.ts` and are
+attached per test as `{ timeout: LOAD_BEARING_TEST_TIMEOUT.<key> }`:
+
+| budget         | for                                               | worst measurement it is sized from                 |
+| -------------- | ------------------------------------------------- | -------------------------------------------------- |
+| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites (`secret-scan.test.ts`) |
+| `subprocessX4` | a subprocess test measured **above** `subprocess` | 37.8s, 4 concurrent suites (the Prettier canary)   |
+| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 21.4s, 4 concurrent suites (`route-auth.test.ts`)  |
+
+The rule for a new budget is stated in that file: take the worst duration you
+have **measured** for that test under the worst load you can actually produce,
+and multiply by 4 — sized against the single-suite figure where one exists, so
+a genuinely hung subprocess still fails.
+
+`src/__tests__/load-bearing-test-timeouts.test.ts` enforces this. It reads test
+sources as **text** (importing them would drag a module graph into the runner),
+resolves **file-level helpers** so a marker in a helper the test only _calls_ is
+still attributed to that test, and fails when a load-scaled test names no
+budget. Its coverage claim is itself under test: the guard's first version was
+blind to helper-delegated work and green on the exact defect it existed to catch,
+so a synthetic fixture now pins that behaviour.
