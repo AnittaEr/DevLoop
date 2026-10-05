@@ -40,6 +40,7 @@
 
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -316,6 +317,231 @@ function runGate(files: Readonly<Record<string, string>>): {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+/**
+ * Create a throwaway git repository with the shipped scanner copied in, and
+ * hand its directory to `body`.
+ *
+ * The scanner is copied from THIS repo and invoked by absolute path, so the
+ * file under test is always the shipped entry point and a test cannot pass by
+ * scanning a copy.
+ */
+function withTempRepo(body: (dir: string) => void): void {
+  const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-repo-"));
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    mkdirSync(path.join(dir, "scripts"), { recursive: true });
+    mkdirSync(path.join(dir, "security"), { recursive: true });
+    for (const name of ["secret-scan.ts", "scan-secrets.ts"]) {
+      writeFileSync(
+        path.join(dir, "scripts", name),
+        readFileSync(path.join(REPO_ROOT, "scripts", name), "utf8"),
+        "utf8",
+      );
+    }
+    body(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Run the shipped CLI in `cwd` and capture its real exit code and output. */
+function runScanner(
+  cwd: string,
+  args: readonly string[] = [],
+): { status: number; output: string } {
+  try {
+    const output = execFileSync("bun", ["run", SCANNER_CLI, ...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { status: 0, output };
+  } catch (error) {
+    const err = error as {
+      status?: number;
+      stdout?: string;
+      stderr?: string;
+    };
+    return {
+      status: err.status ?? 1,
+      output: `${err.stdout ?? ""}${err.stderr ?? ""}`,
+    };
+  }
+}
+
+/** Run a git command in `cwd`, failing the test loudly if it does not work. */
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" });
+}
+
+describe("secret scan: the STAGED BYTES are scanned, not the working tree", () => {
+  // A real bug found by QA at `304bacd`, in the exact code path the ticket's c6
+  // exists to close. `scanFiles()` took its path LIST from `git diff --cached`
+  // and then read each path with `readFileSync` — the WORKING TREE. So `--staged`
+  // meant "the staged file list, paired with whatever the file contains right
+  // now", and this needed no `--no-verify` at all:
+  //
+  //   git add -f a.ts          # index holds the credential
+  //   echo clean > a.ts        # disk does not
+  //   git commit -qm x         # COMMIT_EXIT=0, hook silent
+  //   git show HEAD:a.ts       # the PAT IS IN THE COMMIT
+  //
+  // The default committed-tree mode had the same hole: it reported green over a
+  // HEAD holding a real-shaped PAT whenever the working tree was clean. CI only
+  // escaped because `actions/checkout` materialises HEAD into the working tree
+  // first — a coincidence of the runner, not a property of the gate.
+  //
+  // Every test here stages BYTES THAT DIFFER FROM DISK. A test that only asserts
+  // the path list is staged, with the file on disk holding the same bytes, would
+  // pass against the broken code — which is the round-1 lesson in a new costume.
+
+  const pat = syntheticRealLookingPat(8675309);
+  const CLEAN = 'export const t = "clean";\n';
+
+  it("--staged exits 1 on a staged credential whose working-tree copy is clean", () => {
+    withTempRepo((dir) => {
+      const file = path.join(dir, "a.ts");
+      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+      git(dir, "add", "-f", "a.ts");
+      // The divergence the old code could not see.
+      writeFileSync(file, CLEAN, "utf8");
+      expect(readFileSync(file, "utf8")).toBe(CLEAN);
+
+      const result = runScanner(dir, ["--staged"]);
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("a.ts:1");
+      expect(result.output).toContain("vendor-prefix-entropy");
+    });
+  });
+
+  it("the default committed-tree mode exits 1 over a credential only in the index", () => {
+    withTempRepo((dir) => {
+      const file = path.join(dir, "a.ts");
+      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+      git(dir, "add", "-f", "a.ts");
+      writeFileSync(file, CLEAN, "utf8");
+
+      const result = runScanner(dir);
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("a.ts:1");
+    });
+  });
+
+  it("--staged exits 1 when the working-tree copy of a staged file is DELETED", () => {
+    // The pre-fix code caught this one only by accident, via its readFileSync
+    // throw. Pinned so the index read cannot regress into a disk read that
+    // "handles" absence by skipping.
+    withTempRepo((dir) => {
+      const file = path.join(dir, "a.ts");
+      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+      git(dir, "add", "-f", "a.ts");
+      rmSync(file);
+
+      const result = runScanner(dir, ["--staged"]);
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("a.ts:1");
+    });
+  });
+
+  it("--staged exits 0 when the staged bytes are clean even if disk holds a PAT", () => {
+    // The other direction, and the one that keeps the gate honest rather than
+    // merely noisy: a credential lying around in the working tree that is NOT
+    // staged must not block an unrelated commit. The committed-tree mode is
+    // where an uncommitted PAT gets reported, and it does — see the test above.
+    withTempRepo((dir) => {
+      const file = path.join(dir, "a.ts");
+      writeFileSync(file, CLEAN, "utf8");
+      git(dir, "add", "-f", "a.ts");
+      git(dir, "commit", "-qm", "clean content");
+      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+
+      const result = runScanner(dir, ["--staged"]);
+      expect(result.status).toBe(0);
+    });
+  });
+
+  it("the shipped pre-commit HOOK blocks the commit, not just the CLI", () => {
+    // The end-to-end version of the same defect, through the hook the developer
+    // actually runs. QA's reproduction used `git commit`; this asserts the
+    // installed hook refuses it.
+    withTempRepo((dir) => {
+      git(dir, "config", "user.email", "qa@example.invalid");
+      git(dir, "config", "user.name", "qa");
+      mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+      writeFileSync(
+        path.join(dir, ".githooks", "pre-commit"),
+        readFileSync(path.join(REPO_ROOT, ".githooks", "pre-commit"), "utf8"),
+        "utf8",
+      );
+      // git SILENTLY ignores a non-executable hook (only a hint on stderr), so
+      // without this the commit would succeed and the test would pin the
+      // absence of a hook rather than the presence of one.
+      chmodSync(path.join(dir, ".githooks", "pre-commit"), 0o755);
+      git(dir, "config", "core.hooksPath", ".githooks");
+
+      const file = path.join(dir, "a.ts");
+      writeFileSync(file, CLEAN, "utf8");
+      git(dir, "add", "-A");
+      git(dir, "commit", "-qm", "initial");
+
+      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+      git(dir, "add", "-f", "a.ts");
+      writeFileSync(file, CLEAN, "utf8");
+
+      let commitStatus = 0;
+      try {
+        git(dir, "commit", "-qm", "smuggle a credential in");
+      } catch (error) {
+        commitStatus = (error as { status?: number }).status ?? 1;
+      }
+      expect(commitStatus).not.toBe(0);
+
+      // The commit was refused, so the index still holds exactly the bytes it
+      // held before — proof the hook refused on the STAGED content and that
+      // nothing was rewritten on the way through. (Asserting the index held
+      // CLEAN here was backwards: refusing the commit is exactly what leaves
+      // the smuggled bytes staged.)
+      expect(git(dir, "show", ":./a.ts")).toContain("github_pat_");
+      expect(git(dir, "log", "--format=%s", "-1").trim()).toBe("initial");
+    });
+  });
+
+  it("names, rather than silently drops, a path with no readable index blob", () => {
+    // An UNMERGED path: `git ls-files` lists it, `git diff --cached
+    // --diff-filter=ACMU` deliberately includes it, but `:<path>` needs a
+    // stage-0 entry and there is none, so `cat-file` fails. The gate must SAY
+    // so rather than skip in silence — a silently skipped path is the shape of
+    // the green lie this whole card is about.
+    //
+    // It is not fatal, and must not be: `git commit` refuses an unmerged tree
+    // outright, so nothing it could have hidden can reach a commit that gets
+    // made. The committed-tree CI run sees this only if a developer leaves the
+    // conflict unresolved, which CI reports anyway.
+    withTempRepo((dir) => {
+      git(dir, "config", "user.email", "qa@example.invalid");
+      git(dir, "config", "user.name", "qa");
+      writeFileSync(path.join(dir, "f"), "base\n", "utf8");
+      git(dir, "add", "f");
+      git(dir, "commit", "-qm", "base");
+
+      const startBranch = git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim();
+      git(dir, "checkout", "-qb", "other");
+      writeFileSync(path.join(dir, "f"), "other\n", "utf8");
+      git(dir, "commit", "-qam", "other");
+      git(dir, "checkout", "-q", startBranch);
+      writeFileSync(path.join(dir, "f"), "mine\n", "utf8");
+      git(dir, "commit", "-qam", "mine");
+      // Both sides touched `f` from a common base, so this conflicts rather
+      // than fast-forwarding and leaves `f` at stages 1/2/3.
+      expect(() => git(dir, "merge", "other")).toThrow();
+
+      const result = runScanner(dir);
+      expect(result.output).toContain("f");
+      expect(result.output).toContain("not scanned");
+    });
+  });
+});
 
 describe("secret scan: the shipped CLI's exit code, in a throwaway repo", () => {
   const pat = syntheticRealLookingPat(4242);

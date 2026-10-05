@@ -4,8 +4,17 @@
  *
  * WHAT IT DOES. Reads the list of tracked files from git (never a filesystem
  * walk, so an untracked local `.env.production` is not scanned and a deleted
- * file is not scanned), scans each with the rules in `scripts/secret-scan.ts`,
- * subtracts the committed baseline, and exits non-zero on anything left over.
+ * file is not scanned), reads each one's bytes OUT OF THE INDEX with `git
+ * cat-file blob :<path>` — the bytes git will commit, not whatever is on disk
+ * right now — scans them with the rules in `scripts/secret-scan.ts`, subtracts
+ * the committed baseline, and exits non-zero on anything left over.
+ *
+ * WHY THE BYTES COME FROM THE INDEX. An earlier version read each path off
+ * disk, so `--staged` scanned the staged file LIST paired with working-tree
+ * content: stage a credential, overwrite the file with clean text, and the
+ * commit-time hook passed while the credential went into the commit. The
+ * committed-tree mode was conditional on the working tree matching. See
+ * `readIndexBlob`.
  *
  * EXIT CODES.
  *   0 — every finding is accounted for by the baseline.
@@ -127,20 +136,68 @@ function stagedFiles(): readonly string[] {
   return out.split("\0").filter((p) => p !== "");
 }
 
-function scanFiles(files: readonly string[]): readonly Finding[] {
+/**
+ * The bytes git WILL COMMIT for `file`: its blob in the INDEX, read with
+ * `git cat-file blob :<path>` — never `readFileSync`.
+ *
+ * WHY THIS IS NOT A FILESYSTEM READ (this is the bug this function exists to
+ * fix; found by QA at `304bacd` with a reproduction). The first version
+ * enumerated paths from git and then read each one off disk, which meant every
+ * mode scanned the WORKING TREE:
+ *
+ *   printf 'export const t = "github_pat_<real-shaped>";\n' > a.ts
+ *   git add -f a.ts                       # index now holds the credential
+ *   printf 'export const t = "clean";\n' > a.ts   # disk no longer does
+ *   git commit -qm x                      # COMMIT_EXIT=0, hook said nothing
+ *   git show HEAD:a.ts                    # the credential IS in the commit
+ *
+ * `--staged` was therefore "the staged file LIST, paired with whatever the file
+ * happens to contain right now", and the default committed-tree mode reported
+ * green over a HEAD holding a real-shaped PAT whenever the working tree was
+ * clean. CI only escaped this because `actions/checkout` happens to materialise
+ * HEAD into the working tree first — a coincidence of the runner, not a property
+ * of the gate.
+ *
+ * The index is the right source for BOTH modes, for the same reason the hook and
+ * CI must agree: the index is what the next commit will contain, and after a
+ * fresh checkout the index equals HEAD. So one read serves "what am I about to
+ * commit" and "what is already committed".
+ *
+ * `:.` is prefixed to the path so a repo-root file whose name begins with `-`
+ * cannot be parsed as an option.
+ */
+function readIndexBlob(file: string): Buffer | undefined {
+  try {
+    return execFileSync("git", ["cat-file", "blob", `:./${file}`], {
+      cwd: repoRoot(),
+      encoding: "buffer",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    // No blob in the index under that name: an unmerged path (`:<path>` needs a
+    // stage-0 entry), a gitlink/submodule, or a path that raced away. `git
+    // commit` refuses an unmerged tree outright, so this cannot hide a
+    // credential in a commit that gets made.
+    return undefined;
+  }
+}
+
+function scanFiles(files: readonly string[]): {
+  findings: Finding[];
+  /** Paths with no readable index blob. Named on stdout, never silently dropped. */
+  unreadable: string[];
+} {
   const findings: Finding[] = [];
+  const unreadable: string[] = [];
   for (const file of files) {
-    let bytes: Buffer;
-    try {
-      bytes = readFileSync(inRepo(file));
-    } catch {
-      // A file in the index but absent from the working tree (a staged delete,
-      // or a sparse checkout) is not scanned rather than crashing the gate.
+    const bytes = readIndexBlob(file);
+    if (bytes === undefined) {
+      unreadable.push(file);
       continue;
     }
     findings.push(...scanBuffer(file, bytes));
   }
-  return findings;
+  return { findings, unreadable };
 }
 
 function readBaseline(): {
@@ -159,10 +216,18 @@ function readBaseline(): {
 
 const writeBaseline = process.argv.includes("--write-baseline");
 const stagedOnly = process.argv.includes("--staged");
-const findings = stagedOnly
+const { findings, unreadable } = stagedOnly
   ? scanFiles(stagedFiles())
   : scanFiles(trackedFiles());
 const { entries, unreasoned } = readBaseline();
+
+// A path with no index blob could not be scanned. Naming it is the minimum;
+// silently skipping is what made the pre-fix gate green over unread files.
+for (const file of unreadable) {
+  process.stdout.write(
+    `secret-scan: could not read an index blob for ${file}; not scanned.\n`,
+  );
+}
 
 // An unreasoned baseline line is a DEFECT, not a waiver: it is the shape a
 // silent blanket waiver takes. Reported and fatal in both modes, so the

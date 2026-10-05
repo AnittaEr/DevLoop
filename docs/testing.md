@@ -73,6 +73,49 @@ instead. GitHub push protection and the remote's own secret scanning remain the
 backstop for non-base62 material; that is a remote settings change, out of scope
 for this repository.
 
+### What the gate reads — the index, not the working tree
+
+Every byte the gate scans comes out of the git **index**, via
+`git cat-file blob :<path>`: the content the next commit will contain, or the
+content already committed after a fresh checkout. It never reads a file off
+disk.
+
+This was a real defect, found by QA at `304bacd` and measured by execution, not
+by reading the code. The first version took the path _list_ from
+`git diff --cached` and then read each path with `readFileSync` — the working
+tree — so `--staged` meant "the staged file list paired with whatever the file
+contains right now":
+
+```
+git add -f a.ts                          # index now holds the credential
+echo 'export const t = "clean";' > a.ts  # disk no longer does
+git commit -qm x                         # COMMIT_EXIT=0, hook silent
+git show HEAD:a.ts                       # the PAT IS IN THE COMMIT
+```
+
+That path needed no `--no-verify` at all. The default committed-tree mode had the
+same hole and reported green over a `HEAD` holding a real-shaped PAT whenever the
+working tree was clean; CI only escaped it because `actions/checkout` happens to
+materialise `HEAD` into the working tree first, which is a coincidence of the
+runner rather than a property of the gate.
+
+The consequence for what is and is not covered:
+
+| Content                                   | Scanned? | Why                                                                                                                                                                                                       |
+| ----------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The bytes the next commit will contain    | yes      | read from the index (`:<path>`)                                                                                                                                                                           |
+| The bytes already committed (`HEAD`)      | yes      | after a checkout the index equals `HEAD`; CI reads the same thing                                                                                                                                         |
+| An UNSTAGED file that exists only on disk | no       | deliberately — an uncommitted `.env.production` is the operator's, not a finding to block an unrelated commit over                                                                                        |
+| An UNTRACKED file                         | no       | never enters the index; `.gitignore` plus the environment are the layers for these                                                                                                                        |
+| An UNMERGED path (merge conflict)         | reported | `:<path>` needs a stage-0 entry, so the gate NAMES the path and says it did not scan it. Not fatal: `git commit` refuses an unmerged tree outright, so it cannot hide anything in a commit that gets made |
+| A gitlink / submodule                     | reported | same naming path as above; a submodule's contents belong to another repository's gate                                                                                                                     |
+
+A silently skipped path would be the same green lie in a new form, so the gate
+prints every path it could not read rather than skipping in silence. See
+`readIndexBlob` in `scripts/scan-secrets.ts` and the regression tests in
+`scripts/__tests__/secret-scan.test.ts` that stage bytes deliberately different
+from disk — they fail against the pre-fix code.
+
 ### Enabling the commit-time layer
 
 The hook is committed at `.githooks/pre-commit`; the enablement is one line per

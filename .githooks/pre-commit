@@ -29,10 +29,13 @@
 # script below does it for you.
 #
 # WHAT IT SCANS. Only the files staged for THIS commit (via
-# `git diff --cached --name-only`), using the same rules and the same baseline as
-# the CI gate, so a commit blocked here is blocked for the same reason CI would
-# block it. It deliberately does not scan the whole tree: the whole tree is
-# CI's job, and a slow commit-time hook gets bypassed with `--no-verify`.
+# `git diff --cached --name-only`), and for each one the BYTES IN THE INDEX
+# (`git cat-file blob :<path>`), not the file on disk — so staging a credential
+# and then overwriting the working tree copy with clean text is still refused.
+# Same rules, same baseline as the CI gate, so a commit blocked here is blocked
+# for the same reason CI would block it. It deliberately does not scan the whole
+# tree: the whole tree is CI's job, and a slow commit-time hook gets bypassed
+# with `--no-verify`.
 
 set -euo pipefail
 
