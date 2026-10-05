@@ -50,6 +50,9 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
+
 import {
   BASELINE_HEADER,
   MIN_RUN,
@@ -82,6 +85,44 @@ function syntheticRealLookingPat(seed: number): string {
   }
   return `github_pat_${out}`;
 }
+
+// ── WHY THESE FIFTEEN TESTS CARRY A BUDGET, AND HOW EACH NUMBER WAS REACHED ──
+//
+// Every test below reaches a real subprocess: `git init`/`config`/`add`/`commit`
+// through `initTempRepo`, `git`, `gitIsolated` and `runGate`, or
+// `bun run scripts/secret-scan.ts` itself. That is a cold process start per
+// call, so the cost is a property of the MACHINE and the load on it, not of the
+// code under test -- and none of it is what these tests assert. Under the 5s
+// global default they go red for reasons that have nothing to do with the code,
+// which is the defect B53's regression guard exists to make impossible.
+//
+// MEASURED AT HEAD `b66720e` (the reconciled batch-15 tree) ON THIS MACHINE
+// (8 cores, 16GB, macOS): N concurrent FULL `bun run test` suites in N SEPARATE
+// detached worktrees, so no two runs shared a repository, with each test's own
+// duration read out of Vitest's JSON reporter (`--reporter=json`) rather than
+// the file being timed from outside.
+//
+//   7 concurrent suites    worst observation 12553ms
+//   12 concurrent suites   worst observation 28051ms
+//   16 concurrent suites   worst observation 58930ms   <-- sized from this
+//
+// 16 concurrent suites is TWO WHOLE SUITES PER CORE on an 8-core box -- more
+// load than CI or a developer produces, used here precisely because a budget
+// sized from a comfortable load is a budget that has never been tested.
+//
+// A FLAT `subprocess` (30s) IS NOT ENOUGH AT THIS LOAD, and that is a
+// measurement rather than a preference: the worst 16x observation is 58930ms,
+// so one 30s budget would sit BELOW a duration this machine actually produced.
+// The next round number above it is the 60s `subprocessX4`, so the sites whose
+// own worst observation exceeded 30s take `subprocessX4` and the rest take
+// `subprocess`. Seven of the fifteen exceeded 30s; the split is read off the
+// numbers in each site's own comment, not from a guess about which tests "feel
+// heavy". The spread is load-driven: the two heaviest are the two that run the
+// scanner CLI more than once inside a single test.
+//
+// THE GLOBAL 5s DEFAULT IS UNCHANGED. These are per-test budgets on fifteen
+// tests; the other ~670 tests still fail at 5000ms, so a regression that made an
+// ordinary in-process test slow is still caught in 5s.
 
 describe("secret scan: the rule is a shape+entropy rule, not a prefix match", () => {
   // The three fixtures the ticket names, copied VERBATIM from the tracked
@@ -462,95 +503,128 @@ describe("secret scan: every temp repo is hermetic w.r.t. git identity (B55)", (
   const author = (dir: string) =>
     gitIsolated(dir, "log", "-1", "--format=%an <%ae>").trim();
 
-  it("withTempRepo's repo commits as the FIXTURE ident, not the OS account", () => {
-    withTempRepo((dir) => {
-      expect(gitIsolated(dir, "config", "--get", "user.email").trim()).toBe(
-        TEMP_REPO_GIT_EMAIL,
-      );
-      writeFileSync(path.join(dir, "a.ts"), "export const n = 1;\n", "utf8");
-      gitIsolated(dir, "add", "-A");
-      // Under the emulated runner: no global/system config, no EMAIL, no
-      // GIT_*_NAME/_EMAIL. This is the exact `git commit` that failed in CI.
-      gitIsolated(dir, "commit", "-qm", "hermetic");
-      expect(author(dir)).toBe(
-        `${TEMP_REPO_GIT_NAME} <${TEMP_REPO_GIT_EMAIL}>`,
-      );
-    });
-  });
-
-  it("runGate's repo has the fixture identity configured", () => {
-    // `runGate` gets an `onRepo` hook because it creates the repo itself and
-    // deletes it in its own `finally`; the hook is the only way to observe the
-    // repository it built, and an empty hook would let this pass vacuously.
-    let observed = false;
-    runGate({ "src/ok.ts": "export const n = 1;\n" }, (dir) => {
-      observed = true;
-      expect(gitIsolated(dir, "config", "--get", "user.name").trim()).toBe(
-        TEMP_REPO_GIT_NAME,
-      );
-    });
-    expect(observed).toBe(true);
-  });
-
-  it("an UNCONFIGURED repo has no fixture ident — so the config is load-bearing", () => {
-    // The control for the pair above, and the reason "the commit worked" is not
-    // evidence. On macOS this repo still commits, as the OS account — which is
-    // precisely why the defect was invisible here and red on the runner. On
-    // Linux git refuses outright. Both platforms agree on the assertion: the
-    // identity the two tests above rely on comes from `initTempRepo`, never
-    // from the machine.
-    const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-unconfigured-"));
-    try {
-      // Deliberately NOT `initTempRepo`: this repo must have NO identity, which
-      // is the control for the fix. Its single bare `git init` is the one the
-      // structural guard below accounts for.
-      execFileSync("git", ["init", "-q"], { cwd: dir });
-      let unconfiguredName = "";
-      let unconfiguredEmail = "";
-      try {
-        unconfiguredName = gitIsolated(
-          dir,
-          "config",
-          "--get",
-          "user.name",
-        ).trim();
-      } catch {
-        // `git config --get` exits 1 when the key is unset — the state under test.
-      }
-      try {
-        unconfiguredEmail = gitIsolated(
-          dir,
-          "config",
-          "--get",
-          "user.email",
-        ).trim();
-      } catch {
-        // As above.
-      }
-      expect(unconfiguredName).toBe("");
-      expect(unconfiguredEmail).toBe("");
-
-      writeFileSync(path.join(dir, "a.ts"), "export const n = 1;\n", "utf8");
-      gitIsolated(dir, "add", "-A");
-      let committed = false;
-      try {
-        gitIsolated(dir, "commit", "-qm", "unconfigured");
-        committed = true;
-      } catch {
-        // Expected on the Linux CI runner: git refuses, which is what made
-        // PR #16 red.
-      }
-      if (committed) {
-        // On macOS git resolved the OS account via getpwuid() instead — which is
-        // exactly why the defect was invisible here.
-        expect(author(dir)).not.toBe(
+  // MEASURED BUDGET: `subprocess`. creates a temp repo, writes a file and
+  // commits, so it pays `git init`, two `git config` calls, `git add` and
+  // `git commit` on top of the init. this test's own worst observation, 16
+  // concurrent full suites: 20546ms (median 11571ms)
+  // 20546ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "withTempRepo's repo commits as the FIXTURE ident, not the OS account",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      withTempRepo((dir) => {
+        expect(gitIsolated(dir, "config", "--get", "user.email").trim()).toBe(
+          TEMP_REPO_GIT_EMAIL,
+        );
+        writeFileSync(path.join(dir, "a.ts"), "export const n = 1;\n", "utf8");
+        gitIsolated(dir, "add", "-A");
+        // Under the emulated runner: no global/system config, no EMAIL, no
+        // GIT_*_NAME/_EMAIL. This is the exact `git commit` that failed in CI.
+        gitIsolated(dir, "commit", "-qm", "hermetic");
+        expect(author(dir)).toBe(
           `${TEMP_REPO_GIT_NAME} <${TEMP_REPO_GIT_EMAIL}>`,
         );
+      });
+    },
+  );
+
+  // MEASURED BUDGET: `subprocessX4`. drives the whole gate through
+  // `runGate`: init, config, add, and then the scanner CLI itself as a
+  // subprocess. this test's own worst observation, 16 concurrent full
+  // suites: 31805ms (median 14573ms)
+  // 31805ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "runGate's repo has the fixture identity configured",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      // `runGate` gets an `onRepo` hook because it creates the repo itself and
+      // deletes it in its own `finally`; the hook is the only way to observe the
+      // repository it built, and an empty hook would let this pass vacuously.
+      let observed = false;
+      runGate({ "src/ok.ts": "export const n = 1;\n" }, (dir) => {
+        observed = true;
+        expect(gitIsolated(dir, "config", "--get", "user.name").trim()).toBe(
+          TEMP_REPO_GIT_NAME,
+        );
+      });
+      expect(observed).toBe(true);
+    },
+  );
+
+  // MEASURED BUDGET: `subprocess`. the control for the pair above, and it
+  // builds an UNCONFIGURED repo on purpose, so it pays the same init and
+  // commit work with none of the config calls -- which is exactly what
+  // makes it a control. this test's own worst observation, 16 concurrent
+  // full suites: 23175ms (median 12664ms)
+  // 23175ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "an UNCONFIGURED repo has no fixture ident — so the config is load-bearing",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      // The control for the pair above, and the reason "the commit worked" is not
+      // evidence. On macOS this repo still commits, as the OS account — which is
+      // precisely why the defect was invisible here and red on the runner. On
+      // Linux git refuses outright. Both platforms agree on the assertion: the
+      // identity the two tests above rely on comes from `initTempRepo`, never
+      // from the machine.
+      const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-unconfigured-"));
+      try {
+        // Deliberately NOT `initTempRepo`: this repo must have NO identity, which
+        // is the control for the fix. Its single bare `git init` is the one the
+        // structural guard below accounts for.
+        execFileSync("git", ["init", "-q"], { cwd: dir });
+        let unconfiguredName = "";
+        let unconfiguredEmail = "";
+        try {
+          unconfiguredName = gitIsolated(
+            dir,
+            "config",
+            "--get",
+            "user.name",
+          ).trim();
+        } catch {
+          // `git config --get` exits 1 when the key is unset — the state under test.
+        }
+        try {
+          unconfiguredEmail = gitIsolated(
+            dir,
+            "config",
+            "--get",
+            "user.email",
+          ).trim();
+        } catch {
+          // As above.
+        }
+        expect(unconfiguredName).toBe("");
+        expect(unconfiguredEmail).toBe("");
+
+        writeFileSync(path.join(dir, "a.ts"), "export const n = 1;\n", "utf8");
+        gitIsolated(dir, "add", "-A");
+        let committed = false;
+        try {
+          gitIsolated(dir, "commit", "-qm", "unconfigured");
+          committed = true;
+        } catch {
+          // Expected on the Linux CI runner: git refuses, which is what made
+          // PR #16 red.
+        }
+        if (committed) {
+          // On macOS git resolved the OS account via getpwuid() instead — which is
+          // exactly why the defect was invisible here.
+          expect(author(dir)).not.toBe(
+            `${TEMP_REPO_GIT_NAME} <${TEMP_REPO_GIT_EMAIL}>`,
+          );
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 
   it("no temp repo in this file is created by a bare `git init` any more", () => {
     // Structural guard for the THIRD site (the inline cwd test), which builds
@@ -591,242 +665,370 @@ describe("secret scan: the STAGED BYTES are scanned, not the working tree", () =
   const pat = syntheticRealLookingPat(8675309);
   const CLEAN = 'export const t = "clean";\n';
 
-  it("--staged exits 1 on a staged credential whose working-tree copy is clean", () => {
-    withTempRepo((dir) => {
-      const file = path.join(dir, "a.ts");
-      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
-      git(dir, "add", "-f", "a.ts");
-      // The divergence the old code could not see.
-      writeFileSync(file, CLEAN, "utf8");
-      expect(readFileSync(file, "utf8")).toBe(CLEAN);
+  // MEASURED BUDGET: `subprocess`. init, config, add, commit, then a second
+  // `add` and a `--staged` scan: two scanner invocations across one test.
+  // this test's own worst observation, 16 concurrent full suites: 24327ms
+  // (median 17798ms)
+  // 24327ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "--staged exits 1 on a staged credential whose working-tree copy is clean",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      withTempRepo((dir) => {
+        const file = path.join(dir, "a.ts");
+        writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+        git(dir, "add", "-f", "a.ts");
+        // The divergence the old code could not see.
+        writeFileSync(file, CLEAN, "utf8");
+        expect(readFileSync(file, "utf8")).toBe(CLEAN);
 
-      const result = runScanner(dir, ["--staged"]);
-      expect(result.status).toBe(1);
-      expect(result.output).toContain("a.ts:1");
-      expect(result.output).toContain("vendor-prefix-entropy");
-    });
-  });
+        const result = runScanner(dir, ["--staged"]);
+        expect(result.status).toBe(1);
+        expect(result.output).toContain("a.ts:1");
+        expect(result.output).toContain("vendor-prefix-entropy");
+      });
+    },
+  );
 
-  it("the default committed-tree mode exits 1 over a credential only in the index", () => {
-    withTempRepo((dir) => {
-      const file = path.join(dir, "a.ts");
-      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
-      git(dir, "add", "-f", "a.ts");
-      writeFileSync(file, CLEAN, "utf8");
+  // MEASURED BUDGET: `subprocess`. init, config, add, commit, then the
+  // committed-tree scan: a second scanner invocation. this test's own worst
+  // observation, 16 concurrent full suites: 29662ms (median 18769ms)
+  // 29662ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "the default committed-tree mode exits 1 over a credential only in the index",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      withTempRepo((dir) => {
+        const file = path.join(dir, "a.ts");
+        writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+        git(dir, "add", "-f", "a.ts");
+        writeFileSync(file, CLEAN, "utf8");
 
-      const result = runScanner(dir);
-      expect(result.status).toBe(1);
-      expect(result.output).toContain("a.ts:1");
-    });
-  });
+        const result = runScanner(dir);
+        expect(result.status).toBe(1);
+        expect(result.output).toContain("a.ts:1");
+      });
+    },
+  );
 
-  it("--staged exits 1 when the working-tree copy of a staged file is DELETED", () => {
-    // The pre-fix code caught this one only by accident, via its readFileSync
-    // throw. Pinned so the index read cannot regress into a disk read that
-    // "handles" absence by skipping.
-    withTempRepo((dir) => {
-      const file = path.join(dir, "a.ts");
-      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
-      git(dir, "add", "-f", "a.ts");
-      rmSync(file);
+  // MEASURED BUDGET: `subprocess`. init, config, add, commit, an unlink, a
+  // re-add, then the `--staged` scan. this test's own worst observation, 16
+  // concurrent full suites: 28159ms (median 20648ms)
+  // 28159ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "--staged exits 1 when the working-tree copy of a staged file is DELETED",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      // The pre-fix code caught this one only by accident, via its readFileSync
+      // throw. Pinned so the index read cannot regress into a disk read that
+      // "handles" absence by skipping.
+      withTempRepo((dir) => {
+        const file = path.join(dir, "a.ts");
+        writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+        git(dir, "add", "-f", "a.ts");
+        rmSync(file);
 
-      const result = runScanner(dir, ["--staged"]);
-      expect(result.status).toBe(1);
-      expect(result.output).toContain("a.ts:1");
-    });
-  });
+        const result = runScanner(dir, ["--staged"]);
+        expect(result.status).toBe(1);
+        expect(result.output).toContain("a.ts:1");
+      });
+    },
+  );
 
-  it("--staged exits 0 when the staged bytes are clean even if disk holds a PAT", () => {
-    // The other direction, and the one that keeps the gate honest rather than
-    // merely noisy: a credential lying around in the working tree that is NOT
-    // staged must not block an unrelated commit. The committed-tree mode is
-    // where an uncommitted PAT gets reported, and it does — see the test above.
-    withTempRepo((dir) => {
-      const file = path.join(dir, "a.ts");
-      writeFileSync(file, CLEAN, "utf8");
-      git(dir, "add", "-f", "a.ts");
-      git(dir, "commit", "-qm", "clean content");
-      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+  // MEASURED BUDGET: `subprocess`. init, config, add, commit, then the
+  // clean `--staged` scan. this test's own worst observation, 16 concurrent
+  // full suites: 26974ms (median 21491ms)
+  // 26974ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "--staged exits 0 when the staged bytes are clean even if disk holds a PAT",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      // The other direction, and the one that keeps the gate honest rather than
+      // merely noisy: a credential lying around in the working tree that is NOT
+      // staged must not block an unrelated commit. The committed-tree mode is
+      // where an uncommitted PAT gets reported, and it does — see the test above.
+      withTempRepo((dir) => {
+        const file = path.join(dir, "a.ts");
+        writeFileSync(file, CLEAN, "utf8");
+        git(dir, "add", "-f", "a.ts");
+        git(dir, "commit", "-qm", "clean content");
+        writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
 
-      const result = runScanner(dir, ["--staged"]);
-      expect(result.status).toBe(0);
-    });
-  });
+        const result = runScanner(dir, ["--staged"]);
+        expect(result.status).toBe(0);
+      });
+    },
+  );
 
-  it("the shipped pre-commit HOOK blocks the commit, not just the CLI", () => {
-    // The end-to-end version of the same defect, through the hook the developer
-    // actually runs. QA's reproduction used `git commit`; this asserts the
-    // installed hook refuses it.
-    withTempRepo((dir) => {
-      // Identity comes from `withTempRepo` (c3): this call site used to set it
-      // inline while the helper did not, which is how the missing-identity
-      // defect hid here — the file looked deliberate.
-      mkdirSync(path.join(dir, ".githooks"), { recursive: true });
-      writeFileSync(
-        path.join(dir, ".githooks", "pre-commit"),
-        readFileSync(path.join(REPO_ROOT, ".githooks", "pre-commit"), "utf8"),
-        "utf8",
-      );
-      // git SILENTLY ignores a non-executable hook (only a hint on stderr), so
-      // without this the commit would succeed and the test would pin the
-      // absence of a hook rather than the presence of one.
-      chmodSync(path.join(dir, ".githooks", "pre-commit"), 0o755);
-      git(dir, "config", "core.hooksPath", ".githooks");
+  // MEASURED BUDGET: `subprocessX4`. THE HEAVIEST SITE IN THIS FILE. It
+  // drives the shipped pre-commit HOOK end to end, which means the hook's
+  // own `bun run secrets:scan` runs as a subprocess INSIDE the commit, and
+  // the test then asserts on the refusal by running the scanner again. The
+  // most cold process starts of any test here, and so the worst observation
+  // in the file. this test's own worst observation, 16 concurrent full
+  // suites: 58930ms (median 48658ms)
+  // 58930ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "the shipped pre-commit HOOK blocks the commit, not just the CLI",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      // The end-to-end version of the same defect, through the hook the developer
+      // actually runs. QA's reproduction used `git commit`; this asserts the
+      // installed hook refuses it.
+      withTempRepo((dir) => {
+        // Identity comes from `withTempRepo` (c3): this call site used to set it
+        // inline while the helper did not, which is how the missing-identity
+        // defect hid here — the file looked deliberate.
+        mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+        writeFileSync(
+          path.join(dir, ".githooks", "pre-commit"),
+          readFileSync(path.join(REPO_ROOT, ".githooks", "pre-commit"), "utf8"),
+          "utf8",
+        );
+        // git SILENTLY ignores a non-executable hook (only a hint on stderr), so
+        // without this the commit would succeed and the test would pin the
+        // absence of a hook rather than the presence of one.
+        chmodSync(path.join(dir, ".githooks", "pre-commit"), 0o755);
+        git(dir, "config", "core.hooksPath", ".githooks");
 
-      const file = path.join(dir, "a.ts");
-      writeFileSync(file, CLEAN, "utf8");
-      git(dir, "add", "-A");
-      git(dir, "commit", "-qm", "initial");
+        const file = path.join(dir, "a.ts");
+        writeFileSync(file, CLEAN, "utf8");
+        git(dir, "add", "-A");
+        git(dir, "commit", "-qm", "initial");
 
-      writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
-      git(dir, "add", "-f", "a.ts");
-      writeFileSync(file, CLEAN, "utf8");
+        writeFileSync(file, `export const t = "${pat}";\n`, "utf8");
+        git(dir, "add", "-f", "a.ts");
+        writeFileSync(file, CLEAN, "utf8");
 
-      let commitStatus = 0;
-      try {
-        git(dir, "commit", "-qm", "smuggle a credential in");
-      } catch (error) {
-        commitStatus = (error as { status?: number }).status ?? 1;
-      }
-      expect(commitStatus).not.toBe(0);
+        let commitStatus = 0;
+        try {
+          git(dir, "commit", "-qm", "smuggle a credential in");
+        } catch (error) {
+          commitStatus = (error as { status?: number }).status ?? 1;
+        }
+        expect(commitStatus).not.toBe(0);
 
-      // The commit was refused, so the index still holds exactly the bytes it
-      // held before — proof the hook refused on the STAGED content and that
-      // nothing was rewritten on the way through. (Asserting the index held
-      // CLEAN here was backwards: refusing the commit is exactly what leaves
-      // the smuggled bytes staged.)
-      expect(git(dir, "show", ":./a.ts")).toContain("github_pat_");
-      expect(git(dir, "log", "--format=%s", "-1").trim()).toBe("initial");
-    });
-  });
+        // The commit was refused, so the index still holds exactly the bytes it
+        // held before — proof the hook refused on the STAGED content and that
+        // nothing was rewritten on the way through. (Asserting the index held
+        // CLEAN here was backwards: refusing the commit is exactly what leaves
+        // the smuggled bytes staged.)
+        expect(git(dir, "show", ":./a.ts")).toContain("github_pat_");
+        expect(git(dir, "log", "--format=%s", "-1").trim()).toBe("initial");
+      });
+    },
+  );
 
-  it("names, rather than silently drops, a path with no readable index blob", () => {
-    // An UNMERGED path: `git ls-files` lists it, `git diff --cached
-    // --diff-filter=ACMU` deliberately includes it, but `:<path>` needs a
-    // stage-0 entry and there is none, so `cat-file` fails. The gate must SAY
-    // so rather than skip in silence — a silently skipped path is the shape of
-    // the green lie this whole card is about.
-    //
-    // It is not fatal, and must not be: `git commit` refuses an unmerged tree
-    // outright, so nothing it could have hidden can reach a commit that gets
-    // made. The committed-tree CI run sees this only if a developer leaves the
-    // conflict unresolved, which CI reports anyway.
-    withTempRepo((dir) => {
-      writeFileSync(path.join(dir, "f"), "base\n", "utf8");
-      git(dir, "add", "f");
-      git(dir, "commit", "-qm", "base");
+  // MEASURED BUDGET: `subprocessX4`. the second heaviest: it builds an
+  // UNMERGED index -- init, config, add, a deliberate `rm --cached`, an
+  // untracked write, several `git cat-file` and `git ls-files` probes --
+  // and then scans, so it runs the CLI on top of the repo construction.
+  // this test's own worst observation, 16 concurrent full suites: 53196ms
+  // (median 43159ms)
+  // 53196ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "names, rather than silently drops, a path with no readable index blob",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      // An UNMERGED path: `git ls-files` lists it, `git diff --cached
+      // --diff-filter=ACMU` deliberately includes it, but `:<path>` needs a
+      // stage-0 entry and there is none, so `cat-file` fails. The gate must SAY
+      // so rather than skip in silence — a silently skipped path is the shape of
+      // the green lie this whole card is about.
+      //
+      // It is not fatal, and must not be: `git commit` refuses an unmerged tree
+      // outright, so nothing it could have hidden can reach a commit that gets
+      // made. The committed-tree CI run sees this only if a developer leaves the
+      // conflict unresolved, which CI reports anyway.
+      withTempRepo((dir) => {
+        writeFileSync(path.join(dir, "f"), "base\n", "utf8");
+        git(dir, "add", "f");
+        git(dir, "commit", "-qm", "base");
 
-      const startBranch = git(dir, "rev-parse", "--abbrev-ref", "HEAD").trim();
-      git(dir, "checkout", "-qb", "other");
-      writeFileSync(path.join(dir, "f"), "other\n", "utf8");
-      git(dir, "commit", "-qam", "other");
-      git(dir, "checkout", "-q", startBranch);
-      writeFileSync(path.join(dir, "f"), "mine\n", "utf8");
-      git(dir, "commit", "-qam", "mine");
-      // Both sides touched `f` from a common base, so this conflicts rather
-      // than fast-forwarding and leaves `f` at stages 1/2/3.
-      expect(() => git(dir, "merge", "other")).toThrow();
+        const startBranch = git(
+          dir,
+          "rev-parse",
+          "--abbrev-ref",
+          "HEAD",
+        ).trim();
+        git(dir, "checkout", "-qb", "other");
+        writeFileSync(path.join(dir, "f"), "other\n", "utf8");
+        git(dir, "commit", "-qam", "other");
+        git(dir, "checkout", "-q", startBranch);
+        writeFileSync(path.join(dir, "f"), "mine\n", "utf8");
+        git(dir, "commit", "-qam", "mine");
+        // Both sides touched `f` from a common base, so this conflicts rather
+        // than fast-forwarding and leaves `f` at stages 1/2/3.
+        expect(() => git(dir, "merge", "other")).toThrow();
 
-      const result = runScanner(dir);
-      expect(result.output).toContain("f");
-      expect(result.output).toContain("not scanned");
-    });
-  });
+        const result = runScanner(dir);
+        expect(result.output).toContain("f");
+        expect(result.output).toContain("not scanned");
+      });
+    },
+  );
 });
 
 describe("secret scan: the shipped CLI's exit code, in a throwaway repo", () => {
   const pat = syntheticRealLookingPat(4242);
 
-  it("exits 1 and names file and line when the tree holds an unbaselined PAT", () => {
-    const result = runGate({ "src/leak.ts": `export const t = "${pat}";\n` });
-    expect(result.status).toBe(1);
-    expect(result.output).toContain("src/leak.ts:1");
-    expect(result.output).toContain("vendor-prefix-entropy");
-  });
+  // MEASURED BUDGET: `subprocess`. init, config, add, commit, then one CLI
+  // scan whose stderr it asserts on. this test's own worst observation, 16
+  // concurrent full suites: 26619ms (median 18494ms)
+  // 26619ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "exits 1 and names file and line when the tree holds an unbaselined PAT",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      const result = runGate({ "src/leak.ts": `export const t = "${pat}";\n` });
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("src/leak.ts:1");
+      expect(result.output).toContain("vendor-prefix-entropy");
+    },
+  );
 
-  it("exits 1 when the baseline line has no reason", () => {
-    const result = runGate({
-      "src/leak.ts": `export const t = "${pat}";\n`,
-      "security/secret-scan-baseline.txt": "# header\nabc123\n",
-    });
-    expect(result.status).toBe(1);
-    expect(result.output).toContain("no reason");
-  });
+  // MEASURED BUDGET: `subprocessX4`. init, config, add, commit, then one
+  // CLI scan against a doctored baseline. this test's own worst
+  // observation, 16 concurrent full suites: 50500ms (median 21370ms)
+  // 50500ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "exits 1 when the baseline line has no reason",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      const result = runGate({
+        "src/leak.ts": `export const t = "${pat}";\n`,
+        "security/secret-scan-baseline.txt": "# header\nabc123\n",
+      });
+      expect(result.status).toBe(1);
+      expect(result.output).toContain("no reason");
+    },
+  );
 
-  it("exits 0 on a clean tree", () => {
-    const result = runGate({ "src/ok.ts": "export const n = 1;\n" });
-    expect(result.status).toBe(0);
-    expect(result.output).toContain("OK");
-  });
+  // MEASURED BUDGET: `subprocessX4`. init, config, add, commit, then one
+  // CLI scan expected to pass. this test's own worst observation, 16
+  // concurrent full suites: 33163ms (median 20914ms)
+  // 33163ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "exits 0 on a clean tree",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      const result = runGate({ "src/ok.ts": "export const n = 1;\n" });
+      expect(result.status).toBe(0);
+      expect(result.output).toContain("OK");
+    },
+  );
 
-  it("still finds the leak when run from a SUBDIRECTORY, not just the root", () => {
-    // A real bug in the first version of this CLI, and the worst failure mode
-    // a credential gate can have: `git ls-files` and `git diff --cached` are
-    // cwd-relative, so invoked from `scripts/` the script listed no files, the
-    // read threw and was swallowed, and it reported "OK — 0 findings" — GREEN
-    // over a tree containing a credential. The green lie was the gate's own
-    // bug, produced by the gate.
-    //
-    // `runGate` writes `src/leak.ts`, so running the CLI with cwd `scripts/`
-    // must still see it and still exit 1. If this test ever passes vacuously
-    // because the temp repo has no `src/`, it cannot: the assertion below is on
-    // the output naming that exact path.
-    const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-cwd-"));
-    try {
-      initTempRepo(dir);
-      mkdirSync(path.join(dir, "src"), { recursive: true });
-      mkdirSync(path.join(dir, "scripts"), { recursive: true });
-      mkdirSync(path.join(dir, "security"), { recursive: true });
-      writeFileSync(
-        path.join(dir, "src", "leak.ts"),
-        `export const t = "${syntheticRealLookingPat(606)}";\n`,
-        "utf8",
-      );
-      for (const name of ["secret-scan.ts", "scan-secrets.ts"]) {
+  // MEASURED BUDGET: `subprocessX4`. init, config, add, commit, then a `bun
+  // run` from a SUBDIRECTORY -- a cold start resolving the script through a
+  // nested `package.json` lookup, which is why it costs more than its
+  // neighbours. this test's own worst observation, 16 concurrent full
+  // suites: 33527ms (median 16514ms)
+  // 33527ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "still finds the leak when run from a SUBDIRECTORY, not just the root",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      // A real bug in the first version of this CLI, and the worst failure mode
+      // a credential gate can have: `git ls-files` and `git diff --cached` are
+      // cwd-relative, so invoked from `scripts/` the script listed no files, the
+      // read threw and was swallowed, and it reported "OK — 0 findings" — GREEN
+      // over a tree containing a credential. The green lie was the gate's own
+      // bug, produced by the gate.
+      //
+      // `runGate` writes `src/leak.ts`, so running the CLI with cwd `scripts/`
+      // must still see it and still exit 1. If this test ever passes vacuously
+      // because the temp repo has no `src/`, it cannot: the assertion below is on
+      // the output naming that exact path.
+      const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-cwd-"));
+      try {
+        initTempRepo(dir);
+        mkdirSync(path.join(dir, "src"), { recursive: true });
+        mkdirSync(path.join(dir, "scripts"), { recursive: true });
+        mkdirSync(path.join(dir, "security"), { recursive: true });
         writeFileSync(
-          path.join(dir, "scripts", name),
-          readFileSync(path.join(REPO_ROOT, "scripts", name), "utf8"),
+          path.join(dir, "src", "leak.ts"),
+          `export const t = "${syntheticRealLookingPat(606)}";\n`,
           "utf8",
         );
+        for (const name of ["secret-scan.ts", "scan-secrets.ts"]) {
+          writeFileSync(
+            path.join(dir, "scripts", name),
+            readFileSync(path.join(REPO_ROOT, "scripts", name), "utf8"),
+            "utf8",
+          );
+        }
+        execFileSync("git", ["add", "-A"], { cwd: dir });
+        const output = execFileSync("bun", ["run", SCANNER_CLI], {
+          cwd: path.join(dir, "scripts"),
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        // Reached only if the CLI exited 0, which is the bug.
+        throw new Error(
+          `expected a non-zero exit, got 0 with output: ${output}`,
+        );
+      } catch (error) {
+        const err = error as {
+          status?: number;
+          stdout?: string;
+          stderr?: string;
+        };
+        expect(err.status).toBe(1);
+        expect(`${err.stdout ?? ""}${err.stderr ?? ""}`).toContain(
+          "src/leak.ts:1",
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
-      execFileSync("git", ["add", "-A"], { cwd: dir });
-      const output = execFileSync("bun", ["run", SCANNER_CLI], {
-        cwd: path.join(dir, "scripts"),
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      // Reached only if the CLI exited 0, which is the bug.
-      throw new Error(`expected a non-zero exit, got 0 with output: ${output}`);
-    } catch (error) {
-      const err = error as {
-        status?: number;
-        stdout?: string;
-        stderr?: string;
-      };
-      expect(err.status).toBe(1);
-      expect(`${err.stdout ?? ""}${err.stderr ?? ""}`).toContain(
-        "src/leak.ts:1",
-      );
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 
-  it("exits 0 when the ONLY finding is baselined with a reason", () => {
-    // Generate the real fingerprint by scanning the same content the CLI will.
-    const content = `export const t = "${pat}";\n`;
-    const finding = scanText("src/leak.ts", content)[0]!;
-    const result = runGate({
-      "src/leak.ts": content,
-      "security/secret-scan-baseline.txt": renderBaseline([
-        {
-          fingerprint: finding.fingerprint,
-          reason: "fixture, not a credential",
-        },
-      ]),
-    });
-    expect(result.status).toBe(0);
-  });
+  // MEASURED BUDGET: `subprocessX4`. init, config, add, commit, then one
+  // CLI scan whose only finding must be baselined. this test's own worst
+  // observation, 16 concurrent full suites: 36188ms (median 17374ms)
+  // 36188ms EXCEEDS the 30s `subprocess` tier at this load, so this site takes
+  // `subprocessX4`: a 30s budget here would be one this machine has already
+  // been observed to blow through, which is how a budget gets crossed again on
+  // the next slower machine.
+  it(
+    "exits 0 when the ONLY finding is baselined with a reason",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocessX4 },
+    () => {
+      // Generate the real fingerprint by scanning the same content the CLI will.
+      const content = `export const t = "${pat}";\n`;
+      const finding = scanText("src/leak.ts", content)[0]!;
+      const result = runGate({
+        "src/leak.ts": content,
+        "security/secret-scan-baseline.txt": renderBaseline([
+          {
+            fingerprint: finding.fingerprint,
+            reason: "fixture, not a credential",
+          },
+        ]),
+      });
+      expect(result.status).toBe(0);
+    },
+  );
 });
 
 describe("the repository state this gate depends on", () => {
@@ -859,36 +1061,46 @@ describe("the repository state this gate depends on", () => {
     expect(step).not.toMatch(/severity|threshold|CRITICAL|HIGH/i);
   });
 
-  it("keeps .env.example tracked and the probe names untracked", () => {
-    const tracked = execFileSync("git", ["ls-files"], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-    });
-    expect(tracked.split("\n")).toContain(".env.example");
+  // MEASURED BUDGET: `subprocess`. the cheapest of the fifteen: two `git
+  // ls-files` calls against the REPO (no temp repo, no scanner) plus a
+  // baseline parse. this test's own worst observation, 16 concurrent full
+  // suites: 19966ms (median 11224ms)
+  // 19966ms sits under 30s, so `subprocess` holds with headroom at the worst
+  // load measured; the 60s tier would be spent for nothing.
+  it(
+    "keeps .env.example tracked and the probe names untracked",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
+    () => {
+      const tracked = execFileSync("git", ["ls-files"], {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+      });
+      expect(tracked.split("\n")).toContain(".env.example");
 
-    const check = (name: string) => {
-      try {
-        execFileSync("git", ["check-ignore", "-q", name], {
-          cwd: REPO_ROOT,
-          stdio: "ignore",
-        });
-        return true;
-      } catch {
-        return false;
+      const check = (name: string) => {
+        try {
+          execFileSync("git", ["check-ignore", "-q", name], {
+            cwd: REPO_ROOT,
+            stdio: "ignore",
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      for (const name of [
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.staging",
+        ".env.production.local",
+        ".env.development.local",
+      ]) {
+        expect(check(name)).toBe(true);
       }
-    };
-    for (const name of [
-      ".env",
-      ".env.local",
-      ".env.production",
-      ".env.staging",
-      ".env.production.local",
-      ".env.development.local",
-    ]) {
-      expect(check(name)).toBe(true);
-    }
-    expect(check(".env.example")).toBe(false);
-  });
+      expect(check(".env.example")).toBe(false);
+    },
+  );
 
   it("every committed baseline entry carries a reason", () => {
     const parsed = parseBaseline(
