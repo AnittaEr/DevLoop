@@ -35,6 +35,8 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
+
 const THIS_FILE = fileURLToPath(import.meta.url);
 const PLUGIN_DIR = path.resolve(path.dirname(THIS_FILE), "..");
 const SRC_DIR = path.resolve(PLUGIN_DIR, "..", "..");
@@ -457,25 +459,31 @@ describe("plugin boundary: core does not import the plugin implementation", () =
     }
   });
 
-  // TIMEOUT: 30s, measured. This test is the only one in the file that spawns a
-  // subprocess, and it spawns it TWICE (a negative control, then the real
-  // bytes), so its floor is two Prettier cold starts. Measured on this file at
-  // base `1f4bd5c` with `Date.now()` probes around each `spawnSync`, over 8 full
-  // `bun run test` runs:
+  // MEASURED BUDGET: `subprocess`. This test spawns Prettier TWICE -- a
+  // negative control, then the real bytes -- so it pays two cold starts inside
+  // one test, and it is the only test in this file that spawns anything at all.
   //
-  //   isolated (3 runs)  control spawn 1041-1740ms, final spawn 746-1829ms
-  //   full suite (7 runs) control spawn 1922-3135ms, final spawn 2839-3981ms
+  // Measured here, at origin/main `1f4bd5c`, with `Date.now()` probes around
+  // each `spawnSync` and the full suite (509 tests, 8 cores):
   //
-  // i.e. 2.6-6.9s of subprocess wall time inside ONE test, against a 5s default
-  // timeout. That is why this test was red at 2 of 8 full-suite runs and 0 of 8
-  // isolated runs on UNMODIFIED `origin/main`: suite load stretches Prettier's
-  // Node start, not the code under test. 30s is ~4x the worst observed total
-  // (6.9s), so the guard keeps its teeth against a genuinely hung formatter --
-  // `prettier --check` on one file cannot legitimately take 30s. Scoped to this
-  // test on purpose: the global timeout stays 5s for the other 508 tests.
+  //   isolated, 3 runs     control 1041-1740ms, final 746-1829ms  (total <= 3.6s)
+  //   full suite, 8 runs   4 of 8 runs FAILED with "Test timed out in 5000ms";
+  //                        the per-spawn cost stretched to 1922-3981ms, i.e.
+  //                        2.6-6.9s of subprocess wall time in one test
+  //
+  // So the timeout is load-bearing, not decorative: it is reproduced on
+  // UNMODIFIED main without any other change. 30s is ~4x the worst observed
+  // total, so the guard keeps its teeth against a genuinely hung formatter
+  // (`prettier --check` on one file cannot legitimately take 30s).
+  //
+  // SCOPED HERE ON PURPOSE. The global timeout stays Vitest's 5s default for the
+  // other 508 tests, so a regression that made an ordinary in-process test slow
+  // still fails in 5s. B52 (`t_c81e68dd`, `7ba17de`) raised this same test's
+  // timeout independently and is not integrated; this card does not cherry-pick
+  // it, so this edit is reviewable on its own.
   it(
     "writes a canary Prettier accepts, so a leftover cannot break format:check",
-    { timeout: 30_000 },
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
     () => {
       // The canary's bytes are the whole finding: a leftover lives inside the
       // Prettier-checked tree, so whatever these bytes are, they decide whether
@@ -511,12 +519,10 @@ describe("plugin boundary: core does not import the plugin implementation", () =
           encoding: "utf8",
         });
         expect(result.status, result.stdout + result.stderr).toBe(0);
-        expect(result.stdout + result.stderr).not.toContain(
-          "Code style issues",
-        );
-      } finally {
-        removeCanary();
-      }
+        expect(result.stdout + result.stderr).not.toContain("Code style issues");
+        } finally {
+          removeCanary();
+        }
     },
   );
 
