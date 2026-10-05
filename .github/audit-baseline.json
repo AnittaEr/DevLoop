@@ -1,0 +1,3 @@
+{
+  "GHSA-vfj7-8cjw-p6xm": "braces <=3.0.3: stack-exhaustion DoS via deeply nested patterns (high, CWE-674, CVSS 7.5). UNFIXABLE BY ANY BUMP: braces dist-tags.latest IS 3.0.3 and the advisory's vulnerable_versions is <=3.0.3, so the latest release is itself the last vulnerable release and no fixed version exists to move to. Reached via tailwindcss > micromatch > braces and eslint-config-next > @next/eslint-plugin-next > fast-glob > micromatch > braces; micromatch@4.0.8 (latest) depends on braces ^3.0.3, so no upstream resolution can escape it either. The only real paths off it are tailwindcss v4 or eslint-config-next 16, both multi-commit migrations that are out of scope for this card. Remove this entry when a fixed braces release exists."
+}
