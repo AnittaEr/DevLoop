@@ -652,9 +652,9 @@ describe("buildReviewSummary -- purity", () => {
  *
  * SO THE WORDS ARE NEVER WRITTEN WHOLE HERE, and the assembly is DELIBERATE and
  * declared rather than sneaky: the halves sit visibly side by side on the page,
- * `join` is the only mechanism, and {@link VOCABULARY_IS_ASSEMBLED_NOT_LITERAL}
- * asserts that the round trip really reproduces the token -- so a reader cannot
- * mistake a silently-broken deny-list for a renderer that is merely clean.
+ * `token` is the only mechanism, and {@link EXPECTED_SPELLING} independently
+ * pins what each assembled token MUST spell -- so a reader cannot mistake a
+ * silently-broken deny-list for a renderer that is merely clean.
  *
  * A denial that is slightly harder to read is the correct trade against a
  * denial that fails to load at all. The guard that matters here is still the
@@ -681,6 +681,36 @@ const FORBIDDEN_VOCABULARY: readonly string[] = [
   token("repos", "itory"),
   token("http", "s://"),
   token("http", "://"),
+];
+
+/**
+ * The ONLY control that can see a corrupted assembly.
+ *
+ * `FORBIDDEN_VOCABULARY` is checked against itself everywhere else in this file,
+ * which is `x.includes(x)` -- true for ANY array, right spelling or not. So an
+ * assembly that quietly stopped concatenating (`${head}__${tail}`, a stray
+ * suffix, a case fold) would leave the scan above perfectly green over a
+ * renderer whose deny-list can no longer see a single vendor word. THAT IS THE
+ * FAILURE THIS TABLE EXISTS TO CATCH, and it is caught only because the expected
+ * spelling is written INDEPENDENTLY: as per-byte numeric codes, derived from the
+ * word rather than from `token()`. If the two ever diverge, one of them is wrong
+ * and the test says so by name.
+ */
+const EXPECTED_SPELLING: readonly (readonly number[])[] = [
+  [0x67, 0x69, 0x74, 0x68, 0x75, 0x62],
+  [0x6f, 0x63, 0x74, 0x6f, 0x6b, 0x69, 0x74],
+  [0x70, 0x75, 0x6c, 0x6c, 0x5f, 0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74],
+  [0x70, 0x75, 0x6c, 0x6c, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74],
+  [0x70, 0x75, 0x6c, 0x6c, 0x20, 0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74],
+  [0x67, 0x69, 0x74, 0x6c, 0x61, 0x62],
+  [0x62, 0x69, 0x74, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74],
+  [0x61, 0x7a, 0x75, 0x72, 0x65],
+  [0x47, 0x49, 0x54, 0x48, 0x55, 0x42, 0x5f, 0x54, 0x4f, 0x4b, 0x45, 0x4e],
+  [0x6f, 0x77, 0x6e, 0x65, 0x72],
+  [0x62, 0x72, 0x61, 0x6e, 0x63, 0x68],
+  [0x72, 0x65, 0x70, 0x6f, 0x73, 0x69, 0x74, 0x6f, 0x72, 0x79],
+  [0x68, 0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f],
+  [0x68, 0x74, 0x74, 0x70, 0x3a, 0x2f, 0x2f],
 ];
 
 describe("src/core/review/render.ts is provider neutral", () => {
@@ -719,11 +749,13 @@ describe("src/core/review/render.ts is provider neutral", () => {
   });
 
   it("POSITIVE CONTROL: the deny-list really does detect each token it names", () => {
-    // The scan above proves nothing unless it CAN fail. Every token is fed to
-    // the real matcher through a one-line source fragment and must be found in
-    // it -- so a deny-list that silently stopped matching (a typo in a
-    // concatenation half, a case-folding bug) fails HERE, as a named assertion,
+    // LIVENESS ONLY. Every token is fed to the real matcher through a one-line
+    // source fragment and must be found in it, so a deny-list that went inert
+    // (empty, or structurally unable to match) fails HERE as a named assertion
     // rather than leaving the renderer looking clean because the guard is blind.
+    // Note what this deliberately CANNOT see: `denied` and `other` are the same
+    // entries, so this passes for any array at all. Whether each token is
+    // spelled correctly is the separate, independent check below.
     for (const denied of FORBIDDEN_VOCABULARY) {
       const fragment = `const value = ${JSON.stringify(`prefix ${denied} suffix`)};`;
       const detected = FORBIDDEN_VOCABULARY.some((other) =>
@@ -734,6 +766,24 @@ describe("src/core/review/render.ts is provider neutral", () => {
         `the deny-list cannot see its own token: ${JSON.stringify(denied)}`,
       ).toBe(true);
     }
+  });
+
+  it("CONTROL: each assembled token spells exactly the word its byte codes describe", () => {
+    // The independent check the test above cannot make. `token()` is corrupted
+    // -- `head + tail` becomes `head + "_" + tail`, a suffix is dropped, a
+    // half is transposed -- and this is the assertion that notices, because the
+    // right-hand side comes from `EXPECTED_SPELLING`, never from
+    // `FORBIDDEN_VOCABULARY`. Measured: this went green at 32/32 while the
+    // mutation shipped, which is exactly what the round trip must never do.
+    expect(FORBIDDEN_VOCABULARY).toHaveLength(EXPECTED_SPELLING.length);
+
+    FORBIDDEN_VOCABULARY.forEach((assembled, index) => {
+      const expected = String.fromCharCode(...EXPECTED_SPELLING[index]!);
+      expect(
+        assembled,
+        `deny-list entry ${index} assembles to the wrong word; the deny-list can no longer see what it is meant to deny`,
+      ).toBe(expected);
+    });
   });
 
   it("detects a provider token when one is really planted in the renderer", () => {
