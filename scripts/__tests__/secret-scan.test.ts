@@ -267,17 +267,78 @@ describe("secret scan: the baseline is read in BOTH directions", () => {
 });
 
 /**
+ * The identity every temp repo in this file commits as. It is a FIXTURE value:
+ * `.invalid` is reserved by RFC 2606 and can never be a real mailbox.
+ */
+const TEMP_REPO_GIT_NAME = "devloop secret-scan tests";
+const TEMP_REPO_GIT_EMAIL = "secret-scan-tests@example.invalid";
+
+/**
+ * Initialise a throwaway repository at `dir` with a committer identity that
+ * does NOT depend on ambient machine state.
+ *
+ * WHY THIS EXISTS (B55, PR #16 red in CI). `git commit` needs an author and a
+ * committer. When a repository configures neither, git falls back to global
+ * config, then to `EMAIL`/`GIT_AUTHOR_*`/`GIT_COMMITTER_*`, and finally — on
+ * macOS only — to the OS account name via `getpwuid()`. A Linux CI runner has
+ * none of those, so `git commit` exits non-zero with
+ * `fatal: empty ident name ... not allowed` and this suite goes red in a way
+ * no macOS run can reproduce. Measured pre-fix: 1 failure in 6 full-suite runs
+ * under `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`, because the
+ * failure is load-dependent (the `bun run` subprocess inherits whatever the
+ * parallel suite left behind) and single-file runs never hit it.
+ *
+ * So the identity is set EXPLICITLY, here, once per temp repo, at every one of
+ * the three sites that create one. The hermeticity test below asserts it, and
+ * that assertion fails on macOS too — which a "no local failures" argument
+ * could never do.
+ */
+function initTempRepo(dir: string): void {
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  execFileSync("git", ["config", "user.name", TEMP_REPO_GIT_NAME], {
+    cwd: dir,
+  });
+  execFileSync("git", ["config", "user.email", TEMP_REPO_GIT_EMAIL], {
+    cwd: dir,
+  });
+}
+
+/**
+ * An environment with every ambient git identity removed, emulating a CI
+ * runner: no global config, no system config, no `EMAIL`, no `GIT_*_NAME` /
+ * `GIT_*_EMAIL`. On macOS this still does not make an unconfigured repo
+ * uncommittable — `getpwuid()` fills in the OS account — which is exactly why
+ * the tests below assert the RESOLVED ident rather than merely observing that
+ * a commit succeeded.
+ */
+function envWithoutAmbientGitIdentity(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env.EMAIL;
+  delete env.GIT_AUTHOR_NAME;
+  delete env.GIT_AUTHOR_EMAIL;
+  delete env.GIT_COMMITTER_NAME;
+  delete env.GIT_COMMITTER_EMAIL;
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_SYSTEM = "/dev/null";
+  return env;
+}
+
+/**
  * Run the shipped CLI against a throwaway git repository. Returns the exit
  * code and combined output. This is the only assertion here that observes the
  * gate's real exit code, which is the thing CI actually reacts to.
  */
-function runGate(files: Readonly<Record<string, string>>): {
+function runGate(
+  files: Readonly<Record<string, string>>,
+  onRepo?: (dir: string) => void,
+): {
   status: number;
   output: string;
 } {
   const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-"));
   try {
-    execFileSync("git", ["init", "-q"], { cwd: dir });
+    initTempRepo(dir);
+    onRepo?.(dir);
     for (const [name, content] of Object.entries(files)) {
       const full = path.join(dir, name);
       mkdirSync(path.dirname(full), { recursive: true });
@@ -329,7 +390,7 @@ function runGate(files: Readonly<Record<string, string>>): {
 function withTempRepo(body: (dir: string) => void): void {
   const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-repo-"));
   try {
-    execFileSync("git", ["init", "-q"], { cwd: dir });
+    initTempRepo(dir);
     mkdirSync(path.join(dir, "scripts"), { recursive: true });
     mkdirSync(path.join(dir, "security"), { recursive: true });
     for (const name of ["secret-scan.ts", "scan-secrets.ts"]) {
@@ -374,6 +435,137 @@ function runScanner(
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
 }
+
+/**
+ * `git` with every ambient identity removed — see
+ * `envWithoutAmbientGitIdentity`. Used only by the hermeticity tests, which
+ * must resolve the ident the way a Linux CI runner does. The other tests go
+ * through `git()`, whose environment does not matter *because* `initTempRepo`
+ * configured the repo explicitly: the repo config is consulted before the
+ * `getpwuid()` fallback, so it wins regardless.
+ */
+function gitIsolated(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: envWithoutAmbientGitIdentity(),
+  });
+}
+
+describe("secret scan: every temp repo is hermetic w.r.t. git identity (B55)", () => {
+  // The defect this pins: PR #16's `verify` job was red because
+  // `withTempRepo()` created a repository with no `user.name`/`user.email`, and
+  // `git commit` inside it needed one. macOS papers over this with
+  // `getpwuid()`; a Linux CI runner has no such fallback. A suite that merely
+  // PASSES locally therefore proves nothing — these tests assert the resolved
+  // ident instead, and they fail on macOS too if the configuration is removed.
+  const author = (dir: string) =>
+    gitIsolated(dir, "log", "-1", "--format=%an <%ae>").trim();
+
+  it("withTempRepo's repo commits as the FIXTURE ident, not the OS account", () => {
+    withTempRepo((dir) => {
+      expect(gitIsolated(dir, "config", "--get", "user.email").trim()).toBe(
+        TEMP_REPO_GIT_EMAIL,
+      );
+      writeFileSync(path.join(dir, "a.ts"), "export const n = 1;\n", "utf8");
+      gitIsolated(dir, "add", "-A");
+      // Under the emulated runner: no global/system config, no EMAIL, no
+      // GIT_*_NAME/_EMAIL. This is the exact `git commit` that failed in CI.
+      gitIsolated(dir, "commit", "-qm", "hermetic");
+      expect(author(dir)).toBe(
+        `${TEMP_REPO_GIT_NAME} <${TEMP_REPO_GIT_EMAIL}>`,
+      );
+    });
+  });
+
+  it("runGate's repo has the fixture identity configured", () => {
+    // `runGate` gets an `onRepo` hook because it creates the repo itself and
+    // deletes it in its own `finally`; the hook is the only way to observe the
+    // repository it built, and an empty hook would let this pass vacuously.
+    let observed = false;
+    runGate({ "src/ok.ts": "export const n = 1;\n" }, (dir) => {
+      observed = true;
+      expect(gitIsolated(dir, "config", "--get", "user.name").trim()).toBe(
+        TEMP_REPO_GIT_NAME,
+      );
+    });
+    expect(observed).toBe(true);
+  });
+
+  it("an UNCONFIGURED repo has no fixture ident — so the config is load-bearing", () => {
+    // The control for the pair above, and the reason "the commit worked" is not
+    // evidence. On macOS this repo still commits, as the OS account — which is
+    // precisely why the defect was invisible here and red on the runner. On
+    // Linux git refuses outright. Both platforms agree on the assertion: the
+    // identity the two tests above rely on comes from `initTempRepo`, never
+    // from the machine.
+    const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-unconfigured-"));
+    try {
+      // Deliberately NOT `initTempRepo`: this repo must have NO identity, which
+      // is the control for the fix. Its single bare `git init` is the one the
+      // structural guard below accounts for.
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      let unconfiguredName = "";
+      let unconfiguredEmail = "";
+      try {
+        unconfiguredName = gitIsolated(
+          dir,
+          "config",
+          "--get",
+          "user.name",
+        ).trim();
+      } catch {
+        // `git config --get` exits 1 when the key is unset — the state under test.
+      }
+      try {
+        unconfiguredEmail = gitIsolated(
+          dir,
+          "config",
+          "--get",
+          "user.email",
+        ).trim();
+      } catch {
+        // As above.
+      }
+      expect(unconfiguredName).toBe("");
+      expect(unconfiguredEmail).toBe("");
+
+      writeFileSync(path.join(dir, "a.ts"), "export const n = 1;\n", "utf8");
+      gitIsolated(dir, "add", "-A");
+      let committed = false;
+      try {
+        gitIsolated(dir, "commit", "-qm", "unconfigured");
+        committed = true;
+      } catch {
+        // Expected on the Linux CI runner: git refuses, which is what made
+        // PR #16 red.
+      }
+      if (committed) {
+        // On macOS git resolved the OS account via getpwuid() instead — which is
+        // exactly why the defect was invisible here.
+        expect(author(dir)).not.toBe(
+          `${TEMP_REPO_GIT_NAME} <${TEMP_REPO_GIT_EMAIL}>`,
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("no temp repo in this file is created by a bare `git init` any more", () => {
+    // Structural guard for the THIRD site (the inline cwd test), which builds
+    // its own repository and so cannot be covered by exercising the helper.
+    // Without this, re-adding `git init -q` at any site would restore the exact
+    // defect while every hermeticity test above still passed.
+    const source = readFileSync(__filename, "utf8");
+    const bareInits = source.match(/\["init", "-q"\]/g) ?? [];
+    // Exactly two: the one inside `initTempRepo`, and the one in the
+    // unconfigured-repo control above, which must NOT configure an identity.
+    expect(bareInits).toHaveLength(2);
+    const helperCalls = source.match(/^\s*initTempRepo\(dir\);$/gm) ?? [];
+    expect(helperCalls).toHaveLength(3); // runGate, withTempRepo, inline cwd
+  });
+});
 
 describe("secret scan: the STAGED BYTES are scanned, not the working tree", () => {
   // A real bug found by QA at `304bacd`, in the exact code path the ticket's c6
@@ -466,8 +658,9 @@ describe("secret scan: the STAGED BYTES are scanned, not the working tree", () =
     // actually runs. QA's reproduction used `git commit`; this asserts the
     // installed hook refuses it.
     withTempRepo((dir) => {
-      git(dir, "config", "user.email", "qa@example.invalid");
-      git(dir, "config", "user.name", "qa");
+      // Identity comes from `withTempRepo` (c3): this call site used to set it
+      // inline while the helper did not, which is how the missing-identity
+      // defect hid here — the file looked deliberate.
       mkdirSync(path.join(dir, ".githooks"), { recursive: true });
       writeFileSync(
         path.join(dir, ".githooks", "pre-commit"),
@@ -519,8 +712,6 @@ describe("secret scan: the STAGED BYTES are scanned, not the working tree", () =
     // made. The committed-tree CI run sees this only if a developer leaves the
     // conflict unresolved, which CI reports anyway.
     withTempRepo((dir) => {
-      git(dir, "config", "user.email", "qa@example.invalid");
-      git(dir, "config", "user.name", "qa");
       writeFileSync(path.join(dir, "f"), "base\n", "utf8");
       git(dir, "add", "f");
       git(dir, "commit", "-qm", "base");
@@ -582,7 +773,7 @@ describe("secret scan: the shipped CLI's exit code, in a throwaway repo", () => 
     // the output naming that exact path.
     const dir = mkdtempSync(path.join(tmpdir(), "secret-scan-cwd-"));
     try {
-      execFileSync("git", ["init", "-q"], { cwd: dir });
+      initTempRepo(dir);
       mkdirSync(path.join(dir, "src"), { recursive: true });
       mkdirSync(path.join(dir, "scripts"), { recursive: true });
       mkdirSync(path.join(dir, "security"), { recursive: true });
