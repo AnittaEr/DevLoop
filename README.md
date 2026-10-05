@@ -60,26 +60,29 @@ empty and no credential belongs in the repository.
 
 ## Scripts
 
-Every script in `package.json`, all 16 of them:
+Every script in `package.json`, all 19 of them:
 
-| Script                 | Purpose                                                     |
-| ---------------------- | ----------------------------------------------------------- |
-| `bun run dev`          | Start the dev server                                        |
-| `bun run build`        | Production build (`next build`)                             |
-| `bun run start`        | Serve the production build (`next start`)                   |
-| `bun run lint`         | `eslint . --max-warnings 0` — zero tolerance, so it gates   |
-| `bun run typecheck`    | `tsc --noEmit`                                              |
-| `bun run test`         | Vitest, single run (`src/**` plus `e2e/**` helpers)         |
-| `bun run e2e`          | Playwright end-to-end specs against a real Chromium         |
-| `bun run e2e:install`  | One-time: download the Chromium build Playwright needs      |
-| `bun run test:watch`   | Vitest in watch mode                                        |
-| `bun run test:db`      | The DB round-trip suite (separate config, needs a database) |
-| `bun run format`       | Prettier write                                              |
-| `bun run format:check` | Prettier check (no writes) — the only gate that reads `.md` |
-| `bun run db:generate`  | `drizzle-kit generate` — regenerate `db/migrations`         |
-| `bun run db:migrate`   | Apply `db/migrations` to `DATABASE_URL`                     |
-| `bun run db:check`     | Confirm `DATABASE_URL` reaches a live server                |
-| `bun run audit`        | Dependency advisories against `.github/audit-baseline.json` |
+| Script                          | Purpose                                                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `bun run dev`                   | Start the dev server                                                                                          |
+| `bun run build`                 | Production build (`next build`)                                                                               |
+| `bun run start`                 | Serve the production build (`next start`)                                                                     |
+| `bun run lint`                  | `eslint . --max-warnings 0` — zero tolerance, so it gates                                                     |
+| `bun run typecheck`             | `tsc --noEmit`                                                                                                |
+| `bun run test`                  | Vitest, single run (`src/**` plus `e2e/**` helpers)                                                           |
+| `bun run e2e`                   | Playwright end-to-end specs against a real Chromium                                                           |
+| `bun run e2e:install`           | One-time: download the Chromium build Playwright needs                                                        |
+| `bun run test:watch`            | Vitest in watch mode                                                                                          |
+| `bun run test:db`               | The DB round-trip suite (separate config, needs a database)                                                   |
+| `bun run format`                | Prettier write                                                                                                |
+| `bun run format:check`          | Prettier check (no writes) — the only gate that reads `.md`                                                   |
+| `bun run db:generate`           | `drizzle-kit generate` — regenerate `db/migrations`                                                           |
+| `bun run db:migrate`            | Apply `db/migrations` to `DATABASE_URL`                                                                       |
+| `bun run db:check`              | Confirm `DATABASE_URL` reaches a live server                                                                  |
+| `bun run audit`                 | Dependency advisories against `.github/audit-baseline.json`                                                   |
+| `bun run secrets:scan`          | Scan committed content for credentials (`scripts/scan-secrets.ts`), minus `security/secret-scan-baseline.txt` |
+| `bun run secrets:scan:baseline` | Rewrite the credential-scan baseline from current findings (`scripts/scan-secrets.ts --write-baseline`)       |
+| `bun run secrets:hook:install`  | Point this clone's git at the committed `.githooks` (`scripts/install-secret-hook.ts`)                        |
 
 Note the three runners: `test`, `test:db` and `e2e` are independent and none
 substitutes for another. `docs/testing.md` explains the split.
@@ -103,19 +106,23 @@ bun run db:migrate && bun run test:db                 # db round trip job
 `bun run start`, which serves `.next/`), and `bun run test:db` needs
 `bun run db:migrate` against a live database.
 
-Two `verify`-job steps this gate also does not run:
+Three `verify`-job steps this gate also does not run:
 
 ```bash
 bun run audit                                            # Dependency advisories
+bun run secrets:scan                                     # Scan for committed credentials
 bun run db:generate && git diff --exit-code -- db/migrations   # migrations in sync
 ```
 
 `bun run audit` reads the advisory feed and fails loudly when the feed is
 unreachable or unparseable, so it is a real red-capable gate, not a report.
-The second is `bun run db:generate` followed by a `git diff` over
-`db/migrations`: anything other than empty means `db/schema.ts` and the
-committed migrations disagree, and nothing else in this list can see that
-drift because it lives only in a generated `.sql` file.
+`bun run secrets:scan` reads the committed index rather than the working tree,
+subtracts `security/secret-scan-baseline.txt` and fails on anything left over;
+it is deliberately independent of `.githooks/pre-commit`, so a commit made with
+`--no-verify` is still caught here. The third is `bun run db:generate`
+followed by a `git diff` over `db/migrations`: anything other than empty means
+`db/schema.ts` and the committed migrations disagree, and nothing else in this
+list can see that drift because it lives only in a generated `.sql` file.
 
 ## CI
 
@@ -132,19 +139,20 @@ inside `verify`:
 
 Steps of `verify`, in order — the Runs column is the command each step executes:
 
-| Step                         | Runs                                                      |
-| ---------------------------- | --------------------------------------------------------- |
-| Checkout                     | —                                                         |
-| Install bun                  | —                                                         |
-| Verify lockfile is committed | shell guard for a missing `bun.lock`                      |
-| Install dependencies         | `bun install --frozen-lockfile`                           |
-| Dependency advisories        | `bun run audit`                                           |
-| Format check                 | `bun run format:check`                                    |
-| Lint                         | `bun run lint`                                            |
-| Typecheck                    | `bun run typecheck`                                       |
-| Test                         | `bun run test`                                            |
-| Database migrations in sync  | `bun run db:generate`, then `git diff` on `db/migrations` |
-| Build                        | `bun run build`                                           |
+| Step                           | Runs                                                      |
+| ------------------------------ | --------------------------------------------------------- |
+| Checkout                       | —                                                         |
+| Install bun                    | —                                                         |
+| Verify lockfile is committed   | shell guard for a missing `bun.lock`                      |
+| Install dependencies           | `bun install --frozen-lockfile`                           |
+| Dependency advisories          | `bun run audit`                                           |
+| Scan for committed credentials | `bun run secrets:scan`                                    |
+| Format check                   | `bun run format:check`                                    |
+| Lint                           | `bun run lint`                                            |
+| Typecheck                      | `bun run typecheck`                                       |
+| Test                           | `bun run test`                                            |
+| Database migrations in sync    | `bun run db:generate`, then `git diff` on `db/migrations` |
+| Build                          | `bun run build`                                           |
 
 Steps of `e2e`:
 
@@ -172,10 +180,11 @@ Steps of `db`:
 
 **Local green is not CI green.** The gate above covers five of `verify`'s
 substantive steps — format check, lint, typecheck, test, build — and parts of
-`e2e` (build only). It does not cover `bun run audit` or the
-`Database migrations in sync` drift check, and it proves nothing about the
-Playwright run or the database round trip, so you can be locally green and red
-in CI. Run `bun run audit` and `bun run db:generate && git diff --exit-code --
+`e2e` (build only). It does not cover `bun run audit`, the `Scan for committed
+credentials` step, or the `Database migrations in sync` drift check, and it
+proves nothing about the Playwright run or the database round trip, so you can
+be locally green and red in CI. Run `bun run audit`, `bun run secrets:scan` and
+`bun run db:generate && git diff --exit-code --
 db/migrations` alongside it, plus `bun run e2e` after `bun run e2e:install` and
 `bun run db:migrate && bun run test:db`, before you call a change done.
 
@@ -193,7 +202,7 @@ PRs.
 db/               Drizzle schema, SQL migrations, migrate/check scripts
 docs/             docs/testing.md — the three runners, and why they are split
 e2e/              Playwright specs
-scripts/          Repository-level gates (audit)
+scripts/          Repository-level gates (audit, secret scan, hook install)
 src/app/          App Router pages, API routes, global styles, layout
 src/components/   shadcn/ui primitives
 src/core/         Framework-agnostic domain: canonical events, the evidence
