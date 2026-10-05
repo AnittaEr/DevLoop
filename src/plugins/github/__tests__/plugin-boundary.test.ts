@@ -470,18 +470,33 @@ describe("plugin boundary: core does not import the plugin implementation", () =
   //   full suite, 8 runs   2 of 8 runs FAILED with "Test timed out in 5000ms";
   //                        the per-spawn cost stretched to 1922-3981ms, i.e.
   //                        2.6-6.9s of subprocess wall time in one test
-  //   4 concurrent suites 37798ms for this test ALONE -- measured with the
-  //                        budgets applied and every other file green. This is
-  //                        why the budget is `subprocessX4` and not
-  //                        `subprocess`: at 30s this test was still red with
-  //                        'Test timed out in 30000ms' in 4 of 4 runs.
+  //
+  // and RE-MEASURED on this branch at head `6f05277` with the budget applied,
+  // in four SEPARATE detached worktrees so this test's fixed-path canary file
+  // could not be deleted out from under a concurrent run:
+  //
+  //   isolated, 5 runs                 857 / 882 / 981 / 1059 / 1104 ms
+  //   4x concurrent FULL suites, 4 runs 18522 / 17534 / 17532 / 18354 ms
+  //
+  // THE WORST LOADED OBSERVATION IS 18522ms, and the 60s budget is sized from
+  // it: 4x that is 74s, so 60s is the round number below it, while 30s would
+  // leave only 1.6x headroom over the worst case actually observed -- the
+  // number a slower machine crosses first. Isolated worst is 1104ms, so 60s
+  // keeps ~54x headroom over that and still fails a genuinely hung formatter
+  // (`prettier --check` on one file cannot legitimately take 60s).
+  //
+  // This SUPERSEDES an earlier "37798ms" figure that this comment, the budgets
+  // module and `docs/testing.md` all quoted. That one was measured with four
+  // suites sharing ONE worktree, where this test deletes its canary in a
+  // `finally` and a concurrent suite read the file after deletion -- so it
+  // measured contention over the canary file, not this test's cost. The four
+  // numbers above replace it EVERYWHERE, quoted identically: two irreconcilable
+  // measurements for one budget is exactly what makes an integrator stop and
+  // guess which one is real.
   //
   // So the timeout is load-bearing, not decorative: it is reproduced on
-  // UNMODIFIED main without any other change. 60s is ~7x the worst SINGLE-suite
-  // observation (8.0s), so it keeps its teeth against a genuinely hung formatter
-  // (`prettier --check` on one file cannot legitimately take 60s); it is sized
-  // against the CONCURRENT measurement because that is the only load condition
-  // ever observed to exceed 30s.
+  // UNMODIFIED main without any other change, and it is sized against the only
+  // load condition ever observed to exceed 30s.
   //
   // SCOPED HERE ON PURPOSE. The global timeout stays Vitest's 5s default for the
   // other 508 tests, so a regression that made an ordinary in-process test slow
