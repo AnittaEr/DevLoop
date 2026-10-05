@@ -312,20 +312,50 @@ export function requireSource(
 }
 
 /**
- * Fetch one page through a registered source and map it to canonical events.
+ * One fetched page, mapped to canonical events.
+ *
+ * `nextCursor` is carried rather than dropped. The plugin's `FetchedPage`
+ * already returns it, and it is the ONLY way past the first page: a cursor is
+ * never derivable from the events themselves, so a caller that discards it has
+ * no way to reach anything older. Returning it beside the events is what makes
+ * {@link syncSource}'s `SyncOptions.cursor` reachable at all -- before this,
+ * no call site in the module ever produced a value for that field.
+ */
+export interface CanonicalEventPage {
+  /** The page's events, mapped, in source order. */
+  readonly events: CanonicalEvent[];
+  /**
+   * Opaque cursor for the next page, or `undefined` when the source is
+   * exhausted. Opaque to core: hand it back to `fetchCanonicalEvents` /
+   * {@link SyncOptions.cursor} unchanged.
+   */
+  readonly nextCursor?: string;
+}
+
+/**
+ * Fetch ONE page through a registered source and map it to canonical events.
  *
  * The plugin's native item type is erased by the registry, so the items are
  * handed straight back to the same plugin's `mapToCanonicalEvents` without this
  * module ever inspecting one. Nothing provider-shaped crosses here.
+ *
+ * ONE PAGE, NOT THE WHOLE SOURCE. The plugin decides page size, and this
+ * function does not loop: an unbounded loop here would make a single call's
+ * cost unknowable and would page a source forever on a bug. The caller drives
+ * the walk instead -- see {@link SyncResult.nextCursor} and
+ * {@link syncSourceAllPages}.
  */
 export async function fetchCanonicalEvents(
   registry: PluginRegistry,
   name: string = SOURCE_NAME,
   cursor?: string,
-): Promise<CanonicalEvent[]> {
+): Promise<CanonicalEventPage> {
   const plugin = requireSource(registry, name);
   const page = await plugin.fetchItems(cursor);
-  return plugin.mapToCanonicalEvents(page.items);
+  const events = plugin.mapToCanonicalEvents(page.items);
+  return page.nextCursor === undefined
+    ? { events }
+    : { events, nextCursor: page.nextCursor };
 }
 
 /**
@@ -736,12 +766,42 @@ export interface SyncOptions {
   readonly registry: PluginRegistry;
   /** Registered plugin name. Defaults to the GitHub plugin's own name. */
   readonly source?: string;
-  /** Opaque cursor from a previous call. */
+  /**
+   * Opaque cursor from a previous call, to resume where that call stopped.
+   * Produced by a previous call's {@link SyncResult.nextCursor}. `undefined`
+   * starts at the source's newest page.
+   */
   readonly cursor?: string;
   /** Persistence target. Defaults to the real Drizzle client. */
   readonly writer?: CanonicalEventWriter;
 }
 
+/**
+ * The outcome of syncing ONE page: what was written, and whether there is more.
+ *
+ * `failure` AND `nextCursor` ARE NOT IN TENSION, and which one is present is
+ * not inferable from the type -- so the three states are enumerated here and
+ * pinned by tests in `__tests__/composition-root.test.ts` ("failure and
+ * nextCursor are independent"):
+ *
+ *   | outcome                            | persisted | failure | nextCursor |
+ *   |------------------------------------|-----------|---------|------------|
+ *   | batch REFUSED                      | 0         | present | ABSENT     |
+ *   | successful, source EXHAUSTED        | > 0       | absent  | ABSENT     |
+ *   | successful, PARTIAL (more to come)  | > 0       | absent  | present    |
+ *
+ * WHY A REFUSED BATCH CARRIES NO CURSOR, since that is the one case a caller
+ * cannot derive from the rules above. The batch is all-or-nothing, so a refusal
+ * wrote NOTHING: every event on that page is still unwritten. Handing back the
+ * source's cursor would tell a caller to advance PAST a page it believes is
+ * durable, which loses those events permanently and silently. So the cursor is
+ * dropped on the refusal path and the caller re-drives the SAME cursor instead,
+ * which re-fetches the refused page and retries it once the data is fixed.
+ *
+ * Consequently `failure` and `nextCursor` are mutually exclusive by
+ * construction, and "both present" is not a reachable state rather than an
+ * undocumented one.
+ */
 export interface SyncResult {
   /** The events this sync produced, in source order. */
   readonly events: CanonicalEvent[];
@@ -755,6 +815,16 @@ export interface SyncResult {
    * so there is no partial count to report.
    */
   readonly failure?: SyncFailure;
+  /**
+   * Cursor for the NEXT page, or `undefined` when the source is exhausted.
+   *
+   * This is the pagination contract, stated explicitly: a single `syncSource`
+   * call syncs exactly ONE page, and reaching older history means calling again
+   * with the cursor this returns. It is `undefined` -- never a stale repeat of
+   * the input cursor -- once the source has no more pages, so a caller walking
+   * the source terminates rather than looping on the final page forever.
+   */
+  readonly nextCursor?: string;
 }
 
 /**
@@ -799,9 +869,12 @@ export interface SyncResult {
  * The all-or-nothing property is preserved and load-bearing: a CHECK refusal
  * aborts the whole statement, so `persisted: 0` is literally true rather than a
  * rounded-down count.
+ *
+ * ONE PAGE PER CALL. See {@link SyncResult.nextCursor} for the contract and
+ * {@link syncSourceAllPages} for the caller that walks the whole source.
  */
 export async function syncSource(options: SyncOptions): Promise<SyncResult> {
-  const events = await fetchCanonicalEvents(
+  const page = await fetchCanonicalEvents(
     options.registry,
     options.source ?? SOURCE_NAME,
     options.cursor,
@@ -811,17 +884,193 @@ export async function syncSource(options: SyncOptions): Promise<SyncResult> {
   // every call and demand DATABASE_URL from a caller that has nothing to
   // persist. The callee resolves it inside its own empty-list guard.
   try {
-    const persisted = await persistCanonicalEvents(events, options.writer);
-    return { events, persisted };
+    const persisted = await persistCanonicalEvents(page.events, options.writer);
+    return withCursor({ events: page.events, persisted }, page.nextCursor);
   } catch (error) {
+    // A REFUSAL CARRIES NO CURSOR, and that is a decision rather than an
+    // omission -- see `SyncResult`'s doc comment. `page.nextCursor` is dropped
+    // on both refusal paths: the batch was all-or-nothing and NOTHING was
+    // written, so advancing past this page would silently skip events the
+    // caller believes are now durable. A caller that re-drives the SAME cursor
+    // re-fetches the refused page and can retry it once the data is fixed.
     if (error instanceof SyncPersistenceError) {
-      return { events, persisted: 0, failure: error.failure };
+      return { events: page.events, persisted: 0, failure: error.failure };
     }
     if (isCheckViolation(error)) {
-      return { events, persisted: 0, failure: checkViolationFailure(error) };
+      return {
+        events: page.events,
+        persisted: 0,
+        failure: checkViolationFailure(error),
+      };
     }
     throw error;
   }
+}
+
+/**
+ * Attach `nextCursor` only when the source reported one.
+ *
+ * OMISSION RATHER THAN `undefined`. An always-present `nextCursor: undefined`
+ * key would make `"nextCursor" in result` and `Object.keys()` disagree with
+ * what a caller sees, which is the same trap `SyncResult.failure` is documented
+ * against: callers branch on `!== undefined`, and a test asserting the key is
+ * absent is asserting a stronger and more useful fact than one asserting it
+ * reads `undefined`.
+ */
+function withCursor(
+  result: SyncResult,
+  nextCursor: string | undefined,
+): SyncResult {
+  return nextCursor === undefined ? result : { ...result, nextCursor };
+}
+
+/** Bound on the page walk, so a source that never reports exhaustion cannot
+ * hang the process. Far above any real page count at `PAGE_SIZE = 30`. */
+const MAX_SYNC_PAGES = 10_000;
+
+/**
+ * The outcome of a walk that reached the source's end.
+ *
+ * A FOURTH SHAPE, and narrower than {@link SyncResult} on purpose. Where a
+ * single `syncSource` call reports one of three states (refused / exhausted /
+ * partial), this walk reaches exactly one: every page it fetched was WRITTEN and
+ * the source reported no further page. So it carries no `failure` and no
+ * `nextCursor` — a refusal aborts the walk by throwing
+ * {@link SyncPageRefusedError}, and exhaustion means there is nowhere left to
+ * resume. Declaring the optional fields here would let a caller branch on a
+ * `failure` that can never be present and on a cursor that can never be
+ * meaningful, which is precisely the "which field wins" ambiguity `SyncResult`
+ * already has to document.
+ */
+export interface SyncSourceAllPagesResult {
+  /** Every event across every page, in source order. All of it was written. */
+  readonly events: CanonicalEvent[];
+  /** How many rows were written. Equals `events.length` by construction. */
+  readonly persisted: number;
+  /** How many pages were fetched and persisted, the empty last one included. */
+  readonly pages: number;
+}
+
+/**
+ * A page in the MIDDLE of a walk was refused, so the walk stopped there.
+ *
+ * Distinct from a thrown transport or credential failure: this carries the
+ * batch-12 classification, and — unlike a first-page refusal, which the caller
+ * sees directly from `syncSource` — it happens behind pages that were already
+ * written, so the caller cannot tell from anything it already holds that an
+ * earlier page succeeded.
+ *
+ * `cursor` IS THE CURSOR THAT FETCHED THE REFUSED PAGE, not the cursor after
+ * it. That is the whole point: the refused page wrote nothing (the batch is
+ * all-or-nothing), so re-driving this cursor re-fetches exactly those events
+ * and retries them once the data is fixed, while the `pages` already counted
+ * stay durable. Advancing instead would silently lose a page.
+ */
+export class SyncPageRefusedError extends Error {
+  /** The classification `syncSource` produced for the refused page. */
+  readonly failure: SyncFailure;
+  /** Cursor to re-drive to retry the refused page; `undefined` if it was the first. */
+  readonly retryCursor: string | undefined;
+  /** Pages durably written BEFORE the refusal. */
+  readonly pages: number;
+  /** Rows durably written before the refusal. */
+  readonly persisted: number;
+
+  constructor(
+    failure: SyncFailure,
+    retryCursor: string | undefined,
+    pages: number,
+    persisted: number,
+  ) {
+    super(
+      `syncSourceAllPages: page ${pages + 1} was refused (${failure.code}, scope ${failure.scope}) after ${pages} page(s); ${persisted} row(s) remain durable and the refused page is unwritten. Re-drive the same cursor to retry it.`,
+    );
+    this.name = "SyncPageRefusedError";
+    this.failure = failure;
+    this.retryCursor = retryCursor;
+    this.pages = pages;
+    this.persisted = persisted;
+  }
+}
+
+/**
+ * Walk a source from `cursor` to exhaustion, syncing every page.
+ *
+ * EXISTS BECAUSE ONE PAGE IS NOT A SYNC. With `PAGE_SIZE = 30` and descending
+ * order, a single page only ever reaches the newest 30 items, so "ingest the
+ * repository's history" was unreachable unless every caller remembered to
+ * re-drive the cursor by hand -- and nothing in the module produced a cursor to
+ * do that with. This is that loop, written once.
+ *
+ * THE BOUND IS LOAD-BEARING, not defensive decoration: termination is decided
+ * by the plugin reporting no `nextCursor`, and a plugin that keeps reporting one
+ * would otherwise loop forever. The walk also throws on a REPEATED cursor,
+ * which is the other way a source can fail to advance -- a plugin that returns
+ * a constant cursor is paging itself in circles, and silently returning the
+ * first page's events once per duplicate would be a silently truncated ingest.
+ *
+ * A REFUSED PAGE ABORTS THE WALK, AND THAT IS THE POINT. A refusal is reported,
+ * not thrown, by `syncSource` — which is right for one page but wrong for the
+ * aggregate, because a refusal on any page but the FIRST is invisible from
+ * outside: the loop sees a `SyncResult` whose `persisted` is 0 and whose
+ * `events` is a full page, and if it kept summing, the aggregate would report
+ * `persisted: 2, events.length: 4` and no failure at all. Two events were never
+ * written and the caller is told the ingest completed. So the walk stops on the
+ * first `page.failure` and throws {@link SyncPageRefusedError} naming the cursor
+ * that fetched that page. Returning-throwing keeps the result's one invariant
+ * true and unmissable: if this returns, `persisted === events.length`.
+ *
+ * @throws {RangeError} when `maxPages` is not an integer >= 1.
+ * @throws {SyncPageRefusedError} when a page is refused mid-walk, carrying the
+ * classification and the cursor to re-drive. Nothing partial is returned in any
+ * of these cases: the failure is loud instead.
+ */
+export async function syncSourceAllPages(
+  options: SyncOptions & { readonly maxPages?: number },
+): Promise<SyncSourceAllPagesResult> {
+  const maxPages = options.maxPages ?? MAX_SYNC_PAGES;
+  if (!Number.isInteger(maxPages) || maxPages < 1) {
+    throw new RangeError(`syncSourceAllPages: maxPages must be >= 1`);
+  }
+
+  const events: CanonicalEvent[] = [];
+  const seenCursors = new Set<string>();
+  let persisted = 0;
+  let pages = 0;
+  let cursor = options.cursor;
+
+  for (;;) {
+    const page: SyncResult = await syncSource({ ...options, cursor });
+    pages += 1;
+    // BEFORE anything is accumulated: a refused page contributed nothing
+    // durable, so its events must not enter `events` (which would break
+    // `persisted === events.length`) and the walk must not advance past it.
+    if (page.failure !== undefined) {
+      throw new SyncPageRefusedError(
+        page.failure,
+        cursor,
+        pages - 1,
+        persisted,
+      );
+    }
+    events.push(...page.events);
+    persisted += page.persisted;
+    if (page.nextCursor === undefined) break;
+    if (seenCursors.has(page.nextCursor)) {
+      throw new Error(
+        `syncSourceAllPages: source repeated cursor after ${pages} pages; aborting rather than paging in circles`,
+      );
+    }
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+    if (pages >= maxPages) {
+      throw new Error(
+        `syncSourceAllPages: exceeded maxPages (${maxPages}) without the source reporting exhaustion; aborting`,
+      );
+    }
+  }
+
+  return { events, persisted, pages };
 }
 
 /**

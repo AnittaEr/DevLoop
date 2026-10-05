@@ -149,3 +149,91 @@ they can carry Vitest negative controls. The two runners still never pick up
 each other's files: Playwright's `testMatch` is `*.spec.ts`, so a `.test.ts`
 under `e2e/` is invisible to `playwright test`, and a `.spec.ts` under `e2e/`
 is invisible to Vitest.
+
+## Dependency advisories
+
+`bun run audit` is a CI gate. It runs as its own named step (`Dependency
+advisories`) inside the existing `verify` job in `.github/workflows/ci.yml`,
+immediately after `bun install --frozen-lockfile` — `bun audit` reads the
+resolved lockfile, and running it before the quality gates means a new advisory
+is reported as itself rather than buried behind a later failure.
+
+The gate's verdict is `bun audit --json` compared against a committed baseline,
+`.github/audit-baseline.json`. An advisory is acceptable **only** if its GitHub
+advisory ID is a key in that file. It is a baseline, not a waiver: it is a
+diffable file, every entry carries a reason that is printed on each run,
+removing an ID turns the gate red, and no code path rewrites the file. It is
+matched by **ID** — not by package name, not by severity, not by wildcard — so a
+new advisory for an already-listed package is still reported.
+
+### The known-unfixable advisory: `GHSA-vfj7-8cjw-p6xm`
+
+`braces` — **high**, stack-exhaustion denial of service through deeply nested
+patterns (CWE-674, CVSS 7.5). Reached via two independent chains:
+
+```
+tailwindcss › micromatch › braces
+eslint-config-next › @next/eslint-plugin-next › fast-glob › micromatch › braces
+```
+
+**No fixed release exists.** `braces`' `dist-tags.latest` is `3.0.3` and the
+advisory's `vulnerable_versions` is `<=3.0.3`, so the latest published release
+is itself the last vulnerable release — there is no version to move to. And
+`micromatch@4.0.8` (also latest) depends on `braces: ^3.0.3`, so no upstream
+re-resolution escapes it either. The only real paths off it are upgrading
+`tailwindcss` to v4 or `eslint-config-next` to 16, both multi-commit migrations
+with their own breakage.
+
+### A fixed advisory that was fixed, not baselined
+
+`esbuild` — **moderate**, `GHSA-67mh-4wv8-2f99` ("enables any website to send
+any requests to the development server and read the response"). This one **was**
+reachable, via `drizzle-kit › esbuild`. `esbuild@0.18.20` was required by
+`@esbuild-kit/core-utils@3.3.2`, whose own latest pins `esbuild: ~0.18.20`.
+
+bun 1.3.10 does not honour npm's scoped `parent>child` override syntax (both
+`@esbuild-kit/core-utils>esbuild` and the `>parent>child` form were measured to
+leave `esbuild@0.18.20` in the lockfile), so the working path is the flat
+`"overrides": { "esbuild": "0.28.2" }` entry — which also collapses the
+`0.18.20`/`0.25.12`/`0.28.2` copies to one non-vulnerable `0.28.2`. That is
+why the baseline has one entry, not two: the second advisory was genuinely
+fixable and was fixed rather than waived.
+
+### When the gate runs red
+
+A transport failure is **not** a skip. If the advisory feed cannot be reached,
+`bun run audit` fails with a `::error::` naming the failure, because a run that
+could not reach the feed has verified nothing and reporting that as green would
+be a false green. This costs little in practice: the step runs directly after
+`bun install --frozen-lockfile`, which needs the same registry and would already
+have failed the job.
+
+When a genuine new advisory appears, either upgrade the dependency, or — if the
+advisory truly has no fixed release — add its ID to
+`.github/audit-baseline.json` with a one-line reason. Do not raise a severity
+threshold to hide it. A baseline entry that matches nothing in the current tree
+is reported as a `::warning::` so the file cannot rot into a permanent blanket.
+
+## No test file may be collected by no suite
+
+`src/__tests__/no-orphaned-test-files.test.ts` fails the **default** suite (so
+`verify`, which has no database) if any **tracked** file matching
+`*.test.*` / `*.spec.*` is collected by none of the three runners. It reads the
+tracked list from `git ls-files` — an untracked file is work in progress, not a
+defect — and derives the collected sets by parsing `test.include` in
+`vitest.config.ts` and `vitest.db.config.ts` plus `testDir`/`testMatch` in
+`playwright.config.ts` as **text**. It imports no config: executing a
+Vitest/Playwright config from inside a jsdom test is a measured failure, and
+`db-suite-registry.test.ts` records the exact error it causes.
+
+This is the inverse of `db-suite-registry.test.ts`. That guard answers "is this
+db-backed test collected by the _right_ suite?"; this one answers "is this test
+file collected by _any_ suite?". A file that is written, committed, and matched
+by no glob runs nowhere and looks green in every report — this guard closes that
+gap.
+
+It carries its own non-vacuity floors, asserted rather than commented: the
+tracked set must exceed 20 files, the unit config must contribute at least 10,
+the db config at least 1, and Playwright at least 1. So deleting a whole
+`include:` array turns the guard **red** instead of quietly shrinking the
+difference to nothing.

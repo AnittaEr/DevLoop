@@ -6,6 +6,19 @@ on:
   push:
     branches: [main]
 
+# Least privilege for GITHUB_TOKEN, stated explicitly.
+#
+# WITHOUT THIS LINE the workflow inherits the repository's default token
+# permissions, which is a larger grant than any job here needs: no job uses
+# GITHUB_TOKEN at all. Nothing in this file reads a repository secret — the only
+# credential-shaped string is the throwaway Postgres service pair in the `db`
+# job, which is a local container credential and not a secret. So the checkout
+# is the only thing the token is ever for, and `contents: read` is its whole
+# job. Stated at workflow level (a sibling of `on:`/`concurrency:`) rather than
+# per job so a job added later cannot silently widen it.
+permissions:
+  contents: read
+
 # A new push to the same branch supersedes an in-flight run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -47,6 +60,38 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      # B50 (`t_e211ed32`) — the dependency-advisory gate, placed immediately
+      # after the install because `bun audit` reads the resolved lockfile, and
+      # before the quality gates so an unfixable-looking advisory is reported as
+      # itself rather than buried behind a later step.
+      #
+      # WHY IT IS A STEP IN `verify` AND NOT A FOURTH JOB. The three existing
+      # jobs are separate because they need DIFFERENT RUNNERS — `e2e` needs
+      # Chromium, `db` needs a Postgres service. This step needs the same runner,
+      # the same install and the same lockfile as `verify`, and it runs in about
+      # a second. Splitting it would add a runner allocation and a second place
+      # to keep green for no gain; its own `- name:` is what makes a red
+      # advisory legible in the PR checks list, and that is available either way.
+      #
+      # WHY IT IS NOT `continue-on-error`. This is the step that makes a new
+      # high-severity advisory a red check instead of an invisible fact; marking
+      # it advisory-only would restore exactly the ungated condition this card
+      # exists to close, and would be indistinguishable in the checks list from a
+      # step that cannot fail.
+      #
+      # NETWORK FAILURE. `bun audit` needs the advisory feed. On a transport
+      # failure the gate FAILS LOUDLY (`::error::` naming the failure) rather than
+      # skipping: a run that could not reach the feed has verified nothing, and
+      # a silent skip would report that as a green "no unbaselined advisories".
+      # scripts/audit.ts also treats an unparseable feed as failure, so
+      # "unreachable" and "reachable and clean" are never the same output. The
+      # risk of a false red is bounded: this step runs right after
+      # `bun install --frozen-lockfile`, which needs the same registry and would
+      # already have failed the job — so a feed outage is never the sole cause of
+      # a red run, and it is never laundered into a green one.
+      - name: Dependency advisories
+        run: bun run audit
 
       # `prettier --check` is the only gate here that reads .md, .yml, .json and
       # .css. Lint is `eslint .` over TypeScript, so a file carrying unresolved

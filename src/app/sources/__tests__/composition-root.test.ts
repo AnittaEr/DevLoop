@@ -41,6 +41,7 @@ import {
   FIXTURE_REPOSITORY,
   fixtureIssue,
   fixtureProposal,
+  fullPage,
   pageBody,
 } from "@/plugins/github/__tests__/fixtures";
 
@@ -55,6 +56,7 @@ import {
   SYNC_FAILURE_CODES,
   SYNC_FAILURE_SCOPES,
   SourceConfigurationError,
+  SyncPageRefusedError,
   SyncPersistenceError,
   createSourceRegistry,
   fetchCanonicalEvents,
@@ -62,6 +64,7 @@ import {
   persistCanonicalEvents,
   requireSource,
   syncSource,
+  syncSourceAllPages,
 } from "../index";
 
 /**
@@ -265,11 +268,451 @@ describe("composition root: the registry holds the wired GitHub plugin", () => {
   });
 });
 
+/**
+ * Pagination: the defect this block exists for is that a cursor was DROPPED.
+ *
+ * Before the fix `fetchCanonicalEvents` returned `CanonicalEvent[]` and threw
+ * `page.nextCursor` away, and `SyncOptions.cursor` had no producer anywhere in
+ * the module. So with `PAGE_SIZE = 30` and descending order, everything older
+ * than the newest page was unreachable — not merely awkward, unreachable, and
+ * no test could have shown it because no caller could produce a cursor.
+ *
+ * The plugin issues a cursor only off a FULL page, so these tests pin
+ * `pageSize: 2` and serve exactly two items per real page. That is what makes
+ * the walk continue: a short page means "exhausted" by the plugin's own
+ * documented rule.
+ */
+describe("composition root: pagination reaches past the first page", () => {
+  /** Page 1: issues 1-2 (full → cursor). Page 2: issues 3-4 (full → cursor).
+   *  Page 3: empty (short → exhausted). */
+  function threePageRegistry(): {
+    registry: PluginRegistry;
+    transport: FakeHttpTransport;
+  } {
+    return registryWith(
+      {
+        "1": { body: pageBody(fullPage(2, 1)) },
+        "2": { body: pageBody(fullPage(2, 3)) },
+        "3": { body: "[]" },
+      },
+      { pageSize: 2 },
+    );
+  }
+
+  it("returns the next cursor instead of discarding it", async () => {
+    const { registry } = threePageRegistry();
+
+    const page = await fetchCanonicalEvents(registry);
+
+    // The defect, stated as an assertion: the cursor survives the mapping.
+    // Before the fix this property did not exist on the return value at all.
+    expect(page.events).toHaveLength(2);
+    expect(page.nextCursor).toBeDefined();
+  });
+
+  it("actually fetches the SECOND page by feeding the cursor back in", async () => {
+    const { registry } = threePageRegistry();
+
+    const first = await fetchCanonicalEvents(registry);
+    expect(first.events.map((e) => e.externalId).sort()).toEqual([
+      `${FIXTURE_REPOSITORY}#1`,
+      `${FIXTURE_REPOSITORY}#2`,
+    ]);
+
+    // The cursor is accepted by the same entry point. This is the assertion that
+    // fails if the cursor is dropped: with it dropped there is nothing to pass
+    // and the second call can only re-fetch page 1.
+    const second = await fetchCanonicalEvents(
+      registry,
+      SOURCE_NAME,
+      first.nextCursor,
+    );
+
+    expect(second.events.map((e) => e.externalId).sort()).toEqual([
+      `${FIXTURE_REPOSITORY}#3`,
+      `${FIXTURE_REPOSITORY}#4`,
+    ]);
+    // Different content, not the first page again.
+    expect(second.events.map((e) => e.id)).not.toEqual(
+      first.events.map((e) => e.id),
+    );
+  });
+
+  it("reports exhaustion by OMITTING nextCursor, not by echoing the input", async () => {
+    const { registry } = threePageRegistry();
+
+    const first = await fetchCanonicalEvents(registry);
+    const second = await fetchCanonicalEvents(
+      registry,
+      SOURCE_NAME,
+      first.nextCursor,
+    );
+    expect(second.nextCursor).toBeDefined();
+
+    const third = await fetchCanonicalEvents(
+      registry,
+      SOURCE_NAME,
+      second.nextCursor,
+    );
+
+    expect(third.events).toEqual([]);
+    // The key property: a caller looping on `nextCursor !== undefined`
+    // TERMINATES. Echoing the input cursor back here would loop forever on the
+    // empty final page.
+    expect(third.nextCursor).toBeUndefined();
+  });
+
+  it("syncSource returns the cursor, so its `cursor` option has a producer", async () => {
+    const { registry } = threePageRegistry();
+    const writer = new RecordingWriter();
+
+    const first: SyncResult = await syncSource({ registry, writer });
+    expect(first.events).toHaveLength(2);
+    expect(first.persisted).toBe(2);
+    expect(first.nextCursor).toBeDefined();
+
+    // The option this whole block exists to make reachable.
+    const second = await syncSource({
+      registry,
+      writer,
+      cursor: first.nextCursor,
+    });
+    expect(second.events.map((e) => e.externalId).sort()).toEqual([
+      `${FIXTURE_REPOSITORY}#3`,
+      `${FIXTURE_REPOSITORY}#4`,
+    ]);
+    // Both pages reached the writer: 4 rows, not 2.
+    expect(writer.totalRows).toBe(4);
+  });
+
+  it("walks every page to exhaustion and sums the result", async () => {
+    const { registry } = threePageRegistry();
+    const writer = new RecordingWriter();
+
+    const result = await syncSourceAllPages({ registry, writer });
+
+    expect(result.pages).toBe(3);
+    // 4 real events across 2 full pages, plus the empty third that proves
+    // termination.
+    expect(result.events).toHaveLength(4);
+    expect(result.events.map((e) => e.externalId).sort()).toEqual([
+      `${FIXTURE_REPOSITORY}#1`,
+      `${FIXTURE_REPOSITORY}#2`,
+      `${FIXTURE_REPOSITORY}#3`,
+      `${FIXTURE_REPOSITORY}#4`,
+    ]);
+    expect(result.persisted).toBe(4);
+    expect(writer.totalRows).toBe(4);
+    // Exhaustion needs no cursor here: `SyncSourceAllPagesResult` has no
+    // `nextCursor` field to be absent, which is the stronger form of the
+    // "reports exhaustion by omitting nextCursor" assertion on `syncSource`.
+    // Pinned as key absence in "a completed walk's result carries no `failure`
+    // and no `nextCursor` key" below.
+  });
+
+  it("ABORTS rather than looping forever when a source never reports exhaustion", async () => {
+    // A source that keeps handing out cursors is the failure this bound exists
+    // for. Every page here is FULL, so the plugin never reports exhaustion and
+    // would page indefinitely — which is why the walk needs a bound rather than
+    // trusting the source to stop. `maxPages: 3` makes the hang observable in a
+    // test instead of freezing the suite.
+    const byPage: Record<string, { body: string }> = {};
+    for (let page = 1; page <= 10; page += 1) {
+      byPage[String(page)] = {
+        body: pageBody(fullPage(2, (page - 1) * 2 + 1)),
+      };
+    }
+    const { registry } = registryWith(byPage, { pageSize: 2 });
+
+    await expect(
+      syncSourceAllPages({
+        registry,
+        writer: new RecordingWriter(),
+        maxPages: 3,
+      }),
+    ).rejects.toThrow(/maxPages/);
+  });
+
+  it("ABORTS on a repeated cursor instead of paging in circles", async () => {
+    // The second way a source fails to advance: a plugin that hands back the
+    // SAME cursor over and over is paging itself in circles. Returning quietly
+    // would silently re-ingest one page and report a truncated ingest as
+    // complete, so the walk aborts on the repeat.
+    //
+    // A stand-in plugin rather than the real one: the GitHub plugin's cursors
+    // advance, so what is under test here is the WALK's reaction to a stuck
+    // source, not the plugin's cursor arithmetic (which has its own tests).
+    const stuck = new PluginRegistry([
+      {
+        describe: () => ({
+          name: SOURCE_NAME,
+          version: "0.1.0",
+          requiresAuth: false,
+        }),
+        fetchItems: async () => ({
+          items: fullPage(2, 1),
+          nextCursor: "always-the-same",
+        }),
+        mapToCanonicalEvents: (raw) =>
+          raw.map((item) => ({
+            id: `stuck:${String((item as { number: unknown }).number)}`,
+            source: SOURCE_NAME,
+            externalId: String((item as { number: unknown }).number),
+            type: "mention" as const,
+            title: "stuck",
+            occurredAt: "2026-01-01T00:00:00.000Z",
+            metadata: {},
+          })),
+      },
+    ]);
+
+    await expect(
+      syncSourceAllPages({
+        registry: stuck,
+        writer: new RecordingWriter(),
+      }),
+    ).rejects.toThrow(/repeated cursor/);
+  });
+
+  it("rejects a nonsensical maxPages rather than defaulting it", async () => {
+    const { registry } = threePageRegistry();
+    for (const maxPages of [0, -1, 1.5, Number.NaN]) {
+      await expect(
+        syncSourceAllPages({
+          registry,
+          writer: new RecordingWriter(),
+          maxPages,
+        }),
+      ).rejects.toThrow(RangeError);
+    }
+  });
+});
+
+/**
+ * THE THREE-STATE CONTRACT between `failure` and `nextCursor`, pinned per case.
+ *
+ * `SyncResult` carries BOTH fields and a reader cannot infer which one wins:
+ *   - a REFUSED batch        -> `persisted: 0`, `failure` present, NO cursor;
+ *   - a SUCCESS that exhausted the source -> `persisted > 0`, NO failure, NO cursor;
+ *   - a SUCCESSFUL PARTIAL   -> `persisted > 0`, NO failure, cursor PRESENT.
+ *
+ * The refusal case is the one that could silently regress. Pagination adds a
+ * second "keep going" signal next to an existing "stop and report" signal, and
+ * the natural mistake is to attach the source's cursor to a result whose batch
+ * was refused in full — which would tell a caller to advance past a page that
+ * was never written, silently losing every event on it. So the refusal path is
+ * asserted to carry NO cursor, and the reason is stated in the type.
+ */
+describe("composition root: failure and nextCursor are independent", () => {
+  /**
+   * A writer whose persist refuses, standing in for a page-scope CHECK refusal.
+   *
+   * `refuseAfterCalls` lets a test refuse from the Nth persist onward, so the
+   * mid-walk case below is a refusal on a page OTHER than the first. That is the
+   * case a single `syncSource` test cannot reach: with one page, the refusal is
+   * visible straight to the caller, whereas mid-walk it happens behind pages
+   * already written.
+   */
+  function refusingWriter(refuseAfterCalls = 0): CanonicalEventWriter {
+    let calls = 0;
+    return {
+      insert: () => ({
+        values: () => ({
+          onConflictDoUpdate: async () => {
+            calls += 1;
+            if (calls > refuseAfterCalls) {
+              const cause: unknown = { code: "23514" };
+              throw Object.assign(new Error("metadata must be an object"), {
+                cause,
+              });
+            }
+            return undefined;
+          },
+        }),
+      }),
+    };
+  }
+
+  it("a REFUSED batch reports the failure and NO cursor", async () => {
+    // Two full pages available, so the SOURCE does hand out a cursor. The
+    // refusal must swallow it: nothing was written, so advancing the cursor
+    // would skip an unwritten page.
+    const { registry } = registryWith(
+      {
+        "1": { body: pageBody(fullPage(2, 1)) },
+        "2": { body: pageBody(fullPage(2, 3)) },
+      },
+      { pageSize: 2 },
+    );
+
+    const result = await syncSource({ registry, writer: refusingWriter() });
+
+    expect(result.failure).toBeDefined();
+    expect(result.persisted).toBe(0);
+    // The whole point of this case.
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it("a SUCCESSFUL EXHAUSTED batch reports no failure and no cursor", async () => {
+    // A single SHORT page: the source is exhausted immediately, so there is
+    // nothing further to point at.
+    const { registry } = registryWith(
+      { "1": { body: pageBody(fullPage(2, 1)) }, "2": { body: "[]" } },
+      { pageSize: 3 },
+    );
+    const writer = new RecordingWriter();
+
+    const result = await syncSource({ registry, writer });
+
+    expect(result.failure).toBeUndefined();
+    expect(result.persisted).toBe(2);
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it("a SUCCESSFUL PARTIAL batch reports no failure and DOES carry a cursor", async () => {
+    const { registry } = registryWith(
+      { "1": { body: pageBody(fullPage(2, 1)) }, "2": { body: "[]" } },
+      { pageSize: 2 },
+    );
+    const writer = new RecordingWriter();
+
+    const result = await syncSource({ registry, writer });
+
+    expect(result.failure).toBeUndefined();
+    expect(result.persisted).toBe(2);
+    expect(result.nextCursor).toBeDefined();
+  });
+
+  it("a REFUSED page in the MIDDLE of a walk aborts the walk rather than being summed in", async () => {
+    // The defect this pins, reproduced rather than described. Page 1 is written;
+    // page 2's persist raises a driver-thrown 23514, so `syncSource` REFUSES it
+    // (it reports, it does not throw) and returns `{ events: 2, persisted: 0 }`
+    // with no cursor. An aggregate that sums `events` and `persisted` without
+    // looking at `failure` returns
+    //
+    //     pages: 2, events.length: 4, persisted: 2, failure: undefined
+    //
+    // — two events never written, reported as a completed ingest, with nothing on
+    // the result to notice. The only defence was a caller happening to compare
+    // two fields of a type that documents no such invariant.
+    const { registry } = registryWith(
+      {
+        "1": { body: pageBody(fullPage(2, 1)) },
+        "2": { body: pageBody(fullPage(2, 3)) },
+        "3": { body: "[]" },
+      },
+      { pageSize: 2 },
+    );
+
+    // `refuseAfterCalls: 1` — the first persist succeeds, the second refuses.
+    const call = syncSourceAllPages({
+      registry,
+      writer: refusingWriter(1),
+    });
+
+    await expect(call).rejects.toBeInstanceOf(SyncPageRefusedError);
+    // No aggregate is returned at all, so `persisted === events.length` cannot
+    // be violated by a refused page's events leaking into `events`.
+    await expect(call).rejects.toThrow(/was refused/);
+  });
+
+  it("a MID-WALK refusal names the cursor that fetched it, so the SAME page can be retried", async () => {
+    // The refusal is on page 2, which was fetched WITH page 1's `nextCursor`.
+    // Re-driving THAT cursor is what retries the refused page; advancing past it
+    // would lose those events permanently, since the batch was all-or-nothing
+    // and wrote nothing. So the error's `retryCursor` must be the page-1 cursor,
+    // not a later one and not undefined.
+    const { registry } = registryWith(
+      {
+        "1": { body: pageBody(fullPage(2, 1)) },
+        "2": { body: pageBody(fullPage(2, 3)) },
+        "3": { body: "[]" },
+      },
+      { pageSize: 2 },
+    );
+
+    // What page 1 alone reports, so the retry cursor is checked against the
+    // value the walk actually used rather than against a literal.
+    const firstPageCursor = await fetchCanonicalEvents(registry).then(
+      (page) => page.nextCursor,
+    );
+    expect(firstPageCursor).toBeDefined();
+
+    const error = await syncSourceAllPages({
+      registry,
+      writer: refusingWriter(1),
+    }).catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(SyncPageRefusedError);
+    const refusal = error as SyncPageRefusedError;
+    // The classification is carried, not flattened into a message string.
+    expect(refusal.failure.code).toBe(SYNC_FAILURE_CODES.eventNotPersistable);
+    expect(refusal.failure.scope).toBe(SYNC_FAILURE_SCOPES.page);
+    expect(refusal.retryCursor).toBe(firstPageCursor);
+    // What survived, stated so a caller knows the walk was not all-or-nothing.
+    expect(refusal.pages).toBe(1);
+    expect(refusal.persisted).toBe(2);
+  });
+
+  it("a refusal on the FIRST page reports `retryCursor: undefined`, not a later cursor", async () => {
+    // The degenerate case of the same rule: there was no input cursor, so
+    // retrying means re-driving `undefined`. Naming a later cursor here would
+    // skip the refused first page — the exact loss this error exists to prevent.
+    const { registry } = registryWith(
+      {
+        "1": { body: pageBody(fullPage(2, 1)) },
+        "2": { body: pageBody(fullPage(2, 3)) },
+      },
+      { pageSize: 2 },
+    );
+
+    const error = await syncSourceAllPages({
+      registry,
+      writer: refusingWriter(0),
+    }).catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(SyncPageRefusedError);
+    const refusal = error as SyncPageRefusedError;
+    expect(refusal.retryCursor).toBeUndefined();
+    expect(refusal.pages).toBe(0);
+    expect(refusal.persisted).toBe(0);
+  });
+
+  it("a completed walk's result carries no `failure` and no `nextCursor` key", async () => {
+    // The fourth shape, pinned. `syncSourceAllPages` reaches exactly ONE of
+    // `SyncResult`'s three states — every page written, source exhausted — so
+    // the aggregate must not promise the other two. Asserted as key ABSENCE,
+    // the stronger fact: a widened `SyncResult & { pages }` type would let a
+    // caller branch on a `failure` that can never be there.
+    const { registry } = registryWith(
+      {
+        "1": { body: pageBody(fullPage(2, 1)) },
+        "2": { body: pageBody(fullPage(2, 3)) },
+        "3": { body: "[]" },
+      },
+      { pageSize: 2 },
+    );
+
+    const result = await syncSourceAllPages({
+      registry,
+      writer: new RecordingWriter(),
+    });
+
+    expect(Object.keys(result).sort()).toEqual([
+      "events",
+      "pages",
+      "persisted",
+    ]);
+    // The invariant a refused page would have broken.
+    expect(result.persisted).toBe(result.events.length);
+  });
+});
+
 describe("composition root: the credential is resolved, never held", () => {
   it("sends the credential to the transport and keeps it out of every event", async () => {
     const { registry, transport } = registryWith({ "1": { body: TWO_ITEMS } });
 
-    const events = await fetchCanonicalEvents(registry);
+    const { events } = await fetchCanonicalEvents(registry);
 
     // The plugin asked the injected provider, which asked `readEnv`. Proven by
     // the token arriving at the transport — the ONLY place it may appear.
@@ -311,7 +754,7 @@ describe("composition root: fetched events persist through the Drizzle client", 
     const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
     const writer = new RecordingWriter();
 
-    const events = await fetchCanonicalEvents(registry);
+    const { events } = await fetchCanonicalEvents(registry);
     const persisted = await persistCanonicalEvents(events, writer);
 
     expect(events).toHaveLength(2);
@@ -422,8 +865,8 @@ describe("composition root: fetched events persist through the Drizzle client", 
     const once = await fetchCanonicalEvents(registry);
     const twice = await fetchCanonicalEvents(registry);
 
-    expect(once.map((e) => e.id)).toEqual(twice.map((e) => e.id));
-    expect(new Set(once.map((e) => e.id)).size).toBe(once.length);
+    expect(once.events.map((e) => e.id)).toEqual(twice.events.map((e) => e.id));
+    expect(new Set(once.events.map((e) => e.id)).size).toBe(once.events.length);
   });
 
   it("persists the same events twice without error, as an upsert", async () => {
@@ -726,7 +1169,7 @@ describe("composition root: a writer refusal is reported, not thrown", () => {
     // syncSource cannot lose a write silently. It carries the same information
     // the returned failure does.
     const { registry } = registryRefusing(0);
-    const events = await fetchCanonicalEvents(registry, SECOND);
+    const { events } = await fetchCanonicalEvents(registry, SECOND);
 
     let caught: unknown;
     try {
@@ -747,7 +1190,7 @@ describe("composition root: a writer refusal is reported, not thrown", () => {
     // Error thrown from inside the mapper's internals is a bug, and must not be
     // reported to the caller as "this event was refused".
     const { registry } = registryWith({ "1": { body: TWO_ITEMS } });
-    const events = await fetchCanonicalEvents(registry);
+    const { events } = await fetchCanonicalEvents(registry);
     // A writer whose failure is a genuine, unclassified fault.
     //
     // The stub is BOTH a rejected thenable AND an upsert builder, because

@@ -54,7 +54,27 @@ const REPO_ROOT = path.resolve(
   "..",
 );
 
-/** The name `.env.example` tells an operator to set, read from that file. */
+/**
+ * The name `.env.example` tells an operator to set, read from that file.
+ *
+ * WHY THIS SELECTS BY THE PROFILE, NOT BY BEING THE ONLY ENTRY. This helper
+ * originally asserted `.env.example` declared exactly ONE variable besides
+ * `DATABASE_URL` and returned it — a check that passed only while the file
+ * happened to hold nothing else. Its own header states the real intent ("the
+ * name an operator has to set", "survives a legitimate rename of the
+ * variable"), and that intent is not exclusivity: `.env.example` is the list of
+ * everything an operator may need, and other cards add to it (T19 added
+ * `BETTER_AUTH_SECRET` / `BETTER_AUTH_URL`, which are not credentials).
+ *
+ * So the token is now selected by asking which declared name the
+ * `GITHUB_TOKEN_PROFILE` actually is, and the failure mode is preserved rather
+ * than weakened: a RENAME of the documented token variable still fails here,
+ * because the profile's name would then be absent from the file. What is gone is
+ * only the false claim that an unrelated variable's presence is a defect.
+ *
+ * The uniqueness assertion is kept, but on the honest statement: the profile's
+ * name must be declared, and must be declared exactly once.
+ */
 function documentedTokenEnvVar(): string {
   const example = readFileSync(path.join(REPO_ROOT, ".env.example"), "utf8");
   const declared = example
@@ -62,10 +82,18 @@ function documentedTokenEnvVar(): string {
     .map((line) => /^\s*([A-Z0-9_]+)\s*=/.exec(line))
     .filter((match): match is RegExpExecArray => match !== null)
     .map((match) => match[1]);
-  // Everything except DATABASE_URL is the access token.
-  const names = declared.filter((name) => name !== "DATABASE_URL");
-  expect(names).toHaveLength(1);
-  return names[0] as string;
+  // A variable documented twice is ambiguous, and an operator cannot tell which
+  // line wins — so this is the half of the old assertion that was always true.
+  expect(new Set(declared).size).toBe(declared.length);
+
+  const occurrences = declared.filter(
+    (name) => name === GITHUB_TOKEN_PROFILE.envVar,
+  );
+  expect(
+    occurrences,
+    `.env.example must declare ${GITHUB_TOKEN_PROFILE.envVar}; it declares [${declared.join(", ")}]`,
+  ).toHaveLength(1);
+  return GITHUB_TOKEN_PROFILE.envVar;
 }
 
 describe("the production token profile", () => {

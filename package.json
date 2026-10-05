@@ -18,10 +18,12 @@
     "format:check": "prettier --check .",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun run ./db/migrate.ts",
-    "db:check": "bun run ./db/check.ts"
+    "db:check": "bun run ./db/check.ts",
+    "audit": "bun run ./scripts/audit.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "1.1.0",
+    "better-auth": "1.7.7",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "drizzle-orm": "0.45.3",
@@ -59,6 +61,7 @@
   },
   "overrides": {
     "postcss": "8.5.28",
-    "sharp": "0.35.5"
+    "sharp": "0.35.5",
+    "esbuild": "0.28.2"
   }
 }
