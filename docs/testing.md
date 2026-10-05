@@ -357,3 +357,81 @@ tracked set must exceed 20 files, the unit config must contribute at least 10,
 the db config at least 1, and Playwright at least 1. So deleting a whole
 `include:` array turns the guard **red** instead of quietly shrinking the
 difference to nothing.
+
+## Load-bearing tests carry a MEASURED per-test timeout
+
+`vitest.config.ts` sets **no** `testTimeout`, so every test inherits Vitest's
+built-in `5000ms`. That default is deliberate and stays: it is what makes the
+~500 in-process tests honest about a regression that made an ordinary assertion
+slow. **Do not raise it.** A global raise spends a bigger budget on every test
+to serve the handful that do real I/O, and lets a genuine hang sit unnoticed for
+the new number.
+
+A test that spawns a subprocess, or rebuilds a module graph per case, has a
+duration that is a property of the **machine**, not of the code. Under
+full-suite load those tests exceeded 5s and failed with
+`Error: Test timed out in 5000ms` — a red that does not mean a red assertion.
+The budgets live in `src/core/testing/load-bearing-test-timeout.ts` and are
+attached per test as `{ timeout: LOAD_BEARING_TEST_TIMEOUT.<key> }`:
+
+| budget         | for                                               | worst measurement it is sized from                            |
+| -------------- | ------------------------------------------------- | ------------------------------------------------------------- |
+| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites — see the caveat below             |
+| `subprocessX4` | a subprocess test measured **above** `subprocess` | **31.6s**, 7 concurrent **full** suites (the Prettier canary) |
+| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 6.9s, 7 concurrent suites (`route-auth.test.ts`)              |
+
+The `subprocessX4` figure is the worst of 7 measured runs at 7x concurrency:
+31563 / 30895 / 30811 / 30170 / 30050 / 29425 / 26160 ms (median 30170), in
+**separate** detached worktrees, against 589 / 594 / 597 / 617 / 621 ms
+isolated. Separate worktrees matter: that test writes a fixed-path canary and
+deletes it in a `finally`, so concurrent suites sharing one worktree delete the
+file out from under each other and the timing measures that contention instead
+of the test.
+
+At 4x the same test measured worst 10934 ms over 12 observations (median
+7510 ms), and `route-auth.test.ts` CONTROL worst 2662 ms there against 6936 ms
+at 7x. Both budgets clear their worst observation; the table quotes the 7x rows
+because 4x is not the ceiling — the canary's duration grows roughly linearly
+with the number of competing suites (621 ms → 10934 ms → 31563 ms at 1x → 4x →
+7x).
+
+Two caveats stated rather than smoothed over:
+
+- **`subprocess` is sized from a file that is not on this branch yet.** The
+  28.1s measurement is `scripts/__tests__/secret-scan.test.ts`, which lives only
+  on the unintegrated branch `devloop/t_4cdeadc5` (B51) — `git ls-tree -r
+origin/main --name-only | grep -i secret` returns nothing on `main` or on the
+  branch carrying this table. So the budget has zero use sites today and sizes
+  the _next_ subprocess test to arrive. Re-measure when B51 lands.
+- **Two earlier figures for `subprocessX4` are withdrawn, not superseded.** A
+  revision quoted **37.8s** here and **70.1s** in the budgets module for the same
+  budget, then attributed both to four suites sharing one worktree and the
+  canary-file race. The 7x row above reaches the same order in _separate_
+  worktrees, so that explanation does not hold and the attribution is dropped
+  rather than restated. The table now quotes the worst measurement that actually
+  reproduces at a stated condition. The `moduleGraph` row had the same problem:
+  its "21.4s" did not reproduce, and is withdrawn for 6.9s.
+
+The rule for a new budget is stated in that file: take the worst duration you
+have **measured** for that test under the worst load you can actually produce,
+then round up to the next round number. That rule was previously "multiply by 4"
+and is no longer, because the 1x → 4x → 7x progression above shows the growth is
+roughly linear in suite count rather than bounded by any constant multiplier.
+
+`src/__tests__/load-bearing-test-timeouts.test.ts` enforces this. It reads test
+sources as **text** (importing them would drag a module graph into the runner),
+resolves **file-level helpers and classes** so a marker in a helper the test only
+_calls_, or in a class method it only invokes, is still attributed to that test,
+and fails when a load-scaled test names no budget. Its coverage claim is itself
+under test, in both directions:
+
+- the guard's first version was blind to helper-delegated work and green on the
+  exact defect it existed to catch;
+- its second was blind to a **class method** — QA built that counter-example and
+  the guard reported zero offenders on it.
+
+Two shapes it still does **not** resolve, asserted as limitations so the claim
+cannot drift back into coverage it does not have: an instance returned by a
+factory (`makeScanner().run()`), and an object-literal method. Both hide the
+spawn behind a value whose type only a compiler knows; closing them needs type
+information, not a wider regex.

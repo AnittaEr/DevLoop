@@ -63,6 +63,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
+
 /**
  * Deny-list, written as plain literals on purpose: NOT assembled by string
  * concatenation, split/join, `String.fromCharCode`, base64, template
@@ -1720,50 +1722,74 @@ describe("db/ guard and core guard agree (B30 parity)", () => {
     }
   }
 
-  it("agrees with the core plugin-boundary guard on shared probes", async () => {
-    for (const probe of SHARED_PROBES) {
-      const source = `const ${probe} = 1;`;
-      const coreTokens = await coreFindViolations(source);
-      const dbTokens = findViolations(source, "parity-probe.ts").map(
-        (v) => v.token,
-      );
+  // MEASURED BUDGET: `moduleGraph`. Every case below reaches `vi.resetModules()`
+  // through `coreFindViolations()`, which re-imports this file's own copy of the
+  // core plugin-boundary guard on each invocation -- a module-graph rebuild per
+  // call, and in the case-folded one, several rebuilds per test. That cost is
+  // transform + link work rather than assertion work, so it stretches with
+  // machine load exactly as a subprocess spawn does.
+  //
+  // Budgeted per case rather than on the describe so the regression guard
+  // (`src/__tests__/load-bearing-test-timeouts.test.ts`) can attribute the budget
+  // to the test that reaches the work.
+  const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.moduleGraph;
 
-      // The verdict must be identical. NOT the token lists: the two guards'
-      // position and boundary rules differ on purpose (this file widens to SQL
-      // column syntax and uses alphanumeric rather than `\b` boundaries), so a
-      // shape can legitimately match a different subset. Agreeing on WHETHER a
-      // probe is a violation is the policy the two copies share, and it is the
-      // policy that drifted.
-      expect(
-        dbTokens.length > 0,
-        `parity: db guard and core guard disagree on "${probe}" — db=${JSON.stringify(dbTokens)} core=${JSON.stringify(coreTokens)}`,
-      ).toBe(coreTokens.length > 0);
-    }
-  });
+  it(
+    "agrees with the core plugin-boundary guard on shared probes",
+    { timeout: LOAD_BEARING },
+    async () => {
+      for (const probe of SHARED_PROBES) {
+        const source = `const ${probe} = 1;`;
+        const coreTokens = await coreFindViolations(source);
+        const dbTokens = findViolations(source, "parity-probe.ts").map(
+          (v) => v.token,
+        );
 
-  it("agrees that the case-folded probes fire and the look-alikes do not", async () => {
-    // Stated separately from the loop above so a failure names WHICH half moved:
-    // if `db/` goes case-blind the first case fails; if `db/` starts crying wolf on
-    // `shadow` the second does. One loop with both kinds mixed reports "disagrees"
-    // and leaves the reader to work out which side moved.
-    const shouldFire = ["GITHUB_TOKEN", "GitHubToken", `github_${NATIVE_PULL}`];
-    for (const probe of shouldFire) {
-      const source = `const ${probe} = 1;`;
-      expect(
-        findViolations(source, "parity-probe.ts").length,
-        `db guard must fire on ${probe}`,
-      ).toBeGreaterThan(0);
-      expect(
-        (await coreFindViolations(source)).length,
-        `core guard must fire on ${probe}`,
-      ).toBeGreaterThan(0);
-    }
-    for (const probe of ["expr_value", "shadow", "githubrepo"]) {
-      const source = `const ${probe} = 1;`;
-      expect(findViolations(source, "parity-probe.ts"), probe).toEqual([]);
-      expect(await coreFindViolations(source), probe).toEqual([]);
-    }
-  });
+        // The verdict must be identical. NOT the token lists: the two guards'
+        // position and boundary rules differ on purpose (this file widens to SQL
+        // column syntax and uses alphanumeric rather than `\b` boundaries), so a
+        // shape can legitimately match a different subset. Agreeing on WHETHER a
+        // probe is a violation is the policy the two copies share, and it is the
+        // policy that drifted.
+        expect(
+          dbTokens.length > 0,
+          `parity: db guard and core guard disagree on "${probe}" — db=${JSON.stringify(dbTokens)} core=${JSON.stringify(coreTokens)}`,
+        ).toBe(coreTokens.length > 0);
+      }
+    },
+  );
+
+  it(
+    "agrees that the case-folded probes fire and the look-alikes do not",
+    { timeout: LOAD_BEARING },
+    async () => {
+      // Stated separately from the loop above so a failure names WHICH half moved:
+      // if `db/` goes case-blind the first case fails; if `db/` starts crying wolf on
+      // `shadow` the second does. One loop with both kinds mixed reports "disagrees"
+      // and leaves the reader to work out which side moved.
+      const shouldFire = [
+        "GITHUB_TOKEN",
+        "GitHubToken",
+        `github_${NATIVE_PULL}`,
+      ];
+      for (const probe of shouldFire) {
+        const source = `const ${probe} = 1;`;
+        expect(
+          findViolations(source, "parity-probe.ts").length,
+          `db guard must fire on ${probe}`,
+        ).toBeGreaterThan(0);
+        expect(
+          (await coreFindViolations(source)).length,
+          `core guard must fire on ${probe}`,
+        ).toBeGreaterThan(0);
+      }
+      for (const probe of ["expr_value", "shadow", "githubrepo"]) {
+        const source = `const ${probe} = 1;`;
+        expect(findViolations(source, "parity-probe.ts"), probe).toEqual([]);
+        expect(await coreFindViolations(source), probe).toEqual([]);
+      }
+    },
+  );
 
   /**
    * B32: assert this file is comparing against the CURRENT core matcher
@@ -1789,66 +1815,70 @@ describe("db/ guard and core guard agree (B30 parity)", () => {
    * Read-only by construction: this asserts the core file CONTAINS the bridge, and
    * never edits it. Core's matcher is B29's approved content.
    */
-  it("pins the core guard to the bridge generation this file is compared against", async () => {
-    const coreSource = readFileSync(
-      path.resolve(
-        REPO_ROOT,
-        "src",
-        "core",
-        "__tests__",
-        "plugin-boundary.test.ts",
-      ),
-      "utf8",
-    );
+  it(
+    "pins the core guard to the bridge generation this file is compared against",
+    { timeout: LOAD_BEARING },
+    async () => {
+      const coreSource = readFileSync(
+        path.resolve(
+          REPO_ROOT,
+          "src",
+          "core",
+          "__tests__",
+          "plugin-boundary.test.ts",
+        ),
+        "utf8",
+      );
 
-    // (1) The bridge itself, spelled as the per-character rewrite core does. This
-    // is the line B29 introduced and this card depends on.
-    expect(
-      coreSource,
-      "the core guard no longer carries B26's `[_]?` snake_case -> camelCase bridge; if it was narrowed, this file's parity loop is now comparing against a superseded matcher generation and the agreement below is not evidence of anything",
-    ).toContain('if (char === "_") return "[_]?";');
-
-    // (2) And the `_`-terminated carve-out, which is the guard AGAINST over-bridging
-    // and the specific decision this file's own `tokenPattern` was written to
-    // mirror. Asserting (1) without (2) would accept a blanket bridge, which is the
-    // form measured to break two negative controls on the db side.
-    expect(
-      coreSource,
-      "the core guard lost its `_`-terminated carve-out, so its matcher now over-bridges and this file's does not; the two no longer share one policy",
-    ).toContain('if (token.endsWith("_")) {');
-
-    // (3) The behavioural consequence of (1)+(2), stated on the core guard itself.
-    // A structural assertion on a source string proves the text is there; this
-    // proves the text is live. `pullRequest` must fire on core's scanner, or the
-    // two structural assertions above are describing dead code.
-    expect(
-      (await coreFindViolations("const pullRequest = 1;")).length,
-      "the core guard does not fire on a camelCase provider identifier, so the bridge is present in source but not in behaviour",
-    ).toBeGreaterThan(0);
-    // ...and this file must agree with it, which is the whole point.
-    expect(
-      findViolations("const pullRequest = 1;", "parity-probe.ts").length,
-      "db guard must fire on a camelCase provider identifier once the bridge is mirrored",
-    ).toBeGreaterThan(0);
-
-    // (4) The bridge must not have cost core a negative control. Stated so that a
-    // future over-bridge on EITHER side fails here by name.
-    for (const lookAlike of [
-      "xgithuby",
-      "shadow",
-      "githubrepo",
-      "expr_value",
-    ]) {
+      // (1) The bridge itself, spelled as the per-character rewrite core does. This
+      // is the line B29 introduced and this card depends on.
       expect(
-        await coreFindViolations(`const ${lookAlike} = 1;`),
-        `core guard must stay clean on ${lookAlike}`,
-      ).toEqual([]);
+        coreSource,
+        "the core guard no longer carries B26's `[_]?` snake_case -> camelCase bridge; if it was narrowed, this file's parity loop is now comparing against a superseded matcher generation and the agreement below is not evidence of anything",
+      ).toContain('if (char === "_") return "[_]?";');
+
+      // (2) And the `_`-terminated carve-out, which is the guard AGAINST over-bridging
+      // and the specific decision this file's own `tokenPattern` was written to
+      // mirror. Asserting (1) without (2) would accept a blanket bridge, which is the
+      // form measured to break two negative controls on the db side.
       expect(
-        findViolations(`const ${lookAlike} = 1;`, "parity-probe.ts"),
-        `db guard must stay clean on ${lookAlike}`,
-      ).toEqual([]);
-    }
-  });
+        coreSource,
+        "the core guard lost its `_`-terminated carve-out, so its matcher now over-bridges and this file's does not; the two no longer share one policy",
+      ).toContain('if (token.endsWith("_")) {');
+
+      // (3) The behavioural consequence of (1)+(2), stated on the core guard itself.
+      // A structural assertion on a source string proves the text is there; this
+      // proves the text is live. `pullRequest` must fire on core's scanner, or the
+      // two structural assertions above are describing dead code.
+      expect(
+        (await coreFindViolations("const pullRequest = 1;")).length,
+        "the core guard does not fire on a camelCase provider identifier, so the bridge is present in source but not in behaviour",
+      ).toBeGreaterThan(0);
+      // ...and this file must agree with it, which is the whole point.
+      expect(
+        findViolations("const pullRequest = 1;", "parity-probe.ts").length,
+        "db guard must fire on a camelCase provider identifier once the bridge is mirrored",
+      ).toBeGreaterThan(0);
+
+      // (4) The bridge must not have cost core a negative control. Stated so that a
+      // future over-bridge on EITHER side fails here by name.
+      for (const lookAlike of [
+        "xgithuby",
+        "shadow",
+        "githubrepo",
+        "expr_value",
+      ]) {
+        expect(
+          await coreFindViolations(`const ${lookAlike} = 1;`),
+          `core guard must stay clean on ${lookAlike}`,
+        ).toEqual([]);
+        expect(
+          findViolations(`const ${lookAlike} = 1;`, "parity-probe.ts"),
+          `db guard must stay clean on ${lookAlike}`,
+        ).toEqual([]);
+      }
+    },
+  );
 
   it("declares the same case policy as the core guard, read from its own source", async () => {
     // Belt and braces over the behavioural loop: B30's policy was carried as a named
