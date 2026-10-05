@@ -15,8 +15,8 @@
  * reading `node_modules`, and for `vi.resetModules()` re-importing the route
  * and the Drizzle writer. None of that is the code under test, and all of it
  * stretches with machine load. Measured on an 8-core machine at this branch's
- * base (`1f4bd5c`), the Prettier canary took 0.9-1.1s in isolation but 18.5s
- * when four full suites ran at once -- against a 5s budget. Such a test
+ * base (`1f4bd5c`), the Prettier canary took 0.6s in isolation but 31.6s
+ * when SEVEN full suites ran at once -- against a 5s budget. Such a test
  * fails with `Error: Test timed out in 5000ms.` -- a message indistinguishable
  * from a broken assertion, which is the actual defect: a red suite stops
  * meaning a red assertion.
@@ -38,9 +38,13 @@
  *     the first user's evidence.
  *  2. The regression guard (`src/__tests__/load-bearing-test-timeouts.test.ts`)
  *     reads THIS FILE AS TEXT and refuses any test that spawns a subprocess
- *     without naming one of these budgets. A raw `30000` next to a `spawnSync`
- *     fails that guard; `LOAD_BEARING_TEST_TIMEOUT.subprocess` passes. So the
- *     guard cannot be satisfied by a magic number.
+ *     without naming one of these budgets BY NAME. A raw `30000` next to a
+ *     `spawnSync` fails that guard; so does `5000`, which is worse -- it is the
+ *     exact budget this exists to prevent, written by hand and passing. So does
+ *     a MISSPELLED key such as `.subprocses`, which reaches Vitest as
+ *     `undefined` and typechecks clean behind a cast. The guard validates the
+ *     named key against this object, so the guard cannot be satisfied by a magic
+ *     number, and it is driven by tests that prove each rejection fires.
  *  3. Halving or doubling a budget for a whole class of tests is then a
  *     one-line change in one file, and the reviewer sees the class move
  *     together.
@@ -61,9 +65,18 @@
  * behind all three, stated once so a new test can apply it without asking:
  *
  *   Take the worst duration you have MEASURED for that test under the worst
- *   load you can actually produce, and multiply by 4. A budget close to the
- *   measurement will be crossed by the next slow machine; a budget 4x it still
- *   fails a genuinely hung subprocess, which is what the timeout is for.
+ *   load you can actually produce, then round UP to the next round number.
+ *
+ * That rule was previously "multiply by 4", and the 7x measurement below shows
+ * why 4x is the wrong shape rather than merely a conservative choice: the canary
+ * moves 621ms -> 10934ms -> 31563ms as concurrency goes 1x -> 4x -> 7x, which is
+ * roughly LINEAR in the number of competing suites. So the multiplier that
+ * matters is "how many suites could plausibly run at once on a busier machine",
+ * not a constant, and 4x silently under-budgets anything that scales that way. An
+ * earlier revision also applied 4x to the 4x row and got 60s while claiming 74s
+ * was the requirement -- the arithmetic was doing the work the evidence could
+ * not. Stated honestly: the budget must clear the worst number you can MEASURE,
+ * and the roundness is a convenience, not the safety margin.
  *
  * The multiplier is applied to the worst LOADED measurement, not the isolated
  * one. The isolated number is quoted too, because the ratio between them is the
@@ -74,27 +87,31 @@
  * Prettier canary (in the plugin boundary test for the SDK vendor) spawns
  * Prettier TWICE --
  * a negative control, then the real bytes -- so it pays two cold starts.
- * Re-measured on this branch, in four SEPARATE detached worktrees so that the
- * test's fixed-path canary file could not be deleted out from under a
- * concurrent run:
+ * Re-measured on this branch at head `30391bc` with the budget applied, in
+ * SEPARATE detached worktrees so that the test's fixed-path canary file could
+ * not be deleted out from under a concurrent run:
  *
- *   isolated, 5 runs, one suite:        857 / 882 / 981 / 1059 / 1104 ms
- *   4x concurrent FULL suites, 4 runs: 18522 / 17534 / 17532 / 18354 ms
+ *   isolated, 5 runs, one suite:      589 / 594 / 597 / 617 / 621 ms
+ *   4x concurrent FULL suites, 12 obs: worst 10934 ms (median 7510 ms)
+ *   7x concurrent FULL suites,  7 obs: worst 31563 ms (median 30170 ms)
  *
- * Worst loaded observation: 18522ms. 4x that is 74s, so 60s is the round
- * number below it; 30s would leave only 1.6x headroom over the worst case
- * actually observed, which is the number that would be crossed first on a
- * slower machine. Isolated worst is 1104ms, so 60s is ~54x that -- and a
- * `prettier --check` on a single file cannot legitimately take 60s, so the
- * budget still fails a genuine hang.
+ * THE WORST LOADED OBSERVATION IS 31563ms, at 7x, and the 60s budget is sized
+ * from it: 30s would be BELOW an observation this machine actually produced,
+ * which is precisely how a budget gets crossed on the next slower machine, so
+ * 60s is the round number above the worst case (1.9x). Isolated worst is 621ms,
+ * so 60s keeps ~97x headroom over that and still fails a genuinely hung
+ * formatter (`prettier --check` on one file cannot legitimately take 60s).
  *
- * These four measurements REPLACE an earlier pair quoted as "1.0s isolated,
- * 70.1s at 4x". The 70.1s figure was measured with four suites sharing ONE
- * worktree, where this test writes a fixed-path canary file and deletes it in a
- * `finally` -- so a concurrent suite read a deleted file and the run's duration
- * included contention over that file rather than the test's own cost. That
- * isolation bug is reported, not fixed (it is out of scope here). The numbers
- * above are from separate worktrees and are the only ones quoted anywhere.
+ * THE 7x ROW IS WHY `subprocessX4` EXISTS AT ALL, and it is a correction to
+ * what this file claimed before. An earlier revision dismissed the discarded
+ * "37.8s" figure as an artefact of four suites sharing ONE worktree, where the
+ * canary's `finally` deletes the file out from under a concurrent run, and said
+ * the separate-worktree numbers were the only real ones. That explanation does
+ * not hold up: at 7x in separate worktrees this test reaches 31563 ms, the same
+ * order as 37.8s, so the discarded figure is not explained by the file race at
+ * all. The claim is WITHDRAWN rather than restated, because the honest position
+ * is the weaker one -- what is reproducible is the 7x row above, and the 4x row
+ * is not the ceiling.
  */
 
 /**
@@ -132,17 +149,23 @@ export const LOAD_BEARING_TEST_TIMEOUT = {
    * Does not spawn anything, but rebuilds a module graph per case with
    * `vi.resetModules()`, so its duration scales with load the same way.
    *
-   * Measured worst case: 21.4s (`route-auth.test.ts` > "CONTROL: with a
-   * session the real pipeline runs", 4 concurrent suites, 2.5s isolated).
+   * Measured worst case: 6936ms (`route-auth.test.ts` > "CONTROL: with a
+   * session the real pipeline runs", 7 concurrent suites in separate worktrees;
+   * 2662ms at 4x, 1.0-2.7s across 12 observations there). 30s is ~4.3x that
+   * worst case. An earlier "21.4s" for this budget did not reproduce at its
+   * stated condition and is withdrawn.
    */
   moduleGraph: 30_000,
 } as const;
 
 /**
- * The budgets a test may name, as source text. The regression guard matches
- * against these strings, so a test that references a budget the guard does not
- * know about cannot satisfy the guard by accident.
+ * The keys above are the WHOLE vocabulary of budgets, and the regression guard
+ * reads them off this object at runtime rather than from a second exported list.
+ *
+ * An exported mirror of these keys used to live here. It was deleted rather than
+ * wired up, and the reason is worth keeping: nothing referenced it, so it could
+ * not have caught the misspelling it was documented as catching, while looking
+ * exactly like the thing that would. The guard now derives them with
+ * `Object.keys(LOAD_BEARING_TEST_TIMEOUT)`, which cannot drift from this
+ * declaration because it IS this declaration.
  */
-export const KNOWN_BUDGET_KEYS: readonly string[] = Object.keys(
-  LOAD_BEARING_TEST_TIMEOUT,
-);

@@ -374,18 +374,26 @@ full-suite load those tests exceeded 5s and failed with
 The budgets live in `src/core/testing/load-bearing-test-timeout.ts` and are
 attached per test as `{ timeout: LOAD_BEARING_TEST_TIMEOUT.<key> }`:
 
-| budget         | for                                               | worst measurement it is sized from                        |
-| -------------- | ------------------------------------------------- | --------------------------------------------------------- |
-| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites — see the caveat below         |
-| `subprocessX4` | a subprocess test measured **above** `subprocess` | 18.5s, 4 concurrent **full** suites (the Prettier canary) |
-| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 21.4s, 4 concurrent suites (`route-auth.test.ts`)         |
+| budget         | for                                               | worst measurement it is sized from                            |
+| -------------- | ------------------------------------------------- | ------------------------------------------------------------- |
+| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites — see the caveat below             |
+| `subprocessX4` | a subprocess test measured **above** `subprocess` | **31.6s**, 7 concurrent **full** suites (the Prettier canary) |
+| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 6.9s, 7 concurrent suites (`route-auth.test.ts`)              |
 
-The `subprocessX4` figure is the worst of four measured runs: 18522 / 17534 /
-17532 / 18354 ms, in four **separate** detached worktrees, against 857 / 882 /
-981 / 1059 / 1104 ms isolated. Separate worktrees matter: that test writes a
-fixed-path canary and deletes it in a `finally`, so concurrent suites sharing
-one worktree delete the file out from under each other and the timing measures
-that contention instead of the test.
+The `subprocessX4` figure is the worst of 7 measured runs at 7x concurrency:
+31563 / 30895 / 30811 / 30170 / 30050 / 29425 / 26160 ms (median 30170), in
+**separate** detached worktrees, against 589 / 594 / 597 / 617 / 621 ms
+isolated. Separate worktrees matter: that test writes a fixed-path canary and
+deletes it in a `finally`, so concurrent suites sharing one worktree delete the
+file out from under each other and the timing measures that contention instead
+of the test.
+
+At 4x the same test measured worst 10934 ms over 12 observations (median
+7510 ms), and `route-auth.test.ts` CONTROL worst 2662 ms there against 6936 ms
+at 7x. Both budgets clear their worst observation; the table quotes the 7x rows
+because 4x is not the ceiling — the canary's duration grows roughly linearly
+with the number of competing suites (621 ms → 10934 ms → 31563 ms at 1x → 4x →
+7x).
 
 Two caveats stated rather than smoothed over:
 
@@ -395,15 +403,20 @@ Two caveats stated rather than smoothed over:
 origin/main --name-only | grep -i secret` returns nothing on `main` or on the
   branch carrying this table. So the budget has zero use sites today and sizes
   the _next_ subprocess test to arrive. Re-measure when B51 lands.
-- An earlier version of this table quoted **37.8s** for `subprocessX4` against a
-  60s budget, while the budgets module quoted **70.1s** for the same budget. Both
-  are superseded by the 18.5s above. The old figures were measured with four
-  suites sharing one worktree, so they measured the canary-file race.
+- **Two earlier figures for `subprocessX4` are withdrawn, not superseded.** A
+  revision quoted **37.8s** here and **70.1s** in the budgets module for the same
+  budget, then attributed both to four suites sharing one worktree and the
+  canary-file race. The 7x row above reaches the same order in _separate_
+  worktrees, so that explanation does not hold and the attribution is dropped
+  rather than restated. The table now quotes the worst measurement that actually
+  reproduces at a stated condition. The `moduleGraph` row had the same problem:
+  its "21.4s" did not reproduce, and is withdrawn for 6.9s.
 
 The rule for a new budget is stated in that file: take the worst duration you
 have **measured** for that test under the worst load you can actually produce,
-and multiply by 4 — applied to the worst **loaded** figure, so a genuinely hung
-subprocess still fails well inside the budget.
+then round up to the next round number. That rule was previously "multiply by 4"
+and is no longer, because the 1x → 4x → 7x progression above shows the growth is
+roughly linear in suite count rather than bounded by any constant multiplier.
 
 `src/__tests__/load-bearing-test-timeouts.test.ts` enforces this. It reads test
 sources as **text** (importing them would drag a module graph into the runner),

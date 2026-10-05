@@ -471,32 +471,32 @@ describe("plugin boundary: core does not import the plugin implementation", () =
   //                        the per-spawn cost stretched to 1922-3981ms, i.e.
   //                        2.6-6.9s of subprocess wall time in one test
   //
-  // and RE-MEASURED on this branch at head `6f05277` with the budget applied,
-  // in four SEPARATE detached worktrees so this test's fixed-path canary file
+  // and RE-MEASURED on this branch at head `30391bc` with the budget applied,
+  // in SEPARATE detached worktrees so this test's fixed-path canary file
   // could not be deleted out from under a concurrent run:
   //
-  //   isolated, 5 runs                 857 / 882 / 981 / 1059 / 1104 ms
-  //   4x concurrent FULL suites, 4 runs 18522 / 17534 / 17532 / 18354 ms
+  //   isolated, 5 runs                  589 / 594 / 597 / 617 / 621 ms
+  //   4x concurrent FULL suites, 12 obs worst 10934 ms (median 7510 ms)
+  //   7x concurrent FULL suites,  7 obs worst 31563 ms (median 30170 ms)
   //
-  // THE WORST LOADED OBSERVATION IS 18522ms, and the 60s budget is sized from
-  // it: 4x that is 74s, so 60s is the round number below it, while 30s would
-  // leave only 1.6x headroom over the worst case actually observed -- the
-  // number a slower machine crosses first. Isolated worst is 1104ms, so 60s
-  // keeps ~54x headroom over that and still fails a genuinely hung formatter
+  // THE WORST LOADED OBSERVATION IS 31563ms, at 7x, and the 60s budget is sized
+  // from it: 30s would be BELOW an observation this machine actually produced,
+  // which is how a budget gets crossed on the next slower machine, so 60s is the
+  // round number above the worst case (1.9x). Isolated worst is 621ms, so 60s
+  // keeps ~97x headroom over that and still fails a genuinely hung formatter
   // (`prettier --check` on one file cannot legitimately take 60s).
   //
-  // This SUPERSEDES an earlier "37798ms" figure that this comment, the budgets
-  // module and `docs/testing.md` all quoted. That one was measured with four
-  // suites sharing ONE worktree, where this test deletes its canary in a
-  // `finally` and a concurrent suite read the file after deletion -- so it
-  // measured contention over the canary file, not this test's cost. The four
-  // numbers above replace it EVERYWHERE, quoted identically: two irreconcilable
-  // measurements for one budget is exactly what makes an integrator stop and
-  // guess which one is real.
+  // The 7x row is why `subprocessX4` exists at all. It also corrects this
+  // comment's own earlier reasoning: a previous revision dismissed a discarded
+  // "37.8s" figure as an artefact of four suites sharing ONE worktree and this
+  // test's fixed-path canary being deleted out from under a concurrent run. That
+  // explanation does not survive 31563ms at 7x in SEPARATE worktrees -- the same
+  // order as 37.8s -- so the claim is withdrawn rather than restated. What is
+  // reproducible is the table above; the 4x row is not the ceiling.
   //
   // So the timeout is load-bearing, not decorative: it is reproduced on
-  // UNMODIFIED main without any other change, and it is sized against the only
-  // load condition ever observed to exceed 30s.
+  // UNMODIFIED main without any other change, and it is sized against the worst
+  // load condition measured on this machine.
   //
   // SCOPED HERE ON PURPOSE. The global timeout stays Vitest's 5s default for the
   // other 508 tests, so a regression that made an ordinary in-process test slow

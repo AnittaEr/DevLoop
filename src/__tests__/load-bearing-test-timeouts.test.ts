@@ -21,7 +21,15 @@
  *
  * B53 fixed the known instances by hand. This guard is what stops the next one
  * from being born: a test that spawns a subprocess, or rebuilds a module graph
- * per case, and does not name one of the measured budgets, FAILS HERE. The
+ * per case, and does not name one of the measured budgets BY NAME, FAILS HERE.
+ * "By name" is load-bearing, and it is enforced rather than asserted: the
+ * `timeout:` VALUE is read and resolved (including through the `const
+ * LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.moduleGraph` alias every real
+ * `moduleGraph` site uses), and the key it names must exist in
+ * `LOAD_BEARING_TEST_TIMEOUT`. So a raw `30000`, a hand-written `5000`, and a
+ * misspelled `.subprocses` are each reported -- the first two because a magic
+ * number carries none of the measurement that justifies it, the third because
+ * it reaches Vitest as `undefined` and typechecks clean behind a cast. The
  * author of the next load-sensitive test meets that failure at authoring time
  * rather than at a full-suite run on a loaded machine in six weeks.
  *
@@ -98,9 +106,114 @@ const LOAD_SCALED_MARKERS: readonly {
   },
 ];
 
-/** How a test names a measured budget. Both spellings are accepted. */
-const BUDGET_REFERENCE =
-  /LOAD_BEARING_TEST_TIMEOUT\s*\.\s*[A-Za-z0-9_]+|\{\s*timeout\s*:/;
+/**
+ * The budget keys a use site may name, read from the budgets OBJECT itself.
+ *
+ * Read live rather than from a duplicated list, on purpose. An exported mirror
+ * of the keys (`KNOWN_BUDGET_KEYS`) was the previous mechanism and it was
+ * dead -- nothing referenced it, so it could not have caught the typo it was
+ * documented as catching, and a key added to the budgets would not have reached
+ * it. Deriving them here means the two can never drift, because there is only
+ * one of them.
+ */
+const KNOWN_BUDGET_KEYS: readonly string[] = Object.keys(
+  LOAD_BEARING_TEST_TIMEOUT,
+);
+
+/**
+ * `timeout:` and the expression that follows it, up to the `,` or `}` that ends
+ * the options object.
+ *
+ * The VALUE is captured, not just the key's presence, because the presence of a
+ * `timeout:` is exactly what this check must not accept on trust: `{ timeout:
+ * 5000 }` is a test writing by hand the too-small budget this guard exists to
+ * prevent, and a bare "does the word appear" test waves it through.
+ */
+const TIMEOUT_OPTION = /\btimeout\s*:\s*([^,}\n]*)/g;
+
+/**
+ * A direct reference: `LOAD_BEARING_TEST_TIMEOUT.subprocess`.
+ *
+ * Anchored to the whole value, so a trailing TypeScript cast
+ * (`... as unknown as number`) does not defeat it, and the captured key is then
+ * VALIDATED against `KNOWN_BUDGET_KEYS` rather than accepted on sight.
+ */
+const DIRECT_BUDGET_REFERENCE =
+  /^LOAD_BEARING_TEST_TIMEOUT\s*\.\s*([A-Za-z_$][\w$]*)\s*(?:\s+as\s+.*)?$/;
+
+/**
+ * `const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.moduleGraph;`
+ *
+ * An alias is the normal spelling in this suite: `route-auth.test.ts`,
+ * `db-schema-boundary.test.ts` and `session-guard.test.ts` all declare one and
+ * then write `{ timeout: LOAD_BEARING }`. A guard that only accepted the direct
+ * spelling would have to flag every one of them, so the alias is resolved to
+ * the budget it names and the KEY it names is validated exactly as strictly.
+ *
+ * Resolved file-wide rather than per-scope. That over-attributes an alias
+ * declared in one `describe` to an identically-named identifier in another,
+ * which errs toward flagging -- a false flag is a comment in the next commit,
+ * a missed budget is a flaky red suite in six weeks.
+ */
+const BUDGET_ALIAS_DECLARATION =
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+?)?=\s*LOAD_BEARING_TEST_TIMEOUT\s*\.\s*([A-Za-z_$][\w$]*)/g;
+
+/**
+ * The budget key a `timeout:` VALUE names, or undefined if it names no budget.
+ *
+ * Returns undefined for a raw literal (`30000`, `5000`), for an unresolvable
+ * identifier, and for a key that is not in `KNOWN_BUDGET_KEYS` -- a typo such
+ * as `.subprocses` typechecks no worse than a correct one and so must not
+ * satisfy the guard.
+ */
+function budgetKeyNamedBy(
+  value: string,
+  aliases: ReadonlyMap<string, string>,
+): string | undefined {
+  const direct = DIRECT_BUDGET_REFERENCE.exec(value.trim());
+  if (direct?.[1]) return direct[1];
+  const alias = aliases.get(value.trim());
+  return alias;
+}
+
+/** Alias name -> budget key, for every alias declaration in the file. */
+function collectBudgetAliases(
+  stripped: readonly string[],
+): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const text = stripped.join("\n");
+  BUDGET_ALIAS_DECLARATION.lastIndex = 0;
+  let match = BUDGET_ALIAS_DECLARATION.exec(text);
+  while (match !== null) {
+    const [, name, key] = match;
+    if (name && key) aliases.set(name, key);
+    match = BUDGET_ALIAS_DECLARATION.exec(text);
+  }
+  return aliases;
+}
+
+/**
+ * Does this test attach a budget that RESOLVES to a real, named key?
+ *
+ * The value must name one of `KNOWN_BUDGET_KEYS`. That is what makes the
+ * budgets module's "a magic number cannot satisfy the guard" claim true rather
+ * than aspirational, and it is the whole of D4 and D5: a raw literal and a
+ * misspelled key both reach Vitest's real timeout behaviour, so both must be
+ * rejected here.
+ */
+function attachesBudget(
+  head: string,
+  body: string,
+  aliases: ReadonlyMap<string, string>,
+): boolean {
+  for (const text of [head, body]) {
+    for (const match of text.matchAll(TIMEOUT_OPTION)) {
+      const key = budgetKeyNamedBy(match[1] ?? "", aliases);
+      if (key !== undefined && KNOWN_BUDGET_KEYS.includes(key)) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Blank out comments and string/template literal CONTENTS, keeping the
@@ -493,6 +606,7 @@ function scanSource(file: string, raw: string): LoadSensitiveTest[] {
   const strippedText = stripCommentsAndStrings(raw);
   const stripped = strippedText.split("\n");
   const helpers = collectHelpers(stripped);
+  const aliases = collectBudgetAliases(stripped);
   const openings = [...strippedText.matchAll(OPENING)];
   openings.forEach((match) => {
     const start = match.index ?? 0;
@@ -505,11 +619,7 @@ function scanSource(file: string, raw: string): LoadSensitiveTest[] {
     const head = [header, lines[startLine + 1] ?? ""].join("\n");
     const body = ownedLines(stripped, startLine, indent).join("\n");
     const marker = markerReachedFrom(body, helpers);
-    if (
-      marker &&
-      !BUDGET_REFERENCE.test(head) &&
-      !BUDGET_REFERENCE.test(body)
-    ) {
+    if (marker && !attachesBudget(head, body, aliases)) {
       offenders.push({
         file: path.relative(REPO_ROOT, file),
         line: startLine + 1,
@@ -603,7 +713,7 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
       LOAD_SCALED_MARKERS.some((marker) => marker.pattern.test(body)),
       "the scan must fire on a real spawn with no budget",
     ).toBe(true);
-    expect(BUDGET_REFERENCE.test(body)).toBe(false);
+    expect(attachesBudget(body, "", collectBudgetAliases([]))).toBe(false);
 
     // The budget is attached on the RAW source, then stripped -- attaching it
     // after stripping would put it inside a blanked-out literal and the test
@@ -622,7 +732,7 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
       budgeted.indexOf("it("),
       budgeted.indexOf("it(") + 400,
     );
-    expect(BUDGET_REFERENCE.test(head)).toBe(true);
+    expect(attachesBudget(head, "", collectBudgetAliases([]))).toBe(true);
   });
 
   it("follows load-scaled work reached through a file-level helper", () => {
@@ -783,6 +893,114 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
         "instance hides the class name, so this text scan cannot attribute the " +
         "spawn. Closing it needs type information, not a wider regex.",
     ).not.toContain(14);
+  });
+
+  it("rejects a raw literal timeout, which is the budget this guard exists to stop", () => {
+    // D4. The budgets module claimed "A raw `30000` next to a `spawnSync` fails
+    // that guard ... So the guard cannot be satisfied by a magic number." QA
+    // measured that claim FALSE: the old pattern had an OR alternative
+    // `\{\s*timeout\s*:` that matched ANY literal, so `{ timeout: 30000 }` next
+    // to a spawn passed, and so did `{ timeout: 5000 }` -- the second being the
+    // sharp case, a test writing by hand the exact too-small budget this guard
+    // is built to prevent, and passing.
+    //
+    // Driven through `scanSource` (the real entry point), so this is what the
+    // guard does, not what a helper does in isolation.
+    for (const literal of ["30000", "5_000", "60_000", "1"]) {
+      const raw = [
+        'describe("synthetic", () => {',
+        `  it("spawns behind a hand-written timeout", { timeout: ${literal} }, () => {`,
+        "    const result = spawnSync('git', ['--version']);",
+        "    expect(result.status).toBe(0);",
+        "  });",
+        "});",
+      ].join("\n");
+      expect(
+        scanSource("synthetic.test.ts", raw).map((o) => o.line),
+        `a raw \`timeout: ${literal}\` is a magic number, not a measured ` +
+          "budget, and must be reported so the author is sent to the budgets " +
+          "module rather than left with a number nobody justified",
+      ).toEqual([2]);
+    }
+  });
+
+  it("rejects a budget key that does not exist, including a typo", () => {
+    // D5. `KNOWN_BUDGET_KEYS` was exported and documented as the guard's defence
+    // ("a test that references a budget the guard does not know about cannot
+    // satisfy the guard by accident") while being referenced by nothing, so a
+    // misspelled key cleared the guard -- and typechecked clean, because
+    // `as const` does not check a property accessed through a cast.
+    //
+    // Both spellings QA measured are here: the plain typo, and the cast that
+    // hides it from the compiler as well as from the old regex.
+    for (const key of ["subprocses", "moduleGraphh", "nope"]) {
+      const raw = [
+        'describe("synthetic", () => {',
+        `  it("names a budget that does not exist", { timeout: LOAD_BEARING_TEST_TIMEOUT.${key} }, () => {`,
+        "    const result = spawnSync('git', ['--version']);",
+        "    expect(result.status).toBe(0);",
+        "  });",
+        "});",
+      ].join("\n");
+      expect(
+        scanSource("synthetic.test.ts", raw).map((o) => o.line),
+        `LOAD_BEARING_TEST_TIMEOUT.${key} is not a budget. The value reaches ` +
+          "Vitest as `undefined`, so the test silently keeps the 5s default " +
+          "and typecheck cannot catch it -- the guard must.",
+      ).toEqual([2]);
+    }
+
+    const cast = [
+      'describe("synthetic", () => {',
+      '  it("hides the typo behind a cast", () => {',
+      "    const BOGUS = (LOAD_BEARING_TEST_TIMEOUT as Record<string, number>).subprocses;",
+      "  });",
+      "});",
+      "",
+      'describe("synthetic2", () => {',
+      '  it("spawns behind a casted typo", { timeout: (LOAD_BEARING_TEST_TIMEOUT as unknown as Record<string, number>).subprocses }, () => {',
+      "    const result = spawnSync('git', ['--version']);",
+      "    expect(result.status).toBe(0);",
+      "  });",
+      "});",
+    ].join("\n");
+    expect(
+      scanSource("synthetic.test.ts", cast).map((o) => o.line),
+      "a cast must not be a way to smuggle an unvalidated key past the guard",
+    ).toEqual([8]);
+  });
+
+  it("accepts the alias spelling the suite actually uses, and validates it too", () => {
+    // Every real `moduleGraph` use site writes `{ timeout: LOAD_BEARING }` after
+    // a `const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.moduleGraph`. If the
+    // guard rejected that spelling it would flag four correct tests, so the
+    // alias has to resolve -- and resolving it must not become a loophole, so
+    // the same key validation applies to the right-hand side.
+    const real = [
+      'describe("synthetic", () => {',
+      "  const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.moduleGraph;",
+      '  it("resolves the alias", { timeout: LOAD_BEARING }, () => {',
+      "    const result = spawnSync('git', ['--version']);",
+      "    expect(result.status).toBe(0);",
+      "  });",
+      "});",
+    ].join("\n");
+    expect(scanSource("synthetic.test.ts", real)).toEqual([]);
+
+    const badAlias = [
+      'describe("synthetic", () => {',
+      "  const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.modulGraph;",
+      '  it("aliases a typo, which is still a typo", { timeout: LOAD_BEARING }, () => {',
+      "    const result = spawnSync('git', ['--version']);",
+      "    expect(result.status).toBe(0);",
+      "  });",
+      "});",
+    ].join("\n");
+    expect(
+      scanSource("synthetic.test.ts", badAlias).map((o) => o.line),
+      "an alias whose right-hand side names no real budget resolves to nothing, " +
+        "so it must not clear the guard",
+    ).toEqual([3]);
   });
 
   it("does not accept a marker that appears only in a comment or a string", () => {
