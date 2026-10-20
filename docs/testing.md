@@ -374,11 +374,18 @@ full-suite load those tests exceeded 5s and failed with
 The budgets live in `src/core/testing/load-bearing-test-timeout.ts` and are
 attached per test as `{ timeout: LOAD_BEARING_TEST_TIMEOUT.<key> }`:
 
-| budget         | for                                               | worst measurement it is sized from                            |
-| -------------- | ------------------------------------------------- | ------------------------------------------------------------- |
-| `subprocess`   | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites — see the caveat below             |
-| `subprocessX4` | a subprocess test measured **above** `subprocess` | **31.6s**, 7 concurrent **full** suites (the Prettier canary) |
-| `moduleGraph`  | `vi.resetModules()` / re-import per case          | 6.9s, 7 concurrent suites (`route-auth.test.ts`)              |
+| budget             | for                                               | worst measurement it is sized from                            |
+| ------------------ | ------------------------------------------------- | ------------------------------------------------------------- |
+| `subprocess`       | spawns a subprocess (a cold start per call)       | 28.1s, 4 concurrent suites — see the caveat below             |
+| `subprocessX4`     | a subprocess test measured **above** `subprocess` | **31.6s**, 7 concurrent **full** suites (the Prettier canary) |
+| `moduleGraph`      | `vi.resetModules()` / re-import per case          | 6.9s, 7 concurrent suites (`route-auth.test.ts`)              |
+| `jsdomInteraction` | `userEvent` interaction (typing, clicking)        | 12.6s, 4 concurrent suites (`auth-form.test.tsx`)             |
+
+`userEvent` interaction tests are load-scaled: they drive real jsdom events
+with real timers, so event dispatch and React flushing stretch under machine
+load. The guard recognises `userEvent.setup()` as a load-scaled marker. The
+`jsdomInteraction` budget (30s) is sized from `auth-form.test.tsx` measured at
+10.0–12.6s under 4x concurrent full-suite load (isolated: ~1.3–1.6s).
 
 The `subprocessX4` figure is the worst of 7 measured runs at 7x concurrency:
 31563 / 30895 / 30811 / 30170 / 30050 / 29425 / 26160 ms (median 30170), in

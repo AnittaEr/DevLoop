@@ -101,8 +101,14 @@ const LOAD_SCALED_MARKERS: readonly {
   { pattern: /\bexecFile\s*\(/, why: "spawns a subprocess" },
   { pattern: /Bun\.spawn\s*\(/, why: "spawns a subprocess" },
   {
-    pattern: /vi\.resetModules\s*\(\s*\)/,
+    pattern: /vi\.resetModules\(\s*\)/,
     why: "rebuilds a module graph per case, so its cost scales with load",
+  },
+  {
+    pattern: /\buserEvent\s*\.\s*setup\s*\(/,
+    why:
+      "drives a real jsdom interaction (typing, clicking, waiting) with real " +
+      "timers, so event dispatch and React flushing scale with machine load",
   },
 ];
 
@@ -686,6 +692,7 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
       [/\bexecFile\s*\(/, "execFile('git', [])"],
       [/Bun[.]spawn\s*\(/, "Bun.spawn([])"],
       [/vi[.]resetModules\s*\(\s*\)/, "vi.resetModules();"],
+      [/\buserEvent\s*\.\s*setup\s*\(/, "userEvent.setup()"],
     ];
     const scanned = stripCommentsAndStrings(
       samples.map(([, code]) => `it("t", () => { ${code} });`).join("\n"),
@@ -1028,6 +1035,41 @@ describe("every load-scaled test carries a MEASURED timeout, not the 5s default"
       "a marker inside a comment or a string literal is not real subprocess work",
     ).toEqual([]);
   });
+
+  it("flags an unbudgeted userEvent interaction, and clears it once budgeted", () => {
+    // C3 NON-VACUITY: the guard must fire on a real userEvent.setup() call
+    // with no budget, and clear once a budget is attached. Without this test,
+    // a scanner whose userEvent pattern stopped matching would be green and the
+    // guard above would be theatre.
+    const unbudgeted = [
+      'describe("synthetic", () => {',
+      '  it("types into a field", async () => {',
+      "    const user = userEvent.setup();",
+      "    await user.type(screen.getByLabelText('Email'), 'test@example.com');",
+      "  });",
+      "});",
+    ].join("\n");
+    expect(
+      scanSource("synthetic.test.tsx", unbudgeted).map((o) => ({
+        line: o.line,
+        name: o.name,
+      })),
+      "an unbudgeted userEvent.setup() must be flagged as load-scaled",
+    ).toEqual([{ line: 2, name: "types into a field" }]);
+
+    // GREEN: the same file with a budget on that test scans clean.
+    const budgeted = unbudgeted.replace(
+      '  it("types into a field", async () => {',
+      "  it(\n" +
+        '    "types into a field",\n' +
+        "    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },\n" +
+        "    async () => {",
+    );
+    expect(
+      scanSource("synthetic.test.tsx", budgeted),
+      "a budgeted userEvent.setup() must clear the guard",
+    ).toEqual([]);
+  });
 });
 
 describe("the budgets themselves are the measured ones, not decoration", () => {
@@ -1057,6 +1099,7 @@ describe("the budgets themselves are the measured ones, not decoration", () => {
     // correct one, and the guard would pass while the test kept Vitest's
     // default. This is the check that keeps the exports and their users in step.
     expect(Object.keys(LOAD_BEARING_TEST_TIMEOUT).sort()).toEqual([
+      "jsdomInteraction",
       "moduleGraph",
       "subprocess",
       "subprocessX4",
