@@ -38,9 +38,24 @@ bun run secrets:scan:baseline    # rewrite the baseline's entries (still needs r
 bun run secrets:hook:install     # enable the pre-commit hook in this clone
 ```
 
-Every baseline entry carries a **per-entry reason** saying why the finding is not
-a credential, and an entry without one is fatal rather than ignored: a bare
+Every baseline entry carries a **per-entry reason** saying why the finding is not a
+credential, and an entry without one is fatal rather than ignored: a bare
 fingerprint is a silent blanket waiver wearing the costume of a reviewed entry.
+
+A **stale baseline entry** — one whose fingerprint matches nothing live — is an
+**advisory** (exit 0, reported), not a failure. The scanner prints:
+
+```
+secret-scan: 1 baseline entry is stale (no longer match anything):
+  deadbeefdeadbeef	<reason>
+Run 'bun run secrets:scan --write-baseline' to drop them.
+```
+
+This is deliberate: deleting a fixture must not break the gate for everyone, but a
+stale entry must never be silent either. `bun run secrets:scan --write-baseline`
+drops stale entries (it rewrites the baseline from current findings, preserving
+reasons for surviving entries). A stale entry does **not** suppress a live finding —
+if a genuine unbaselined finding exists, the scan still exits 1.
 
 The `pre-commit` hook (`.githooks/pre-commit`) is the cheap first layer that
 catches a credential before it becomes a commit. It is enabled per clone by

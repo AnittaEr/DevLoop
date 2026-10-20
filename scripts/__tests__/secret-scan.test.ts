@@ -1031,6 +1031,80 @@ describe("secret scan: the shipped CLI's exit code, in a throwaway repo", () => 
   );
 });
 
+describe("secret scan: a stale baseline entry is an ADVISORY (exit 0, reported)", () => {
+  // c2 + c3: A stale entry exits 0 AND the message names the fingerprint
+  // and says it no longer matches anything.
+  it("exits 0 and names the stale fingerprint when a baseline entry matches nothing", () => {
+    const result = runGate({
+      "src/ok.ts": "export const n = 1;\n",
+      "security/secret-scan-baseline.txt": renderBaseline([
+        {
+          fingerprint: "deadbeefdeadbeef",
+          reason: "A synthetic stale entry for this probe.",
+        },
+      ]),
+    });
+    expect(result.status).toBe(0);
+    expect(result.output).toContain("deadbeefdeadbeef");
+    expect(result.output).toContain("stale");
+    expect(result.output).toContain("no longer match anything");
+  });
+
+  // c5: --write-baseline drops stale entries and the next scan reports zero.
+  it("--write-baseline drops stale entries and the next scan reports zero stale", () => {
+    withTempRepo((dir) => {
+      writeFileSync(
+        path.join(dir, "src-ok.ts"),
+        "export const n = 1;\n",
+        "utf8",
+      );
+      writeFileSync(
+        path.join(dir, "security", "secret-scan-baseline.txt"),
+        renderBaseline([
+          {
+            fingerprint: "deadbeefdeadbeef",
+            reason: "A synthetic stale entry for this probe.",
+          },
+        ]),
+        "utf8",
+      );
+      git(dir, "add", "-A");
+
+      // Run --write-baseline
+      const writeResult = runScanner(dir, ["--write-baseline"]);
+      expect(writeResult.status).toBe(0);
+
+      // The stale entry must be gone from the file
+      const baselineAfter = readFileSync(
+        path.join(dir, "security", "secret-scan-baseline.txt"),
+        "utf8",
+      );
+      expect(baselineAfter).not.toContain("deadbeefdeadbeef");
+
+      // Re-run the scanner: zero stale entries reported
+      const rescanResult = runScanner(dir);
+      expect(rescanResult.status).toBe(0);
+      expect(rescanResult.output).not.toContain("stale");
+    });
+  });
+
+  // c6: A stale entry does NOT suppress a live finding.
+  it("exits 1 when a stale entry coexists with a genuine unbaselined finding", () => {
+    const pat = syntheticRealLookingPat(9999);
+    const result = runGate({
+      "src/leak.ts": `export const t = "${pat}";\n`,
+      "security/secret-scan-baseline.txt": renderBaseline([
+        {
+          fingerprint: "deadbeefdeadbeef",
+          reason: "A synthetic stale entry for this probe.",
+        },
+      ]),
+    });
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("src/leak.ts:1");
+  });
+});
+
 describe("the repository state this gate depends on", () => {
   const gitignore = readFileSync(path.join(REPO_ROOT, ".gitignore"), "utf8");
   const ci = readFileSync(
