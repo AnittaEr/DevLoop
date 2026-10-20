@@ -167,7 +167,8 @@ export const LOAD_BEARING_TEST_TIMEOUT = {
    * load (I17 D2, head 3600c0c). The file's 11 tests together take ~1.5s
    * under 7x concurrent load (measured 2026-10-20, this branch). 30s gives
    * ~6x headroom over the 5s timeout and ~20x over the file total, which is
-   * the same safety margin the other budgets carry.
+   * the same safety margin the other budgets carry. Isolated measurement:
+   * 1.64s (measured 2026-10-20, this branch).
    */
   jsdomInteraction: 30_000,
 } as const;
