@@ -135,7 +135,13 @@ const CORE_PLUGIN_BOUNDARY_PATTERNS = [
 
 const eslintConfig = [
   {
-    ignores: [".next/**", "node_modules/**", "coverage/**", "next-env.d.ts"],
+    ignores: [
+      ".next/**",
+      "node_modules/**",
+      "coverage/**",
+      "next-env.d.ts",
+      ".worktrees/**",
+    ],
   },
   ...compat.extends("next/core-web-vitals", "next/typescript", "prettier"),
   {
