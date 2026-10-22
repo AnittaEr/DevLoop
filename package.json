@@ -65,6 +65,8 @@
   "overrides": {
     "postcss": "8.5.28",
     "sharp": "0.35.5",
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "postcss-selector-parser": "7.1.6",
+    "vite": "7.3.7"
   }
 }
