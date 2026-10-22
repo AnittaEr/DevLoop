@@ -20,6 +20,8 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
+
 import { AuthSecretMissingError } from "@/lib/auth";
 
 import { requireSession, SESSION_GUARD_OUTCOMES } from "@/lib/session-guard";
@@ -135,22 +137,33 @@ describe("requireSession", () => {
     await expect(requireSession()).rejects.toBe(boom);
   });
 
-  it("imports without a Next.js request scope and without a configured secret", async () => {
-    // `next build` and `bun run test` both import this module with no `.env` and
-    // no request in flight. If anything ran at module scope this throws, and the
-    // failure would present as an unrelated build or collection error.
-    delete process.env.BETTER_AUTH_SECRET;
-    vi.resetModules();
+  // MEASURED BUDGET: `moduleGraph`. This case calls `vi.resetModules()` and
+  // re-imports `@/lib/session-guard` through a fresh module graph, so its cost is
+  // transform + link work, not assertion work, and it stretches with machine
+  // load exactly as a subprocess spawn does. That is why it is measured here
+  // rather than assumed: it was flagged by the B53 guard
+  // (`src/__tests__/load-bearing-test-timeouts.test.ts`) as the one
+  // module-graph site in the suite that inherited the 5s default.
+  it(
+    "imports without a Next.js request scope and without a configured secret",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.moduleGraph },
+    async () => {
+      // `next build` and `bun run test` both import this module with no `.env` and
+      // no request in flight. If anything ran at module scope this throws, and the
+      // failure would present as an unrelated build or collection error.
+      delete process.env.BETTER_AUTH_SECRET;
+      vi.resetModules();
 
-    const fresh = await import("@/lib/session-guard");
+      const fresh = await import("@/lib/session-guard");
 
-    expect(typeof fresh.requireSession).toBe("function");
-    expect(Object.keys(fresh.SESSION_GUARD_OUTCOMES).sort()).toEqual([
-      "authNotConfigured",
-      "authenticated",
-      "sessionRequired",
-    ]);
-  });
+      expect(typeof fresh.requireSession).toBe("function");
+      expect(Object.keys(fresh.SESSION_GUARD_OUTCOMES).sort()).toEqual([
+        "authNotConfigured",
+        "authenticated",
+        "sessionRequired",
+      ]);
+    },
+  );
 
   it("never reads, returns or echoes the secret value", async () => {
     process.env.BETTER_AUTH_SECRET = THROWAWAY_SECRET;
