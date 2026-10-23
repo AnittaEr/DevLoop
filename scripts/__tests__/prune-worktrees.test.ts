@@ -38,29 +38,37 @@
  */
 
 import { execFileSync } from "node:child_process";
-import {
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  rmSync,
-} from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
 
-import { type WorktreeClassification, classify, classifyAll } from "../prune-worktrees";
+import { classify, classifyAll } from "../prune-worktrees";
 
 /**
- * The repo root, resolved through git rather than assumed. This test imports the
- * shipped `classify`/`classifyAll` directly, so it needs the real repo root only
- * for the subprocess-based CLI tests that copy the script into a temp repo.
+ * Resolve the git SUPERPROJECT root, mirroring the logic in the shipped script.
+ *
+ * The test imports `classify`/`classifyAll` directly, so it needs the real
+ * repo root for the protected-path assertions and for pointing `PRUNE_SCRIPT`
+ * at the script file. In a linked worktree, `git rev-parse --show-toplevel`
+ * returns the worktree directory, not the superproject -- so we go through
+ * `--git-common-dir` (absolute on a worktree, relative `.git` on the main
+ * checkout) and take its parent, matching `superprojectRoot()` in the script.
  */
 function repoRoot(): string {
-  return execFileSync("git", ["rev-parse", "--show-toplevel"], {
+  const toplevel = execFileSync("git", ["rev-parse", "--show-toplevel"], {
     encoding: "utf8",
   }).trim();
+  const common = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+    encoding: "utf8",
+  }).trim();
+  if (!toplevel || !common) {
+    return process.cwd();
+  }
+  const gitDir = path.isAbsolute(common) ? common : path.resolve(toplevel, common);
+  return path.dirname(gitDir);
 }
 
 const REPO_ROOT = repoRoot();
@@ -96,10 +104,7 @@ function gitIn(cwd: string, ...args: string[]): string {
  * repo has a `main` branch and a commit on it so that `git rev-list --count
  * main..<branch>` is well-defined.
  */
-function withTempRepo(
-  body: (dir: string) => void,
-  opts: { timeout?: number } = {},
-): void {
+function withTempRepo(body: (dir: string) => void): void {
   const dir = mkdtempSync(path.join(tmpdir(), "prune-worktrees-repo-"));
   try {
     initTempRepo(dir);
@@ -158,26 +163,30 @@ function makeMergedWorktree(
 describe("prune-worktrees: classify() is the data-destruction guard", () => {
   it("merged branch -> REMOVABLE (unreconciledCount 0)", () => {
     // A branch fully merged into `main` has count 0 -> safe to remove.
-    const c = classify({
-      path: "/tmp/some-worktree",
-      branch: "merged-feature",
-      headSha: "abc1234",
-    });
+    // We inject the count resolver (default would shell out to git in the
+    // live repo, where "merged-feature" does not exist) so this assertion is
+    // a pure function of the verdict logic, not a git side-effect.
+    const c = classify(
+      { path: "/tmp/some-worktree", branch: "merged-feature", headSha: "abc1234" },
+      [],
+      () => 0,
+    );
     expect(c.verdict).toBe("REMOVABLE");
-    expect(c.unreconciledCount).toBeUndefined();
+    expect(c.unreconciledCount).toBe(0);
   });
 
   it("unmerged branch -> KEEP (count > 0)", () => {
-    // We cannot know the real count without a repo, so classify() is the pure
-    // function here; the subprocess test below pins the real rev-list math.
-    // This test ensures an unmerged branch is never REMOVABLE: we simulate by
-    // giving it a branch name that will be tested against a real temp repo in
-    // the subprocess suite. Here we assert the KEEP verdict shape for a
-    // protected path (the deterministic KEEP case) separately, and for the
-    // count case via the subprocess tests.
-    //
-    // To make this non-vacuous: classify() with a real unmerged branch against
-    // a real repo returns count > 0 -> KEEP. We do that in the subprocess tests.
+    // Inject a count of 1: one unreconciled commit not on main -> KEEP. This
+    // is the data-destruction guard -- a non-zero count must NEVER reach
+    // `git worktree remove`.
+    const c = classify(
+      { path: "/tmp/some-worktree", branch: "feature-unmerged", headSha: "abc1234" },
+      [],
+      () => 1,
+    );
+    expect(c.verdict).toBe("KEEP");
+    expect(c.unreconciledCount).toBe(1);
+    expect(c.reason).toContain("1 unreconciled commit");
   });
 
   it("protected path -> KEEP regardless of merge status", () => {
@@ -206,10 +215,11 @@ describe("prune-worktrees: classify() is the data-destruction guard", () => {
 
 describe("prune-worktrees: classifyAll() wires classify() over a list", () => {
   it("classifies a mixed set deterministically", () => {
-    const worktrees: Array<{ path: string; branch: string; headSha: string }> = [
-      { path: PROTECTED_PATH_1, branch: "live", headSha: "0000001" },
-      { path: "/tmp/detached-wt", branch: "(detached)", headSha: "0000002" },
-    ];
+    const worktrees: Array<{ path: string; branch: string; headSha: string }> =
+      [
+        { path: PROTECTED_PATH_1, branch: "live", headSha: "0000001" },
+        { path: "/tmp/detached-wt", branch: "(detached)", headSha: "0000002" },
+      ];
     const result = classifyAll(worktrees);
     expect(result).toHaveLength(2);
     expect(result[0]?.verdict).toBe("KEEP");
@@ -235,8 +245,16 @@ describe("prune-worktrees: CLI dry-run removes nothing (c2/c4/c8)", () => {
     () => {
       withTempRepo((dir) => {
         // One merged worktree, one unmerged worktree.
-        const merged = makeMergedWorktree(dir, "feature-merged", "merged content\n");
-        const unmerged = makeUnmergedWorktree(dir, "feature-unmerged", "unmerged content\n");
+        const merged = makeMergedWorktree(
+          dir,
+          "feature-merged",
+          "merged content\n",
+        );
+        const unmerged = makeUnmergedWorktree(
+          dir,
+          "feature-unmerged",
+          "unmerged content\n",
+        );
 
         const before = gitIn(dir, "worktree", "list");
         expect(before).toContain(merged.wtDir);
@@ -248,7 +266,9 @@ describe("prune-worktrees: CLI dry-run removes nothing (c2/c4/c8)", () => {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
         });
-        expect(output).toContain("DRY-RUN: no changes made. Pass --apply to remove REMOVABLE worktrees.");
+        expect(output).toContain(
+          "DRY-RUN: no changes made. Pass --apply to remove REMOVABLE worktrees.",
+        );
 
         // Both worktrees must still be registered.
         const after = gitIn(dir, "worktree", "list");
@@ -266,8 +286,16 @@ describe("prune-worktrees: CLI --apply removes only REMOVABLE (c5/c8)", () => {
     { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
     () => {
       withTempRepo((dir) => {
-        const merged = makeMergedWorktree(dir, "feature-merged", "merged content\n");
-        const unmerged = makeUnmergedWorktree(dir, "feature-unmerged", "unmerged content\n");
+        const merged = makeMergedWorktree(
+          dir,
+          "feature-merged",
+          "merged content\n",
+        );
+        const unmerged = makeUnmergedWorktree(
+          dir,
+          "feature-unmerged",
+          "unmerged content\n",
+        );
 
         // Run --apply.
         execFileSync("bun", ["run", PRUNE_SCRIPT, "--apply"], {
@@ -336,7 +364,11 @@ describe("prune-worktrees: dry-run is the real default, not apply (c9 non-vacuit
     { timeout: LOAD_BEARING_TEST_TIMEOUT.subprocess },
     () => {
       withTempRepo((dir) => {
-        const merged = makeMergedWorktree(dir, "feature-merged", "merged content\n");
+        const merged = makeMergedWorktree(
+          dir,
+          "feature-merged",
+          "merged content\n",
+        );
         const wtDir = merged.wtDir;
 
         const before = gitIn(dir, "worktree", "list");
