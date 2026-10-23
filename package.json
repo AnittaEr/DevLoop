@@ -22,7 +22,9 @@
     "audit": "bun run ./scripts/audit.ts",
     "secrets:scan": "bun run ./scripts/scan-secrets.ts",
     "secrets:scan:baseline": "bun run ./scripts/scan-secrets.ts --write-baseline",
-    "secrets:hook:install": "bun run ./scripts/install-secret-hook.ts"
+    "secrets:hook:install": "bun run ./scripts/install-secret-hook.ts",
+    "worktrees:prune": "bun run ./scripts/prune-worktrees.ts",
+    "worktrees:prune:apply": "bun run ./scripts/prune-worktrees.ts --apply"
   },
   "dependencies": {
     "@radix-ui/react-slot": "1.1.0",
