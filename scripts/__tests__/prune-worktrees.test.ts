@@ -67,7 +67,9 @@ function repoRoot(): string {
   if (!toplevel || !common) {
     return process.cwd();
   }
-  const gitDir = path.isAbsolute(common) ? common : path.resolve(toplevel, common);
+  const gitDir = path.isAbsolute(common)
+    ? common
+    : path.resolve(toplevel, common);
   return path.dirname(gitDir);
 }
 
@@ -167,7 +169,11 @@ describe("prune-worktrees: classify() is the data-destruction guard", () => {
     // live repo, where "merged-feature" does not exist) so this assertion is
     // a pure function of the verdict logic, not a git side-effect.
     const c = classify(
-      { path: "/tmp/some-worktree", branch: "merged-feature", headSha: "abc1234" },
+      {
+        path: "/tmp/some-worktree",
+        branch: "merged-feature",
+        headSha: "abc1234",
+      },
       [],
       () => 0,
     );
@@ -180,7 +186,11 @@ describe("prune-worktrees: classify() is the data-destruction guard", () => {
     // is the data-destruction guard -- a non-zero count must NEVER reach
     // `git worktree remove`.
     const c = classify(
-      { path: "/tmp/some-worktree", branch: "feature-unmerged", headSha: "abc1234" },
+      {
+        path: "/tmp/some-worktree",
+        branch: "feature-unmerged",
+        headSha: "abc1234",
+      },
       [],
       () => 1,
     );

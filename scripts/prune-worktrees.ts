@@ -79,7 +79,9 @@ function superprojectRoot(): string {
   // `--git-common-dir` is relative to the toplevel only on the MAIN checkout
   // (where it returns `.git`). On a linked worktree it is absolute (the
   // superproject's real `.git`). Handle both.
-  const gitDir = path.isAbsolute(common) ? common : path.resolve(toplevel, common);
+  const gitDir = path.isAbsolute(common)
+    ? common
+    : path.resolve(toplevel, common);
 
   return path.dirname(gitDir);
 }
