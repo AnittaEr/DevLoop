@@ -262,8 +262,8 @@ if (writeBaseline) {
 const findingsToReport = unbaselinedFindings(findings, entries);
 
 // A stale baseline entry is worth naming: it is how a waiver outlives its
-// subject. Not fatal — deleting a fixture must not break the gate for
-// everyone — but never silent.
+// subject. Deliberately ADVISORY (exit 0), not fatal — deleting a fixture
+// must not break the gate for everyone — but never silent. Pinned by tests.
 const live = new Set(findings.map((f) => f.fingerprint));
 const stale = entries.filter((e) => !live.has(e.fingerprint));
 

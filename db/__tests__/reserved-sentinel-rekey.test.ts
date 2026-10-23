@@ -158,9 +158,18 @@ async function applyCapturingNotices(
   return seen;
 }
 
-/** Every row's `id` and `metadata`, ordered, for a whole-table assertion. */
+/**
+ * Every row's `id` and `metadata`, ordered, for a whole-table assertion.
+ *
+ * `metadata` is typed as the COLUMN's own type (`CanonicalEventRow["metadata"]`,
+ * which is exactly `JsonObject`) rather than a loose `Record<string, unknown>`.
+ * The loose form was what forced each use site to re-assert the value into the
+ * domain type, which is the very unchecked narrowing the R145 rule denies. The
+ * raw-SQL reader does no runtime validation either way, so the honest thing to
+ * declare is the type the column actually has.
+ */
 async function readAll(client: postgres.Sql) {
-  return client<{ id: string; metadata: Record<string, unknown> }[]>`
+  return client<{ id: string; metadata: JsonObject }[]>`
     SELECT id, metadata FROM canonical_events ORDER BY id`;
 }
 
@@ -288,7 +297,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
             type: "mention",
             title: "plugin row using the sentinel name as data",
             occurredAt: "2026-10-04T12:31:07.000Z",
-            metadata: colliding.metadata as JsonObject,
+            metadata: colliding.metadata,
           }),
         ).toThrow(TypeError);
       },
@@ -341,7 +350,7 @@ describe("0003 re-keys a plugin row that used the remediation sentinel as data",
           type: "mention",
           title: "plugin row using the sentinel name as data",
           occurredAt: "2026-10-04T12:31:07.000Z",
-          metadata: repaired.metadata as JsonObject,
+          metadata: repaired.metadata,
         };
 
         const row = toCanonicalEventRow(event);

@@ -2,6 +2,10 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FlatCompat } from "@eslint/eslintrc";
 import { coreBoundaryPlugin, RULE_ID } from "./eslint-plugin-core-boundary.mjs";
+import {
+  noJsonAssertPlugin,
+  RULE_ID as JSON_ASSERT_RULE_ID,
+} from "./eslint-plugin-no-json-assert.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -148,6 +152,44 @@ const eslintConfig = [
       // removing the specifier list cannot silently take the resolver with it:
       // the two fail for different reasons and are deleted by different edits.
       [RULE_ID]: "error",
+    },
+  },
+  {
+    // R145: an assertion to a JSON type on a jsonb-bound value erases the only
+    // check that the value is JSON-safe, and `tsc` does not notice — measured on
+    // this tree, not assumed: dropping ` as JsonObject` from the write path of
+    // `db/canonical-event-mapper.ts` leaves `bun run typecheck` at exit 0, and
+    // so does replacing the value with `"nonsense" as unknown as JsonObject`.
+    // See `eslint-plugin-no-json-assert.mjs` for why this is an AST rule rather
+    // than a text search, and why the read-path cast is deliberately NOT denied
+    // (`{}` is not assignable to `JsonObject`, so `tsc` already refuses to
+    // remove it).
+    //
+    // THE ALLOWLIST IS EMPTY, and that is the strongest statement this rule can
+    // make. It was not empty at first: the base `e780063` carried two
+    // occurrences, measured with
+    //   grep -rnE "as (JsonObject|Json|JsonValue|PgJsonb)\b" db src e2e \
+    //     --include='*.ts' --include='*.tsx'
+    // — `db/canonical-event-mapper.ts:39` (WRITE path, the R145 defect itself,
+    // an assertion nothing checks) and `db/canonical-event-mapper.ts:63` (READ
+    // path, redundant rather than unchecked; the rule never reports it). Both
+    // were allowlisted by file:line pending batch 12, which owned the mapper.
+    //
+    // That allowlist was line-pinned, and batch 12 then moved the write-path cast
+    // from line 39 to line 135 and dropped the read-path cast entirely — so both
+    // entries went stale and lint reported 3 errors on the integrated head. The
+    // cast has now been removed by narrowing the value (no replacement cast),
+    // both entries are deleted, and `allow` is `[]`.
+    //
+    // Do NOT add an entry here to silence a violation: that is the exact shape of
+    // defect this rule exists to catch. Narrow the value at the boundary instead.
+    // `unusedAllowlistEntries` is NOT enabled; stale entries are reported by the
+    // rule's own `staleAllowlistEntry` message, which is what caught the two
+    // above on the integrated head.
+    files: ["db/**/*.{ts,tsx}", "src/**/*.{ts,tsx}"],
+    plugins: { "no-json-assert": noJsonAssertPlugin },
+    rules: {
+      [JSON_ASSERT_RULE_ID]: ["error", { allow: [] }],
     },
   },
 ];

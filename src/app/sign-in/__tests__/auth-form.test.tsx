@@ -28,6 +28,8 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
+
 const signInEmail = vi.fn();
 const signUpEmail = vi.fn();
 const signOut = vi.fn();
@@ -66,75 +68,91 @@ const EMAIL = "local@example.invalid";
 const PASSWORD = "not-a-real-password";
 
 describe("AuthForm — sign-in goes through better-auth/client (c1)", () => {
-  it("calls signIn.email with exactly the credentials entered", async () => {
-    signInEmail.mockResolvedValue({ data: { user: {} }, error: null });
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp={false} />);
+  it(
+    "calls signIn.email with exactly the credentials entered",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      signInEmail.mockResolvedValue({ data: { user: {} }, error: null });
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp={false} />);
 
-    await user.type(screen.getByLabelText("Email"), EMAIL);
-    await user.type(screen.getByLabelText("Password"), PASSWORD);
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
+      await user.type(screen.getByLabelText("Email"), EMAIL);
+      await user.type(screen.getByLabelText("Password"), PASSWORD);
+      await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    await waitFor(() => {
-      expect(signInEmail).toHaveBeenCalledWith({
-        email: EMAIL,
-        password: PASSWORD,
+      await waitFor(() => {
+        expect(signInEmail).toHaveBeenCalledWith({
+          email: EMAIL,
+          password: PASSWORD,
+        });
       });
-    });
-  });
+    },
+  );
 
-  it("navigates to /evidence on success, by full page load", async () => {
-    // A full navigation, so the SERVER re-evaluates the guard. A client-side
-    // push would render the destination from the cached bundle instead.
-    signInEmail.mockResolvedValue({ data: { user: {} }, error: null });
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp={false} />);
+  it(
+    "navigates to /evidence on success, by full page load",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      // A full navigation, so the SERVER re-evaluates the guard. A client-side
+      // push would render the destination from the cached bundle instead.
+      signInEmail.mockResolvedValue({ data: { user: {} }, error: null });
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp={false} />);
 
-    await user.type(screen.getByLabelText("Email"), EMAIL);
-    await user.type(screen.getByLabelText("Password"), PASSWORD);
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
+      await user.type(screen.getByLabelText("Email"), EMAIL);
+      await user.type(screen.getByLabelText("Password"), PASSWORD);
+      await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    await waitFor(() => {
-      expect(assign).toHaveBeenCalledWith("/evidence");
-    });
-  });
+      await waitFor(() => {
+        expect(assign).toHaveBeenCalledWith("/evidence");
+      });
+    },
+  );
 
-  it("shows fixed text and never the library's error body when sign-in fails", async () => {
-    signInEmail.mockResolvedValue({
-      data: null,
-      error: { message: "Invalid email or password for hunter2@example.com" },
-    });
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp={false} />);
+  it(
+    "shows fixed text and never the library's error body when sign-in fails",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      signInEmail.mockResolvedValue({
+        data: null,
+        error: { message: "Invalid email or password for hunter2@example.com" },
+      });
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp={false} />);
 
-    await user.type(screen.getByLabelText("Email"), EMAIL);
-    await user.type(screen.getByLabelText("Password"), PASSWORD);
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
+      await user.type(screen.getByLabelText("Email"), EMAIL);
+      await user.type(screen.getByLabelText("Password"), PASSWORD);
+      await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    await waitFor(() => {
-      expect(screen.getByTestId("auth-message")).toBeVisible();
-    });
-    // A library error can echo submitted values back; none of it is rendered.
-    expect(screen.getByTestId("auth-message").textContent).not.toContain(
-      "hunter2",
-    );
-    expect(assign).not.toHaveBeenCalled();
-  });
+      await waitFor(() => {
+        expect(screen.getByTestId("auth-message")).toBeVisible();
+      });
+      // A library error can echo submitted values back; none of it is rendered.
+      expect(screen.getByTestId("auth-message").textContent).not.toContain(
+        "hunter2",
+      );
+      expect(assign).not.toHaveBeenCalled();
+    },
+  );
 
-  it("does not navigate when the call throws", async () => {
-    signInEmail.mockRejectedValue(new Error("network down"));
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp={false} />);
+  it(
+    "does not navigate when the call throws",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      signInEmail.mockRejectedValue(new Error("network down"));
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp={false} />);
 
-    await user.type(screen.getByLabelText("Email"), EMAIL);
-    await user.type(screen.getByLabelText("Password"), PASSWORD);
-    await user.click(screen.getByRole("button", { name: "Sign in" }));
+      await user.type(screen.getByLabelText("Email"), EMAIL);
+      await user.type(screen.getByLabelText("Password"), PASSWORD);
+      await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    await waitFor(() => {
-      expect(screen.getByTestId("auth-message")).toBeVisible();
-    });
-    expect(assign).not.toHaveBeenCalled();
-  });
+      await waitFor(() => {
+        expect(screen.getByTestId("auth-message")).toBeVisible();
+      });
+      expect(assign).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("AuthForm — sign-up is gated on the explicit prop (c2)", () => {
@@ -144,54 +162,66 @@ describe("AuthForm — sign-up is gated on the explicit prop (c2)", () => {
     expect(screen.queryByRole("button", { name: "Sign up" })).toBeNull();
   });
 
-  it("submits through signUp.email when allowed", async () => {
-    signUpEmail.mockResolvedValue({ data: { user: {} }, error: null });
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp />);
+  it(
+    "submits through signUp.email when allowed",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      signUpEmail.mockResolvedValue({ data: { user: {} }, error: null });
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp />);
 
-    await user.type(screen.getByLabelText("Email"), EMAIL);
-    await user.type(screen.getByLabelText("Password"), PASSWORD);
-    await user.type(screen.getByLabelText("Name"), "Local User");
-    await user.click(screen.getByRole("button", { name: "Sign up" }));
+      await user.type(screen.getByLabelText("Email"), EMAIL);
+      await user.type(screen.getByLabelText("Password"), PASSWORD);
+      await user.type(screen.getByLabelText("Name"), "Local User");
+      await user.click(screen.getByRole("button", { name: "Sign up" }));
 
-    await waitFor(() => {
-      expect(signUpEmail).toHaveBeenCalledWith({
-        email: EMAIL,
-        password: PASSWORD,
-        name: "Local User",
+      await waitFor(() => {
+        expect(signUpEmail).toHaveBeenCalledWith({
+          email: EMAIL,
+          password: PASSWORD,
+          name: "Local User",
+        });
       });
-    });
-    // A credential must not reach the OTHER endpoint by accident.
-    expect(signInEmail).not.toHaveBeenCalled();
-  });
+      // A credential must not reach the OTHER endpoint by accident.
+      expect(signInEmail).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("AuthForm — sign-out goes through the library", () => {
-  it("calls signOut and returns to the sign-in page", async () => {
-    signOut.mockResolvedValue({ data: { success: true }, error: null });
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp={false} />);
+  it(
+    "calls signOut and returns to the sign-in page",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      signOut.mockResolvedValue({ data: { success: true }, error: null });
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp={false} />);
 
-    await user.click(screen.getByRole("button", { name: "Sign out" }));
+      await user.click(screen.getByRole("button", { name: "Sign out" }));
 
-    await waitFor(() => {
-      expect(signOut).toHaveBeenCalled();
-    });
-    expect(assign).toHaveBeenCalledWith("/sign-in");
-  });
+      await waitFor(() => {
+        expect(signOut).toHaveBeenCalled();
+      });
+      expect(assign).toHaveBeenCalledWith("/sign-in");
+    },
+  );
 
-  it("reports a failed sign-out without navigating away", async () => {
-    signOut.mockResolvedValue({ data: null, error: { message: "nope" } });
-    const user = userEvent.setup();
-    render(<AuthForm allowSignUp={false} />);
+  it(
+    "reports a failed sign-out without navigating away",
+    { timeout: LOAD_BEARING_TEST_TIMEOUT.jsdomInteraction },
+    async () => {
+      signOut.mockResolvedValue({ data: null, error: { message: "nope" } });
+      const user = userEvent.setup();
+      render(<AuthForm allowSignUp={false} />);
 
-    await user.click(screen.getByRole("button", { name: "Sign out" }));
+      await user.click(screen.getByRole("button", { name: "Sign out" }));
 
-    await waitFor(() => {
-      expect(screen.getByTestId("auth-message")).toBeVisible();
-    });
-    expect(assign).not.toHaveBeenCalled();
-  });
+      await waitFor(() => {
+        expect(screen.getByTestId("auth-message")).toBeVisible();
+      });
+      expect(assign).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("AuthForm — c1/c9 structural guarantees", () => {

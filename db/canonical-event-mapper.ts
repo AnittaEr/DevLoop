@@ -132,7 +132,7 @@ export function toCanonicalEventRow(event: CanonicalEvent): CanonicalEventRow {
     author: event.author ?? null,
     // Structured-cloned so a caller mutating the event afterwards cannot change
     // the row (and so the value is provably JSON-safe before it reaches jsonb).
-    metadata: structuredClone(event.metadata) as JsonObject,
+    metadata: structuredClone(event.metadata),
   };
 }
 
