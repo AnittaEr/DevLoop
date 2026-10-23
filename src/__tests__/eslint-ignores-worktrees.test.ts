@@ -43,6 +43,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ESLint } from "eslint";
+import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
 import { afterEach, describe, expect, it } from "vitest";
 
 /**
@@ -106,34 +107,47 @@ afterEach(() => {
 });
 
 describe("eslint . must ignore .worktrees/", () => {
-  it("never reports a file whose path contains .worktrees, even when one is present", async () => {
-    // Place the probe BEFORE running ESLint so the negative control is real:
-    // if the ignore is missing or misspelled, ESLint will reach this file.
-    ensureProbe();
-    const results = await lintRepo();
-    // Resolve each path RELATIVE TO ROOT before checking. ESLint returns
-    // absolute filePath strings; when this test runs INSIDE a task worktree
-    // (which lives under `.worktrees/`), every absolute path contains the
-    // substring `.worktrees` merely because of the worktree directory — a
-    // false positive that has nothing to do with the ignore. Only a file whose
-    // relative path actually lives under `.worktrees/` is a real violation.
-    const worktreeResults = results.filter((r) => {
-      const rel = path.relative(ROOT, r.filePath);
-      return rel.startsWith("..") === false && rel.includes(".worktrees");
-    });
-    expect(
-      worktreeResults,
-      worktreeResults.length === 0
-        ? undefined
-        : [
-            "ESLint reported files under .worktrees/ — the global ignores",
-            "entry for .worktrees/** is missing, misspelled, or shadowed.",
-            ...worktreeResults.map((r) => `  - ${r.filePath}`),
-          ].join("\n"),
-    ).toEqual([]);
-  });
+  // Both cases drive the real ESLint programmatically over `.` (lintRepo).
+  // ESLint spawns its own worker pool, so this is subprocess-spawning work whose
+  // duration stretches with machine load — exactly the B53 defect class. PM
+  // measured the ESLint pass at 6367ms under full-suite load (16.24s suite
+  // wall, jsdom created 39 times); the 5000ms Vitest default is below that, so
+  // without a budget the test times out for a reason that has nothing to do with
+  // the assertion. `subprocess` (30s) is the measured budget for subprocess work
+  // and clears the observed 6367ms with headroom.
+  const LOAD_BEARING = LOAD_BEARING_TEST_TIMEOUT.subprocess;
+  it(
+    "never reports a file whose path contains .worktrees, even when one is present",
+    { timeout: LOAD_BEARING },
+    async () => {
+      // Place the probe BEFORE running ESLint so the negative control is real:
+      // if the ignore is missing or misspelled, ESLint will reach this file.
+      ensureProbe();
+      const results = await lintRepo();
+      // Resolve each path RELATIVE TO ROOT before checking. ESLint returns
+      // absolute filePath strings; when this test runs INSIDE a task worktree
+      // (which lives under `.worktrees/`), every absolute path contains the
+      // substring `.worktrees` merely because of the worktree directory — a
+      // false positive that has nothing to do with the ignore. Only a file whose
+      // relative path actually lives under `.worktrees/` is a real violation.
+      const worktreeResults = results.filter((r) => {
+        const rel = path.relative(ROOT, r.filePath);
+        return rel.startsWith("..") === false && rel.includes(".worktrees");
+      });
+      expect(
+        worktreeResults,
+        worktreeResults.length === 0
+          ? undefined
+          : [
+              "ESLint reported files under .worktrees/ — the global ignores",
+              "entry for .worktrees/** is missing, misspelled, or shadowed.",
+              ...worktreeResults.map((r) => `  - ${r.filePath}`),
+            ].join("\n"),
+      ).toEqual([]);
+    },
+  );
 
-  it("still lints the repo's own tree", async () => {
+  it("still lints the repo's own tree", { timeout: LOAD_BEARING }, async () => {
     // The probe is NOT present here, so this is a pure control: the previous
     // case proves ignored files are excluded, and this case confirms the rest
     // of the tree is still reached. If the ignore were accidentally broad
