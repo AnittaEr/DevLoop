@@ -38,7 +38,13 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  realpathSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -133,7 +139,7 @@ function makeUnmergedWorktree(
   branch: string,
   content: string,
 ): string {
-  const wt = mkdtempSync(path.join(tmpdir(), "prune-wt-"));
+  const wt = realpathSync(mkdtempSync(path.join(tmpdir(), "prune-wt-")));
   gitIn(repoDir, "worktree", "add", wt, "-b", branch);
   writeFileSync(path.join(wt, "diff.txt"), content, "utf8");
   gitIn(wt, "add", "-A");
@@ -152,7 +158,7 @@ function makeMergedWorktree(
   branch: string,
   content: string,
 ): { wt: string; wtDir: string } {
-  const wt = mkdtempSync(path.join(tmpdir(), "prune-wt-"));
+  const wt = realpathSync(mkdtempSync(path.join(tmpdir(), "prune-wt-")));
   gitIn(repoDir, "worktree", "add", wt, "-b", branch);
   writeFileSync(path.join(wt, "diff.txt"), content, "utf8");
   gitIn(wt, "add", "-A");

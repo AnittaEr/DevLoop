@@ -60,7 +60,7 @@ empty and no credential belongs in the repository.
 
 ## Scripts
 
-Every script in `package.json`, all 19 of them:
+Every script in `package.json`, all 21 of them:
 
 | Script                          | Purpose                                                                                                       |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -83,6 +83,8 @@ Every script in `package.json`, all 19 of them:
 | `bun run secrets:scan`          | Scan committed content for credentials (`scripts/scan-secrets.ts`), minus `security/secret-scan-baseline.txt` |
 | `bun run secrets:scan:baseline` | Rewrite the credential-scan baseline from current findings (`scripts/scan-secrets.ts --write-baseline`)       |
 | `bun run secrets:hook:install`  | Point this clone's git at the committed `.githooks` (`scripts/install-secret-hook.ts`)                        |
+| `bun run worktrees:prune`       | Dry-run: classify every registered worktree as REMOVABLE or KEEP (`scripts/prune-worktrees.ts`)               |
+| `bun run worktrees:prune:apply` | Remove only REMOVABLE worktrees — fully merged into `main` (`scripts/prune-worktrees.ts --apply`)             |
 
 Note the three runners: `test`, `test:db` and `e2e` are independent and none
 substitutes for another. `docs/testing.md` explains the split.
