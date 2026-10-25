@@ -1,5 +1,6 @@
 /**
- * The prune half of worktree lifecycle management (B73 / `t_131131fb`).
+ * The prune half of worktree lifecycle management (B73 / `t_131131fb`, B75 /
+ * `t_3ea8f287`).
  *
  * WHY THIS EXISTS. The dispatcher creates one git worktree per kanban card and
  * has no removal path: a `git worktree list` taken at this branch's head returns
@@ -23,11 +24,21 @@
  * `rm -rf`, and only ever passes a worktree to `git worktree remove` when its
  * verdict is unambiguously `REMOVABLE`.
  *
- * THE SAFETY MODEL, IN ONE LINE: `git rev-list --count main..<branch>` returns
- * 0 exactly when every commit the branch carries is ALSO on `main` -- i.e. the
- * branch added nothing that main does not already have. Count > 0 (or an
- * unparseable branch, or a protected path) => KEEP. Count 0 AND not protected =>
- * REMOVABLE.
+ * THE PROTECTION SET IS DERIVED, NOT HARDCODED. A worktree is protected iff its
+ * card is not terminal (not `done` and not `archived`). The set is read live
+ * from `hermes kanban --board devloop list --json` at every invocation, so it
+ * cannot rot like a stale literal. If the board cannot be read, `--apply`
+ * refuses and exits non-zero (c2); a dry-run prints a WARNING and classifies
+ * everything as KEEP (fail-closed), because an empty protection set is the exact
+ * state that would let `--apply` remove a live card's worktree.
+ *
+ * THE SAFETY MODEL, IN ONE LINE: `git rev-list --count <ref>..<branch>` returns
+ * 0 exactly when every commit the branch carries is ALSO on `<ref>` -- i.e. the
+ * branch added nothing that `<ref>` does not already have. `<ref>` is `main`
+ * when a local `main` resolves, and `origin/main` when only the remote-tracking
+ * ref resolves (so a detached checkout with no local `main` can still classify
+ * a genuinely-merged branch). Count > 0 (or an unparseable branch, or a
+ * protected path) => KEEP. Count 0 AND not protected => REMOVABLE.
  */
 
 import { spawnSync } from "node:child_process";
@@ -40,11 +51,11 @@ import { fileURLToPath } from "node:url";
  * This distinguishes the *main* working tree from a *linked* worktree. In a
  * linked worktree, `git rev-parse --show-toplevel` returns the worktree's own
  * directory (e.g. `/repo/.worktrees/t_131131fb`), NOT the directory that owns
- * the `.worktrees/` folder. The protected paths below are expressed relative
- * to the superproject (`.worktrees/t_b6c6dc7a`, `.worktrees/t_58bc7c17`), so
- * computing them against the worktree root would make them point at
- * `/repo/.worktrees/t_131131fb/.worktrees/t_b6c6dc7a` -- a path that never
- * matches and silently disables protection.
+ * the `.worktrees/` folder. The protected paths produced by
+ * `deriveProtectionSet()` are expressed relative to the superproject
+ * (`.worktrees/<id>`), so computing them against the worktree root would make
+ * them point at `/repo/.worktrees/t_131131fb/.worktrees/<id>` -- a path that
+ * never matches and silently disables protection.
  *
  * `git rev-parse --git-common-dir` returns the common `.git` directory: an
  * absolute path for a linked worktree (the superproject's `.git`), or a
@@ -89,23 +100,103 @@ function superprojectRoot(): string {
 const REPO_ROOT = superprojectRoot();
 
 /**
- * The protected set is hardcoded and explicit. These are the two worktrees
- * backing cards that are live right now (`t_b6c6dc7a` for I23,
- * `t_58bc7c17` for B71). They are KEEP regardless of merge status -- an
- * in-flight card's branch is, by definition, not merged yet, but even after it
- * merges we never want a prune sweep to delete the worktree a running agent is
- * sitting in.
- *
- * These are resolved relative to the git SUPERPROJECT root so they stay correct
- * no matter where the script is invoked from, including from within a linked
- * worktree of `t_131131fb` itself.
+ * Terminal statuses: a worktree for a task in one of these states is no longer
+ * in use and may be safely pruned. Everything else (running, ready, todo,
+ * scheduled, review, triage, blocked, ...) means the card is alive and its
+ * worktree must be protected.
  */
-const PROTECTED_PREFIXES = [
-  path.join(REPO_ROOT, ".worktrees", "t_b6c6dc7a"),
-  path.join(REPO_ROOT, ".worktrees", "t_58bc7c17"),
-];
+const TERMINAL_STATUSES = new Set(["done", "archived"]);
 
-const PROTECTION_LABEL = "protected (live card worktree)";
+/**
+ * A worktree that is protected from pruning because it backs a live kanban card.
+ */
+export interface ProtectedWorktree {
+  /** Absolute path to the worktree directory under `.worktrees/<id>`. */
+  path: string;
+  /** The kanban card id this worktree belongs to (e.g. `t_131131fb`). */
+  cardId: string;
+}
+
+/**
+ * The single source of truth for terminal statuses. `status` values that do NOT
+ * appear here are live (in-flight) cards. Exported so the test suite can assert
+ * the classification logic without depending on the kanban CLI.
+ */
+export const TERMINAL_STATUS_SET = TERMINAL_STATUSES;
+
+/**
+ * Parse the JSON output of `hermes kanban --board devloop list --json` and
+ * derive the protection set: every task whose status is NOT `done` or
+ * `archived` contributes a `.worktrees/<id>` entry.
+ *
+ * This is split out from `deriveProtectionSet` (which shells out to `hermes`)
+ * so the test suite can feed it mock board JSON and assert the derivation
+ * logic as a pure function -- including that a `done` id is NOT protected and a
+ * nonterminal id IS protected.
+ *
+ * `repoRoot` is a parameter so the test suite can point it at a fixture tree.
+ */
+export function parseBoardJson(
+  json: string,
+  repoRoot: string,
+): { entries: ProtectedWorktree[]; ok: boolean } {
+  let tasks: unknown;
+  try {
+    tasks = JSON.parse(json);
+  } catch {
+    return { entries: [], ok: false };
+  }
+  if (!Array.isArray(tasks)) {
+    return { entries: [], ok: false };
+  }
+  const entries: ProtectedWorktree[] = [];
+  for (const t of tasks) {
+    if (
+      t &&
+      typeof t === "object" &&
+      "id" in t &&
+      typeof (t as { id: unknown }).id === "string" &&
+      "status" in t &&
+      typeof (t as { status: unknown }).status === "string" &&
+      !TERMINAL_STATUSES.has((t as { status: string }).status)
+    ) {
+      entries.push({
+        path: path.join(repoRoot, ".worktrees", (t as { id: string }).id),
+        cardId: (t as { id: string }).id,
+      });
+    }
+  }
+  return { entries, ok: true };
+}
+
+/**
+ * Derive the protection set from live board state.
+ *
+ * Calls `hermes kanban --board devloop list --json` and maps every non-terminal
+ * task to a `.worktrees/<id>` path. Returns `boardAvailable: false` when the
+ * board cannot be read at all (no `hermes` on PATH, unknown board slug, parse
+ * failure, etc.) -- the caller is then responsible for fail-closed behaviour
+ * (refuse `--apply`, warn in dry-run) because an empty protection set is the
+ * exact state that would let `--apply` remove a live card's worktree.
+ */
+export function deriveProtectionSet(): {
+  entries: ProtectedWorktree[];
+  boardAvailable: boolean;
+} {
+  const result = spawnSync(
+    "hermes",
+    ["kanban", "--board", "devloop", "list", "--json"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+    },
+  );
+  if (result.status !== 0 || !result.stdout) {
+    return { entries: [], boardAvailable: false };
+  }
+  const parsed = parseBoardJson(result.stdout, REPO_ROOT);
+  return { entries: parsed.entries, boardAvailable: parsed.ok };
+}
 
 export type Verdict = "REMOVABLE" | "KEEP";
 
@@ -116,7 +207,7 @@ export interface WorktreeClassification {
   branch: string;
   /** HEAD SHA of the worktree. */
   headSha: string;
-  /** `git rev-list --count main..<branch>`; undefined when the count cannot be parsed. */
+  /** `git rev-list --count <ref>..<branch>`; undefined when the count cannot be parsed. */
   unreconciledCount: number | undefined;
   /** Why the worktree is held back, when verdict is KEEP. Empty when REMOVABLE. */
   reason: string;
@@ -210,22 +301,58 @@ function listWorktrees(): Array<{
 /**
  * Count commits the worktree's branch carries that are NOT on `main`.
  *
- * `git rev-list --count main..<branch>` returns 0 when every commit on
- * `<branch>` is reachable from `main` -- i.e. `<branch>` is fully merged and the
- * worktree adds nothing main doesn't already have. A non-zero count, or a
- * branch that cannot be resolved (detached, or `git` error), returns `undefined`
- * so the caller marks it KEEP.
+ * `git rev-list --count <ref>..<branch>` returns 0 when every commit on
+ * `<branch>` is reachable from `<ref>` -- i.e. `<branch>` is fully merged and the
+ * worktree adds nothing `<ref>` doesn't already have. A non-zero count, or a
+ * branch/ref that cannot be resolved, returns `undefined` so the caller marks it
+ * KEEP.
  *
- * The `2>/dev/null` is deliberate: if the branch ref can't be resolved, git
- * prints to stderr and exits non-zero -- that is the "unmerged or
- * unresolvable" case, which is KEEP.
+ * `<ref>` is resolved as follows (c3/c4):
+ *   - `main` when a local `main` branch resolves.
+ *   - `origin/main` when no local `main` exists but the remote-tracking ref does.
+ *   - `undefined` (KEEP with a fail-closed reason) when NEITHER resolves -- this
+ *     is the detached-checkout-without-main case, where refusing is safer than
+ *     guessing.
+ *
+ * The stderr is captured (not `2>/dev/null`) so that a real git failure -- as
+ * opposed to an unresolvable branch -- surfaces through the reason string.
  */
+function resolveComparisonRef(): string | undefined {
+  // Prefer a local `main` when it exists.
+  const hasLocal =
+    spawnSync("git", ["rev-parse", "--verify", "--quiet", "main"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+    }).status === 0;
+  if (hasLocal) {
+    return "main";
+  }
+  // Fall back to the remote-tracking ref so a detached checkout (which often
+  // has no local `main`) can still classify a merged branch.
+  const hasOriginMain =
+    spawnSync("git", ["rev-parse", "--verify", "--quiet", "origin/main"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+    }).status === 0;
+  if (hasOriginMain) {
+    return "origin/main";
+  }
+  // Neither resolves: fail closed.
+  return undefined;
+}
+
 function unreconciledCount(branch: string): number | undefined {
   // Detached heads and "(no branch)" have nothing to compare against main.
   if (branch === "(no branch)" || branch === "(detached)") {
     return undefined;
   }
-  const count = gitStdout(["rev-list", "--count", `main..${branch}`]);
+  const ref = resolveComparisonRef();
+  if (ref === undefined) {
+    return undefined;
+  }
+  const count = gitStdout(["rev-list", "--count", `${ref}..${branch}`]);
   const parsed = Number.parseInt(count, 10);
   return Number.isNaN(parsed) ? undefined : parsed;
 }
@@ -236,35 +363,38 @@ function unreconciledCount(branch: string): number | undefined {
  * Verdict logic, in priority order:
  *   1. If the worktree path is in the PROTECTED set, it is KEEP -- live cards
  *      must never be auto-pruned, even if their branch looks merged.
- *   2. If `git rev-list --count main..<branch>` is 0, the worktree is REMOVABLE.
+ *   2. If `git rev-list --count <ref>..<branch>` is 0, the worktree is REMOVABLE.
  *   3. Any non-zero count, a detached/no-branch worktree, or an unparseable
  *      count => KEEP.
  *
+ * `protectedEntries` defaults to an empty array -- the real protection set is
+ * derived from live board state in `main()` and passed in explicitly. It is
+ * exposed as a parameter so the test suite can inject a deterministic set and
+ * treat the verdict logic as a pure function -- this is what makes the
+ * "merged -> REMOVABLE / unmerged -> KEEP" assertions non-vacuous without
+ * requiring every pure test to spin up a throwaway git repo. The subprocess
+ * tests exercise the real `unreconciledCount` against temp repos.
+ *
  * `countResolver` defaults to the real `unreconciledCount` (which shells out
- * to git in `REPO_ROOT`). It is exposed so the test suite can inject a
- * deterministic count and treat the verdict logic as a pure function -- this
- * is what makes the "merged -> REMOVABLE / unmerged -> KEEP" assertions
- * non-vacuous without requiring every pure test to spin up a throwaway git
- * repo. The subprocess tests exercise the real `unreconciledCount` against
- * temp repos.
+ * to git in `REPO_ROOT`).
  */
 export function classify(
   worktree: { path: string; branch: string; headSha: string },
-  protectedPrefixes: string[] = PROTECTED_PREFIXES,
+  protectedEntries: ProtectedWorktree[] = [],
   countResolver: (branch: string) => number | undefined = unreconciledCount,
 ): WorktreeClassification {
   const { path: wtPath, branch, headSha } = worktree;
 
-  const isProtected = protectedPrefixes.some(
-    (p) => wtPath === p || wtPath.startsWith(p + path.sep),
+  const match = protectedEntries.find(
+    (p) => wtPath === p.path || wtPath.startsWith(p.path + path.sep),
   );
-  if (isProtected) {
+  if (match) {
     return {
       path: wtPath,
       branch,
       headSha,
       unreconciledCount: undefined,
-      reason: PROTECTION_LABEL,
+      reason: `protected (live card ${match.cardId}: not done/archived)`,
       verdict: "KEEP",
     };
   }
@@ -303,10 +433,10 @@ export function classify(
  */
 export function classifyAll(
   worktrees: Array<{ path: string; branch: string; headSha: string }>,
-  protectedPrefixes: string[] = PROTECTED_PREFIXES,
+  protectedEntries: ProtectedWorktree[] = [],
   countResolver: (branch: string) => number | undefined = unreconciledCount,
 ): WorktreeClassification[] {
-  return worktrees.map((w) => classify(w, protectedPrefixes, countResolver));
+  return worktrees.map((w) => classify(w, protectedEntries, countResolver));
 }
 
 function isApply(arg: string): boolean {
@@ -327,11 +457,15 @@ function printTable(classifications: WorktreeClassification[]): void {
   }
 }
 
-function printProtections(): void {
-  for (const p of PROTECTED_PREFIXES) {
-    const rel = path.relative(REPO_ROOT, p);
+/**
+ * Print one PROTECTION: line per protected worktree, naming the live card id so
+ * an operator sees exactly why the path is held back (c5).
+ */
+function printProtections(protection: ProtectedWorktree[]): void {
+  for (const p of protection) {
+    const rel = path.relative(REPO_ROOT, p.path);
     console.log(
-      `PROTECTION: ${rel} is KEEP regardless of merge status (live card worktree)`,
+      `PROTECTION: ${rel} is KEEP regardless of merge status (live card ${p.cardId})`,
     );
   }
 }
@@ -378,8 +512,43 @@ function main(): void {
     }
   }
 
-  printProtections();
-  const classifications = classifyAll(listWorktrees());
+  // Derive the protection set from live board state (c1). Fail-closed: if the
+  // board cannot be read we do NOT proceed with an empty protection set,
+  // because that is precisely the state that would let `--apply` remove a
+  // live card's worktree (c2).
+  const { entries: protectionSet, boardAvailable } = deriveProtectionSet();
+
+  if (!boardAvailable) {
+    if (apply) {
+      console.error(
+        "ERROR: board unavailable — protection set unknown. Refusing --apply to avoid removing a live card's worktree.",
+      );
+      process.exit(1);
+    }
+    console.log("WARNING: board unavailable — protection set unknown");
+    // Fail-closed: with no reliable protection set, classify every worktree as
+    // KEEP so nothing is ever removed on a guess.
+    const allWorktrees = listWorktrees();
+    const classifications: WorktreeClassification[] = allWorktrees.map((w) => ({
+      path: w.path,
+      branch: w.branch,
+      headSha: w.headSha,
+      unreconciledCount: undefined,
+      reason: "board unavailable — protection set unknown (fail-closed)",
+      verdict: "KEEP",
+    }));
+    printTable(classifications);
+    console.log(
+      `\n0 REMOVABLE, ${classifications.length} KEEP.`,
+    );
+    console.log(
+      "DRY-RUN: no changes made. Pass --apply to remove REMOVABLE worktrees.",
+    );
+    process.exit(0);
+  }
+
+  printProtections(protectionSet);
+  const classifications = classifyAll(listWorktrees(), protectionSet);
   printTable(classifications);
 
   const removable = classifications.filter((c) => c.verdict === "REMOVABLE");
