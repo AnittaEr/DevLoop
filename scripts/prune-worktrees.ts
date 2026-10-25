@@ -538,9 +538,7 @@ function main(): void {
       verdict: "KEEP",
     }));
     printTable(classifications);
-    console.log(
-      `\n0 REMOVABLE, ${classifications.length} KEEP.`,
-    );
+    console.log(`\n0 REMOVABLE, ${classifications.length} KEEP.`);
     console.log(
       "DRY-RUN: no changes made. Pass --apply to remove REMOVABLE worktrees.",
     );
