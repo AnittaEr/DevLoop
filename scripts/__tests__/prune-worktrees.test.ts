@@ -47,6 +47,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { LOAD_BEARING_TEST_TIMEOUT } from "@/core/testing/load-bearing-test-timeout";
@@ -80,7 +81,11 @@ function repoRoot(): string {
 }
 
 const REPO_ROOT = repoRoot();
-const PRUNE_SCRIPT = path.join(REPO_ROOT, "scripts", "prune-worktrees.ts");
+const PRUNE_SCRIPT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "prune-worktrees.ts",
+);
 
 const TEMP_REPO_GIT_NAME = "devloop prune-worktrees tests";
 const TEMP_REPO_GIT_EMAIL = "prune-tests@example.invalid";
