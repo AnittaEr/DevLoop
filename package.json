@@ -22,7 +22,9 @@
     "audit": "bun run ./scripts/audit.ts",
     "secrets:scan": "bun run ./scripts/scan-secrets.ts",
     "secrets:scan:baseline": "bun run ./scripts/scan-secrets.ts --write-baseline",
-    "secrets:hook:install": "bun run ./scripts/install-secret-hook.ts"
+    "secrets:hook:install": "bun run ./scripts/install-secret-hook.ts",
+    "worktrees:prune": "bun run ./scripts/prune-worktrees.ts",
+    "worktrees:prune:apply": "bun run ./scripts/prune-worktrees.ts --apply"
   },
   "dependencies": {
     "@radix-ui/react-slot": "1.1.0",
@@ -35,7 +37,7 @@
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "tailwind-merge": "2.5.4",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@eslint/eslintrc": "3.2.0",
@@ -51,7 +53,7 @@
     "autoprefixer": "10.4.20",
     "drizzle-kit": "0.31.11",
     "eslint": "9.39.5",
-    "eslint-config-next": "15.5.27",
+    "eslint-config-next": "15.5.28",
     "eslint-config-prettier": "9.1.0",
     "jsdom": "25.0.1",
     "postcss": "8.5.28",
